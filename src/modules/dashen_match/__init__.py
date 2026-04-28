@@ -12,6 +12,7 @@ from .service import (
     DashenMatchDetailOutput,
     DashenMatchListOutput,
     DashenMatchModule,
+    DashenMatchRepliesOutput,
     dashen_match_module,
 )
 
@@ -20,6 +21,7 @@ __all__ = [
     "DashenMatchDetailOutput",
     "DashenMatchListOutput",
     "DashenMatchModule",
+    "DashenMatchRepliesOutput",
     "DashenMatchQuery",
     "DashenMatchRequests",
     "RenderedImage",

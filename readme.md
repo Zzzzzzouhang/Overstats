@@ -1,92 +1,107 @@
 # Overstats
 
-Overstats 是一个基于网易大神上游接口封装的守望先锋本地数据服务。
-它提供统一的本地 HTTP API，用于玩家资料查询、近期战绩查询、段位历史查询，以及总结图片生成。
+`Overstats` 是一个本地 HTTP 服务，封装网易大神相关接口，用于查询守望先锋玩家资料、近期对局、单场详情、历史段位和周期总结。
 
-当前仓库的首发重点是 `overstats` 服务本身。仓库里仍然保留了一些历史 `overshop` 相关代码，但第一版发布目标以 `overstats` 为主。
+## 当前能力
 
-## 功能概览
+- 玩家资料卡：`dashen_profile`
+- 大神对局列表与详情：`dashen_match`
+- 大神对局富回复链路：列表、多图详情、`*` 全员详细、`**` AI锐评
+- 今日 / 昨日 / 本周总结：`dashen_summary`
+- 历史段位：`dashen_rank_history`
+- BattleTag 解析到 `customer_token`
+- 图片渲染、本地资源缓存、请求排队与请求统计
 
-- 提供玩家资料、战绩列表、战绩详情、段位历史、总结模块的 HTTP API
-- 支持 BattleTag 解析为 `customer_token`
-- 支持资料图、战绩图、段位历史图等图片渲染
-- 内置本地请求队列，控制上游请求并发
-- 内置 SQLite 请求统计记录器
-- 支持 query tool 配置加载与静态资源本地缓存
-- 兼容当前项目已有的总结渲染运行时与资源文件
+## 大神对局 replies 链路
 
-## 项目结构
+本次版本新增：
 
-- `overstats/run.py`：本地服务启动入口
-- `overstats/config/config.py`：本地运行配置
-- `overstats/src/server.py`：HTTP 服务与路由处理
-- `overstats/src/client/apiclient.py`：上游 Dashen 请求客户端
-- `overstats/src/modules/`：各业务模块实现
-- `overstats/src/db/request_metrics.py`：请求统计 SQLite 记录器
-- `overstats/res/`：渲染使用的静态资源
-- `overstats/test/`：测试与本地验证脚本
+- `POST /api/v2/dashen-match/replies`
+- `POST /api/v2/dashen-match/detail/replies`
+
+返回形态统一为：
+
+```json
+{
+  "ok": true,
+  "customer_token": "string",
+  "resolved": {},
+  "match_id": "string",
+  "match_kind": "normal",
+  "replies": [
+    {
+      "type": "meta",
+      "meta_type": "ds_match_list",
+      "data": {}
+    },
+    {
+      "type": "image",
+      "media_type": "image/png",
+      "base64": "..."
+    }
+  ]
+}
+```
+
+详情接口支持：
+
+- 普通详情：主战绩图 + 查询者英雄详细
+- `show_all_heroes=true`：主战绩图 + 全员瀑布图
+- `show_all_heroes=true` 且 `analyze=true`：主战绩图 + 全员瀑布图 + AI锐评图
+- `match_kind == "fight"`：仅返回角斗主图；若请求 `*` / `**`，追加不支持说明文本
 
 ## 运行要求
 
-- 推荐 Python 3.11 及以上
-- 支持 Windows 或 Linux
-- 需要能够访问网易大神相关上游接口
+- 推荐 Python 3.11+
+- 支持 Windows / Linux
+- 需要可访问网易大神相关接口
 
-在仓库根目录安装依赖：
+安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 配置说明
+## 配置
 
-当前本地运行配置集中在 `overstats/config/config.py`。
+主要配置文件：`overstats/Overstats/config/config.py`
 
-其中最重要的是 `DASHEN_ACCOUNTS`：
+至少需要配置：
 
-```python
-DASHEN_DTS = 2026
-DASHEN_SERVER = 1
+- `DASHEN_ACCOUNTS`
+- `DASHEN_DTS`
+- `DASHEN_SERVER`
 
-DASHEN_ACCOUNTS = [
-    {
-        "name": "account-1",
-        "role_id": 123456789,
-        "token": "token-a",
-    },
-    {
-        "name": "account-2",
-        "role_id": 987654321,
-        "token": "token-b",
-    },
-]
-```
+可选新增配置：
 
-说明：
-- 如何获取这两个值请参考 `Faststart.md`
-- `token` 同时作为业务请求 token 和 `GL-Bigdata-Auth-Token` 请求头使用
-- `DASHEN_DTS` 与 `DASHEN_SERVER` 对所有账号共享
-- 服务会在多个账号之间轮转请求，失败账号会进入临时冷却
-- `API_HOST`、`API_PORT`、`USE_STREAM_RESPONSE` 用于控制本地服务行为
+- `ANALYSIS_BASE_URL`
+- `ANALYSIS_API_KEY`
+- Match stats reference data defaults to `src/db/match_stats.sqlite3`
 
-## 启动方式
+`src/db/match_stats.sqlite3` 未准备好时：
 
-在仓库根目录执行：
+- 周期总结仍可工作
+- 大神对局全员详细仍可渲染
+- 只是部分均值 / 分位高亮会退化
+
+## 启动
 
 ```bash
 python -m overstats.run
 ```
 
-或者：
+或：
 
 ```bash
 cd overstats
 python run.py
 ```
 
-默认监听地址：
+默认地址：
 
-- `http://127.0.0.1:18080`
+```text
+http://127.0.0.1:18080
+```
 
 健康检查：
 
@@ -94,14 +109,16 @@ python run.py
 curl http://127.0.0.1:18080/healthz
 ```
 
-## 主要 API 端点
+## 常用接口
 
 - `POST /api/v2/dashen-profile`
 - `POST /api/v2/dashen-profile/image`
 - `POST /api/v2/dashen-match`
 - `POST /api/v2/dashen-match/image`
+- `POST /api/v2/dashen-match/replies`
 - `POST /api/v2/dashen-match/detail`
 - `POST /api/v2/dashen-match/detail/image`
+- `POST /api/v2/dashen-match/detail/replies`
 - `POST /api/v2/dashen-rank-history`
 - `POST /api/v2/dashen-rank-history/image`
 - `POST /api/v2/dashen-summary/today`
@@ -111,40 +128,4 @@ curl http://127.0.0.1:18080/healthz
 - `POST /api/v2/dashen-summary/week`
 - `POST /api/v2/dashen-summary/week/image`
 
-更细的请求与响应格式后续可以单独整理成 API 文档。当前以 `overstats/src/server.py` 中实际暴露的路由为准。
-
-## 测试
-
-可以先运行这类基础测试：
-
-```bash
-python -m unittest overstats.test.test_dashen_profile_api
-python -m unittest overstats.test.test_dashen_summary_today
-```
-
-需要注意的是，`overstats/test/` 目录里有一部分文件更偏向本地联调脚本，不完全是纯单元测试，可能依赖本地资源、配置文件或已运行的服务。
-
-## 首版说明
-
-当前第一版可以理解为：
-
-- 一个独立可运行的本地 API 服务
-- 以现有 Dashen 请求链路为基础
-- 渲染资源直接随仓库提供
-- 部分总结运行时仍与历史项目结构共用资源
-
-## 安全提示
-
-发布前请务必检查：
-
-- 不要提交真实的 `token`、`role_id`、Cookie 或 API key
-- 将 `overstats/config/config.py` 中的敏感值替换为占位符
-- 检查日志、截图、测试数据中是否包含敏感标识
-
-`overstats/config/config.py` 是本地运行配置文件，不适合作为公开仓库中的密钥存储位置。
-
-## 许可证
-
-本仓库根目录使用 `MIT` 许可证发布，但该许可证默认仅覆盖项目源码。
-
-第三方图片、字体、游戏素材、上游配置数据及运行时下载资源不自动按 MIT 许可证授权，具体说明见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
+更细的字段说明见 [OVERSTATS_API.md](./OVERSTATS_API.md)。

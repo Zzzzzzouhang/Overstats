@@ -22,6 +22,7 @@ except ModuleNotFoundError:
     from src.client.apiclient import dashen_api_client
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 MIG_ROOT = Path(__file__).resolve().parents[4]
 TITLE_BY_SCOPE = {
     "today": "\u4eca\u65e5\u603b\u7ed3",
@@ -138,25 +139,45 @@ def _load_runtime() -> SummaryRuntime:
         return _RUNTIME
 
     _install_hoshino_stub()
-    if str(MIG_ROOT) not in sys.path:
-        sys.path.insert(0, str(MIG_ROOT))
+    for candidate_root in (PROJECT_ROOT, MIG_ROOT):
+        candidate_text = str(candidate_root)
+        if candidate_text not in sys.path:
+            sys.path.insert(0, candidate_text)
 
-    try:
-        dashen = importlib.import_module("overstats.src.modules.dashen_summary.runtime.dashen")
-        summary = importlib.import_module("overstats.src.modules.dashen_summary.runtime.season_conclusion")
-    except Exception as exc:
-        raise ModuleError(
-            error="summary_runtime_import_failed",
-            message="Failed to load local summary runtime.",
-            status_code=500,
-            details={
-                "exception": type(exc).__name__,
-                "message": str(exc),
-            },
-        ) from exc
+    runtime_prefixes = (
+        "src.modules.dashen_summary.runtime",
+        "overstats.src.modules.dashen_summary.runtime",
+        "Overstats.src.modules.dashen_summary.runtime",
+    )
+    import_failures: List[Dict[str, str]] = []
+    for prefix in runtime_prefixes:
+        try:
+            dashen = importlib.import_module(f"{prefix}.dashen")
+            summary = importlib.import_module(f"{prefix}.season_conclusion")
+            _RUNTIME = SummaryRuntime(dashen=dashen, summary=summary)
+            return _RUNTIME
+        except Exception as exc:
+            import_failures.append(
+                {
+                    "prefix": prefix,
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                }
+            )
 
-    _RUNTIME = SummaryRuntime(dashen=dashen, summary=summary)
-    return _RUNTIME
+    primary_failure = import_failures[0] if import_failures else {}
+    raise ModuleError(
+        error="summary_runtime_import_failed",
+        message="Failed to load local summary runtime.",
+        status_code=500,
+        details={
+            "exception": primary_failure.get("exception", "ImportError"),
+            "message": primary_failure.get("message", "Unknown import failure."),
+            "attempted_prefixes": list(runtime_prefixes),
+            "import_failures": import_failures,
+            "sys_path_roots": [str(PROJECT_ROOT), str(MIG_ROOT)],
+        },
+    )
 
 
 def _resolved_target_from_query(query: Any) -> Dict[str, Any]:

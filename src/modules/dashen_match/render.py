@@ -29,7 +29,7 @@ class RenderedImage:
 def render_match_list(
     matches: Sequence[Dict[str, Any]],
     *,
-    title: str = "Dashen Matches",
+    title: str = "大神对局列表",
     full_id: str = "",
 ) -> RenderedImage:
     try:
@@ -40,7 +40,8 @@ def render_match_list(
     config = _load_ow_config()
     recent_matches = list(matches or [])[:20]
     row_h = 60
-    img_h = row_h * max(len(recent_matches), 1) + 70
+    footer_h = 58
+    img_h = row_h * max(len(recent_matches), 1) + 70 + footer_h
     img = Image.new("RGBA", (700, img_h), (22, 23, 30, 255))
     draw = ImageDraw.Draw(img, "RGBA")
 
@@ -64,10 +65,15 @@ def render_match_list(
     y = 60
     if not recent_matches:
         _rounded_rect(draw, [20, y, 680, y + 50], radius=8, fill=(35, 37, 45, 255))
-        draw.text((40, y + 15), "No matches found.", fill=(230, 235, 245), font=font)
+        draw.text((40, y + 15), "未找到可用对局。", fill=(230, 235, 245), font=font)
     for index, match in enumerate(recent_matches, start=1):
         _draw_match_row(draw, img, config, match, index, y, font, font_sm)
         y += row_h
+
+    footer_top = img_h - footer_h
+    draw.line([(20, footer_top), (680, footer_top)], fill=(60, 67, 82, 255), width=1)
+    hint_text = "回复此图并@机器人发送 1 / 1* / 1**，可查看单场详情 / 全员详细 / AI锐评"
+    draw.text((20, footer_top + 16), _fit_text(draw, hint_text, font_sm, 660), fill=(190, 198, 210), font=font_sm)
 
     output = BytesIO()
     img.convert("RGB").save(output, format="PNG")

@@ -35,6 +35,29 @@ _CONFIG_UPDATED = False
 _CONFIG_CACHE: Dict[str, Any] | None = None
 
 
+def _run_async_sync(awaitable_factory: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(awaitable_factory())
+
+    result: Dict[str, Any] = {}
+    error: Dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(awaitable_factory())
+        except BaseException as exc:
+            error["value"] = exc
+
+    thread = threading.Thread(target=runner, name="query-tool-refresh", daemon=True)
+    thread.start()
+    thread.join()
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
+
+
 def get_query_tool_path() -> Path:
     return QUERY_TOOL_PATH
 
@@ -206,7 +229,7 @@ class QueryToolModule:
                 return _CONFIG_CACHE
 
             local_config = read_query_tool(default={})
-            remote_config = asyncio.run(self.requests.fetch_remote_query_tool())
+            remote_config = _run_async_sync(self.requests.fetch_remote_query_tool)
             merged_config = dict(remote_config)
 
             for key in MANUAL_KEYS:

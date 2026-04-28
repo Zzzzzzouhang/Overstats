@@ -30,6 +30,7 @@ from .db import IDPoolDB
 from .ow_config import load_ow_config
 from .perf_log import append_perf_log
 from .render_gate import get_global_render_limit, get_global_render_semaphore
+from .stat_reference import get_cached_statmap_summary as _shared_get_cached_statmap_summary
 
 
 def _read_env_int(name, default):
@@ -2130,6 +2131,15 @@ def _get_stat_value(stat_map, guid, default=0):
 
 
 def _get_cached_statmap_summary(lookup_key, stat_guids, rank_buckets, ratio_stat_guids, prefer_rank):
+    result = _shared_get_cached_statmap_summary(
+        _GROUP_TITLE_DB,
+        lookup_key,
+        stat_guids,
+        rank_buckets,
+        ratio_stat_guids,
+        prefer_rank,
+        cache_max=SUMMARY_STATMAP_REFERENCE_CACHE_MAX,
+    )
     cache_key = (
         str(lookup_key),
         tuple(sorted(str(item) for item in (stat_guids or []))),
@@ -2137,21 +2147,6 @@ def _get_cached_statmap_summary(lookup_key, stat_guids, rank_buckets, ratio_stat
         tuple(sorted(str(item) for item in (ratio_stat_guids or []))),
         bool(prefer_rank),
     )
-    cached = _SUMMARY_STATMAP_REFERENCE_CACHE.get(cache_key)
-    if cached is not None:
-        try:
-            _SUMMARY_STATMAP_REFERENCE_CACHE.move_to_end(cache_key)
-        except Exception:
-            pass
-        return cached
-
-    result = _GROUP_TITLE_DB.get_statmap_summary(
-        lookup_key,
-        list(stat_guids or []),
-        list(rank_buckets) if rank_buckets is not None else None,
-        set(ratio_stat_guids or []),
-        bool(prefer_rank),
-    ) or {}
     _SUMMARY_STATMAP_REFERENCE_CACHE[cache_key] = result
     while len(_SUMMARY_STATMAP_REFERENCE_CACHE) > SUMMARY_STATMAP_REFERENCE_CACHE_MAX:
         _SUMMARY_STATMAP_REFERENCE_CACHE.popitem(last=False)

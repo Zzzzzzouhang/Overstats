@@ -100,8 +100,10 @@ curl http://127.0.0.1:18080/healthz
 - `POST /api/v2/dashen-profile/image`
 - `POST /api/v2/dashen-match`
 - `POST /api/v2/dashen-match/image`
+- `POST /api/v2/dashen-match/replies`
 - `POST /api/v2/dashen-match/detail`
 - `POST /api/v2/dashen-match/detail/image`
+- `POST /api/v2/dashen-match/detail/replies`
 - `POST /api/v2/dashen-rank-history`
 - `POST /api/v2/dashen-rank-history/image`
 - `POST /api/v2/dashen-summary/today`

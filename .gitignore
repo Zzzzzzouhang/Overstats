@@ -1,0 +1,31 @@
+# Agent guide (environment-specific)
+AGENTS.md
+
+# Python bytecode
+*.pyc
+__pycache__/
+
+# Environment variables
+.env
+
+# Database files (optional, if generated locally)
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime caches
+res/cache_img/
+res/query_tool_assets/
+src/modules/dashen_summary/runtime/cache/
+
+# Test artifacts
+test_*.json
+test_*.md
+test_report_*.md

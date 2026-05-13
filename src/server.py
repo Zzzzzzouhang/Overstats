@@ -560,7 +560,7 @@ class OverstatsCoreService:
         result = await ow_shop_module.query_shop(render=False)
         return result.to_dict()
 
-    async def handle_ow_shop_image(self, payload: Dict[str, object]) -> bytes:
+    async def handle_ow_shop_image(self, payload: Dict[str, object]) -> tuple[bytes, str]:
         result = await ow_shop_module.query_shop(render=True)
         if not result.image:
             raise ModuleError(
@@ -568,7 +568,7 @@ class OverstatsCoreService:
                 message="OW shop image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return result.image.content, result.image.media_type
 
     async def handle_ow_esports(self, payload: Dict[str, object]) -> Dict[str, object]:
         result = await ow_esports_module.query_ow_esports(render=False)
@@ -2235,7 +2235,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_ow_shop_image(payload))
+                image_result = async_runner.run(service.handle_ow_shop_image(payload))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2263,7 +2263,11 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
 
-            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+            image_body = image_result
+            content_type = "image/png"
+            if isinstance(image_result, tuple):
+                image_body, content_type = image_result
+            self._send_binary(HTTPStatus.OK, image_body, content_type)
 
         def _handle_ow_esports_post(self) -> None:
             try:

@@ -32,6 +32,10 @@ GENERATED_AT_LABEL = "生成时间"
 HUGE_BUNDLE_KEYWORD = "超级礼包"
 
 
+MAX_RENDER_BYTES = 5 * 1024 * 1024
+JPEG_QUALITY_STEPS = (92, 88, 84, 80, 76, 72, 68, 64)
+JPEG_SCALE_STEPS = (1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65)
+
 @dataclass(frozen=True)
 class RenderedImage:
     content: bytes
@@ -165,9 +169,7 @@ def render_ow_shop(
         )
         final_img.alpha_composite(overlay, (x, y))
 
-    output = BytesIO()
-    final_img.convert("RGB").save(output, format="PNG", optimize=True)
-    return RenderedImage(content=output.getvalue())
+    return _encode_rendered_image(final_img)
 
 
 def _render_text_overlay(
@@ -230,6 +232,71 @@ def _create_card_image(image_path: Path | None, target_w: int, target_h: int, bg
     mask_draw.rounded_rectangle((0, 0, target_w, target_h), radius=20, fill=255)
     card.putalpha(mask)
     return card
+
+
+def _encode_rendered_image(image: Any, *, max_bytes: int = MAX_RENDER_BYTES) -> RenderedImage:
+    rgb_image = image.convert("RGB")
+    png_bytes = _save_png_bytes(rgb_image)
+    if len(png_bytes) <= max_bytes:
+        return RenderedImage(content=png_bytes, media_type="image/png")
+    return _compress_rendered_image(rgb_image, max_bytes=max_bytes, fallback_bytes=png_bytes)
+
+
+def _compress_rendered_image(image: Any, *, max_bytes: int, fallback_bytes: bytes) -> RenderedImage:
+    best_bytes = fallback_bytes
+    best_media_type = "image/png"
+    source_width = max(1, int(image.width))
+    source_height = max(1, int(image.height))
+
+    for scale in JPEG_SCALE_STEPS:
+        candidate = image
+        if scale != 1.0:
+            candidate = image.resize(
+                (
+                    max(1, int(source_width * scale)),
+                    max(1, int(source_height * scale)),
+                ),
+                _resampling_lanczos(),
+            )
+        for quality in JPEG_QUALITY_STEPS:
+            jpeg_bytes = _save_jpeg_bytes(candidate, quality=quality)
+            if len(jpeg_bytes) < len(best_bytes):
+                best_bytes = jpeg_bytes
+                best_media_type = "image/jpeg"
+            if len(jpeg_bytes) <= max_bytes:
+                return RenderedImage(content=jpeg_bytes, media_type="image/jpeg")
+
+    return RenderedImage(content=best_bytes, media_type=best_media_type)
+
+
+def _save_png_bytes(image: Any) -> bytes:
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
+
+def _save_jpeg_bytes(image: Any, *, quality: int) -> bytes:
+    output = BytesIO()
+    try:
+        image.save(
+            output,
+            format="JPEG",
+            quality=max(40, int(quality)),
+            optimize=False,
+            progressive=False,
+            subsampling=1,
+        )
+    except OSError:
+        output = BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=max(40, int(quality) - 6),
+            optimize=False,
+            progressive=False,
+            subsampling=1,
+        )
+    return output.getvalue()
 
 
 def _price_label(price_raw: int | float, currency: str) -> tuple[str, tuple[int, int, int]]:

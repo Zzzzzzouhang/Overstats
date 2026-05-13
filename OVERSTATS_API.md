@@ -59,7 +59,7 @@ JSON response shape:
 }
 ```
 
-The `/image` endpoint returns `image/png` rendered in the same overshop-style card layout used by the legacy bot module.
+The `/image` endpoint returns the same overshop-style card layout used by the legacy bot module. It prefers `image/png`, and automatically falls back to `image/jpeg` when the rendered PNG would exceed 5 MiB.
 
 ## OW Esports API
 

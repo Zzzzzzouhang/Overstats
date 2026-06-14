@@ -1842,6 +1842,23 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     dashen_api_client.player_identity_recorder = player_identity_recorder
     dashen_api_client.request_metrics_recorder = request_metrics_recorder
 
+    # Register quick-strength persistence callback (writes to match_strength_cache + player_competitive_rank)
+    if config.enable_database_write and match_detail_recorder is not None:
+        _strength_db = match_detail_recorder.db
+
+        def _on_match_strength_computed(match_records, player_records):
+            try:
+                _strength_db.upsert_match_strength_batch(match_records)
+            except Exception as exc:
+                print(f"[overstats] quick-strength match cache write failed: {exc}")
+            try:
+                _strength_db.upsert_player_competitive_ranks(player_records)
+            except Exception as exc:
+                print(f"[overstats] quick-strength player rank write failed: {exc}")
+
+        dashen_quick_strength_module.set_on_match_strength_computed(_on_match_strength_computed)
+        print("[overstats] quick-strength persistence callback registered")
+
     class OverstatsRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "OverstatsCore/0.1"

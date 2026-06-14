@@ -414,7 +414,32 @@ async def get_icon(url: str) -> bytes:
 async def ranking_dist2(st: int = 0) -> Optional[tuple[int, List[int]]]:
     rows = db.get_all_rank()
     if not rows:
-        return None
+        # Fallback: read rank_bucket values from hero_match_detail
+        try:
+            raw_buckets = db.get_all_rank_buckets() or []
+        except Exception:
+            raw_buckets = []
+        if not raw_buckets:
+            return None
+        # Convert rank_bucket values to the encoded score format
+        # (same logic as _rank_bucket_to_score in season_conclusion)
+        rank_scores: List[int] = []
+        missing_count = 0
+        for raw_bucket in raw_buckets:
+            try:
+                bucket = int(raw_bucket)
+            except (TypeError, ValueError):
+                missing_count += 1
+                continue
+            if bucket <= 0:
+                missing_count += 1
+                continue
+            # Convert tier-format bucket to 1000-5000 score
+            score = bucket if bucket >= 100 else (500 + bucket * 500)
+            rank_scores.append(score)
+        if not rank_scores:
+            return None
+        return missing_count, rank_scores
 
     rank_scores: List[int] = []
     missing_count = 0

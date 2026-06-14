@@ -16,6 +16,8 @@ COMP_DATA_TABLE = "comp_data"
 COMP_DATA_SUMMARY_TABLE = "comp_data_summary"
 HERO_PERK_PICK_TABLE = "hero_perk_pick"
 HERO_PERK_SUMMARY_TABLE = "hero_perk_summary"
+MATCH_STRENGTH_CACHE_TABLE = "match_strength_cache"
+PLAYER_COMPETITIVE_RANK_TABLE = "player_competitive_rank"
 OVERALL_RANK_BUCKET_KEY = -1
 
 
@@ -219,6 +221,33 @@ class IDPoolDB:
             )
             """
         )
+        # match_strength_cache: stores per-match avg_score computed by dashen_quick_strength
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {MATCH_STRENGTH_CACHE_TABLE} (
+                match_id TEXT PRIMARY KEY,
+                avg_score REAL NOT NULL,
+                player_count INTEGER NOT NULL DEFAULT 0,
+                score_min INTEGER,
+                score_max INTEGER,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        # player_competitive_rank: stores per-player per-role competitive rank score
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {PLAYER_COMPETITIVE_RANK_TABLE} (
+                player_bnet_id TEXT NOT NULL,
+                role_type TEXT NOT NULL,
+                rank_score INTEGER NOT NULL,
+                season INTEGER,
+                source_match_id TEXT,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (player_bnet_id, role_type)
+            )
+            """
+        )
         index_statements = (
             f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{COMP_DATA_TABLE}_uniq "
             f"ON {COMP_DATA_TABLE} (match_id, player_bnet_id, hero_guid, statmap_name)",
@@ -236,6 +265,8 @@ class IDPoolDB:
             f"ON {COMP_DATA_SUMMARY_TABLE} (hero_guid, rank_bucket_key, statmap_name)",
             f"CREATE INDEX IF NOT EXISTS idx_{HERO_PERK_SUMMARY_TABLE}_hero_level_rank "
             f"ON {HERO_PERK_SUMMARY_TABLE} (hero_guid, perk_level, rank_bucket_key, perk_guid)",
+            f"CREATE INDEX IF NOT EXISTS idx_{PLAYER_COMPETITIVE_RANK_TABLE}_player "
+            f"ON {PLAYER_COMPETITIVE_RANK_TABLE} (player_bnet_id)",
         )
         for statement in index_statements:
             try:
@@ -336,6 +367,73 @@ class IDPoolDB:
                 "pick_rate": float(pick_rate or 0.0),
             }
         return grouped
+
+    def get_all_rank_buckets(self) -> List[int]:
+        """Read all non-null, non-zero rank_bucket values from hero_match_detail.
+
+        These values are in the 0-5+ range (produced by normalize_hero_rank_score).
+        They can be converted to the 1000-5000 scale by the caller.
+        """
+        conn = self._get_connection()
+        if conn is None:
+            return []
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT rank_bucket FROM hero_match_detail
+                    WHERE rank_bucket IS NOT NULL AND rank_bucket > 0
+                    """
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            return [int(row[0]) for row in rows if row[0] is not None and int(row[0]) > 0]
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_all_rank_buckets failed: {type(exc).__name__}: {exc}")
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_match_player_rank_scores(self, match_ids: List[str]) -> List[int]:
+        """Read raw rank_score values for all players in the given matches.
+
+        Returns the rank_score values as stored in hero_match_detail (0-5+ range).
+        """
+        if not match_ids:
+            return []
+        conn = self._get_connection()
+        if conn is None:
+            return []
+        try:
+            placeholders = ",".join(["?"] * len(match_ids))
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT player_bnet_id, rank_score
+                    FROM hero_match_detail
+                    WHERE match_id IN ({placeholders})
+                    AND rank_score IS NOT NULL AND rank_score > 0
+                    """,
+                    tuple(str(mid) for mid in match_ids),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            return [int(row[1]) for row in rows if row[1] is not None and int(row[1]) > 0]
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_match_player_rank_scores failed: {type(exc).__name__}: {exc}")
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def get_all_rank(self) -> List[Dict[str, Any]]:
         conn = self._get_connection()
@@ -1499,6 +1597,178 @@ class IDPoolDB:
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # match_strength_cache: per-match avg_score from dashen_quick_strength
+    # ------------------------------------------------------------------
+
+    def upsert_match_strength_batch(
+        self,
+        records: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Batch upsert match strength records. Returns count of rows written."""
+        if not records:
+            return 0
+        with self._write_lock:
+            conn = self._get_write_connection()
+            if conn is None:
+                return 0
+            try:
+                self._initialize_match_detail_tables(conn)
+                now = int(time.time())
+                rows = [
+                    (
+                        str(r.get("match_id") or ""),
+                        float(r.get("avg_score") or 0),
+                        int(r.get("player_count") or 0),
+                        r.get("score_min"),
+                        r.get("score_max"),
+                        now,
+                    )
+                    for r in records
+                    if r.get("match_id") and float(r.get("avg_score") or 0) > 0
+                ]
+                if not rows:
+                    return 0
+                conn.executemany(
+                    f"""
+                    INSERT OR REPLACE INTO {MATCH_STRENGTH_CACHE_TABLE}
+                        (match_id, avg_score, player_count, score_min, score_max, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
+                return len(rows)
+            except Exception as exc:
+                self._warn_once(f"match stats sqlite upsert_match_strength_batch failed: {type(exc).__name__}: {exc}")
+                return 0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def get_match_strength(self, match_ids: Sequence[str]) -> Dict[str, float]:
+        """Read cached avg_score for given match_ids. Returns {match_id: avg_score}."""
+        if not match_ids:
+            return {}
+        conn = self._get_connection()
+        if conn is None:
+            return {}
+        try:
+            placeholders = ",".join(["?"] * len(match_ids))
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"SELECT match_id, avg_score FROM {MATCH_STRENGTH_CACHE_TABLE} "
+                    f"WHERE match_id IN ({placeholders}) AND avg_score > 0",
+                    tuple(str(mid) for mid in match_ids),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            return {str(r[0]): float(r[1]) for r in rows if r[0] and float(r[1] or 0) > 0}
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_match_strength failed: {type(exc).__name__}: {exc}")
+            return {}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # player_competitive_rank: per-player per-role competitive rank score
+    # ------------------------------------------------------------------
+
+    def upsert_player_competitive_ranks(
+        self,
+        records: Sequence[Dict[str, Any]],
+    ) -> int:
+        """Batch upsert player competitive rank records. Returns count of rows written."""
+        if not records:
+            return 0
+        with self._write_lock:
+            conn = self._get_write_connection()
+            if conn is None:
+                return 0
+            try:
+                self._initialize_match_detail_tables(conn)
+                now = int(time.time())
+                rows = [
+                    (
+                        str(r.get("player_bnet_id") or ""),
+                        str(r.get("role_type") or ""),
+                        int(r.get("rank_score") or 0),
+                        r.get("season"),
+                        str(r.get("source_match_id") or ""),
+                        now,
+                    )
+                    for r in records
+                    if r.get("player_bnet_id")
+                    and r.get("role_type")
+                    and int(r.get("rank_score") or 0) > 0
+                ]
+                if not rows:
+                    return 0
+                conn.executemany(
+                    f"""
+                    INSERT OR REPLACE INTO {PLAYER_COMPETITIVE_RANK_TABLE}
+                        (player_bnet_id, role_type, rank_score, season, source_match_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+                conn.commit()
+                return len(rows)
+            except Exception as exc:
+                self._warn_once(f"match stats sqlite upsert_player_competitive_ranks failed: {type(exc).__name__}: {exc}")
+                return 0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def get_player_competitive_ranks(
+        self,
+        player_bnet_ids: Sequence[str],
+    ) -> Dict[str, Dict[str, int]]:
+        """Read competitive ranks for given players. Returns {bnet_id: {role_type: rank_score}}."""
+        if not player_bnet_ids:
+            return {}
+        conn = self._get_connection()
+        if conn is None:
+            return {}
+        try:
+            placeholders = ",".join(["?"] * len(player_bnet_ids))
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"SELECT player_bnet_id, role_type, rank_score FROM {PLAYER_COMPETITIVE_RANK_TABLE} "
+                    f"WHERE player_bnet_id IN ({placeholders}) AND rank_score > 0",
+                    tuple(str(pid) for pid in player_bnet_ids),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            result: Dict[str, Dict[str, int]] = {}
+            for row in rows:
+                pid = str(row[0])
+                role = str(row[1])
+                score = int(row[2])
+                if score > 0:
+                    result.setdefault(pid, {})[role] = score
+            return result
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_player_competitive_ranks failed: {type(exc).__name__}: {exc}")
+            return {}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def get_entry_ds_exact_ci_one(self, battletag: str, battlenum: Optional[int] = None) -> Optional[Dict[str, Any]]:
         return None
 
@@ -1526,6 +1796,8 @@ __all__ = [
     "HERO_PERK_SUMMARY_TABLE",
     "IDPoolDB",
     "MATCH_STATS_DB_PATH",
+    "MATCH_STRENGTH_CACHE_TABLE",
     "OVERALL_RANK_BUCKET_KEY",
+    "PLAYER_COMPETITIVE_RANK_TABLE",
     "PLAYER_IDENTITY_TABLE",
 ]

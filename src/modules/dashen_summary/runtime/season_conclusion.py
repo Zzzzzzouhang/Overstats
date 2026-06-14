@@ -228,7 +228,7 @@ ATTR_TEXT_BY_GUID = {
 QUICK_DIST_BUCKET_START = 1000
 QUICK_DIST_BUCKET_END = 4900
 QUICK_DIST_BUCKET_STEP = 100
-QUICK_DIST_SNAPSHOT_VERSION = 2
+QUICK_DIST_SNAPSHOT_VERSION = 3
 QUICK_DIST_RANK_SPANS = (
     (1000, 1500, "青铜"),
     (1500, 2000, "白银"),
@@ -239,6 +239,32 @@ QUICK_DIST_RANK_SPANS = (
     (4000, 4500, "宗师"),
     (4500, 5000, "英杰"),
 )
+
+
+def _rank_bucket_to_score(bucket_value):
+    """Convert a rank_bucket value from hero_match_detail to the 1000-5000 scale.
+
+    The database stores rank_bucket values produced by normalize_hero_rank_score:
+    - For raw rankScore >= 100 (encoded format): bucket = raw // 100 (e.g. 25 for 2523)
+    - For raw rankScore < 100 (tier format): bucket = raw value directly (e.g. 2, 3, 4, 5)
+      where 2=Silver, 3=Gold, 4=Platinum, 5=Diamond
+
+    This function converts both formats to the 1000-5000 scale used by _score_bucket_key.
+    """
+    try:
+        bucket = int(bucket_value)
+    except (TypeError, ValueError):
+        return None
+    if bucket <= 0:
+        return None
+    if bucket >= 100:
+        # Already in encoded format (e.g. 25 from raw 2523)
+        # _score_bucket_key handles this directly
+        return bucket
+    # Simple tier format: 1=Bronze, 2=Silver, 3=Gold, 4=Platinum, 5=Diamond,
+    # 6=Master, 7=Grandmaster, 8+=Champion
+    # Map to center of each rank span in the 1000-5000 scale
+    return 500 + bucket * 500
 
 
 def _extract_match_entries(payload, *preferred_keys):
@@ -1210,6 +1236,7 @@ def _is_rank_distribution_snapshot_compatible(snapshot):
 def _build_rank_distribution_snapshot(target_day):
     bucket_counts = {str(bucket): 0 for bucket in _all_rank_bucket_keys()}
     total_samples = 0
+    # Primary source: rank table (may not exist in all deployments)
     try:
         rank_rows = _GROUP_TITLE_DB.get_all_rank() or []
     except Exception:
@@ -1219,6 +1246,21 @@ def _build_rank_distribution_snapshot(target_day):
             continue
         for key in ("tank", "dps", "healer"):
             bucket = _score_bucket_key(row.get(key))
+            if bucket is None:
+                continue
+            bucket_counts[str(bucket)] = bucket_counts.get(str(bucket), 0) + 1
+            total_samples += 1
+    # Fallback source: hero_match_detail rank_bucket values from SQLite
+    if total_samples <= 0:
+        try:
+            raw_buckets = _GROUP_TITLE_DB.get_all_rank_buckets() or []
+        except Exception:
+            raw_buckets = []
+        for raw_bucket in raw_buckets:
+            score = _rank_bucket_to_score(raw_bucket)
+            if score is None:
+                continue
+            bucket = _score_bucket_key(score)
             if bucket is None:
                 continue
             bucket_counts[str(bucket)] = bucket_counts.get(str(bucket), 0) + 1
@@ -1340,6 +1382,9 @@ def _sample_period_quick_matches(matches, max_samples=12):
     return picked
 
 
+
+
+
 async def _build_quick_strength_distribution_data(customer_token, matches):
     sampled_matches = _sample_period_quick_matches(matches, max_samples=12)
     latest_ts = max(
@@ -1392,15 +1437,21 @@ async def _build_quick_strength_distribution_data(customer_token, matches):
     )
 
     sample_points = []
+    resolved_match_ids = set()
+    # Track matches where API returned no score, for live/DB fallback
+    api_missed_matches = []
     for match, result in zip(sampled_matches, results):
         if isinstance(result, Exception) or not isinstance(result, tuple) or len(result) < 4:
+            api_missed_matches.append(match)
             continue
         avg_score = _num(result[3])
         if avg_score <= 0:
+            api_missed_matches.append(match)
             continue
         bucket = _score_bucket_key(avg_score)
         if bucket is None:
             continue
+        resolved_match_ids.add(str(match.get("matchId")))
         sample_points.append(
             {
                 "match_id": match.get("matchId"),
@@ -1413,6 +1464,110 @@ async def _build_quick_strength_distribution_data(customer_token, matches):
                 "result": _int(match.get("matchRet")),
             }
         )
+
+    # Tier 2 fallback: match_strength_cache (populated by dashen_quick_strength, DB-only)
+    cache_missed_ids = [str(m.get("matchId")) for m in api_missed_matches if m.get("matchId")]
+    if cache_missed_ids and len(sample_points) < len(sampled_matches):
+        try:
+            cached_scores = _GROUP_TITLE_DB.get_match_strength(cache_missed_ids)
+        except Exception:
+            cached_scores = {}
+        if cached_scores:
+            still_missed = []
+            for match in api_missed_matches:
+                mid = str(match.get("matchId") or "")
+                if not mid or mid in resolved_match_ids:
+                    still_missed.append(match)
+                    continue
+                avg_score = cached_scores.get(mid)
+                if avg_score is None or avg_score <= 0:
+                    still_missed.append(match)
+                    continue
+                bucket = _score_bucket_key(avg_score)
+                if bucket is None:
+                    still_missed.append(match)
+                    continue
+                resolved_match_ids.add(mid)
+                sample_points.append(
+                    {
+                        "match_id": match.get("matchId"),
+                        "bucket": bucket,
+                        "avg_score": avg_score,
+                        "rank_label": _quick_dist_rank_label(avg_score),
+                        "count": int(bucket_counts.get(str(bucket), 0)),
+                        "begin_ts": _num(match.get("beginTs")),
+                        "map_guid": match.get("mapGuid"),
+                        "result": _int(match.get("matchRet")),
+                    }
+                )
+            api_missed_matches = still_missed
+
+    # Tier 3 fallback: use database rank_bucket data as last resort (DB-only, no extra API calls)
+    db_missed_ids = [str(m.get("matchId")) for m in api_missed_matches if m.get("matchId")]
+    if db_missed_ids and len(sample_points) < len(sampled_matches):
+        try:
+            db_scores = _GROUP_TITLE_DB.get_match_player_rank_scores(db_missed_ids) or []
+        except Exception:
+            db_scores = []
+        if db_scores:
+            match_score_map = {}
+            try:
+                conn_db = _GROUP_TITLE_DB._get_connection()
+                if conn_db is not None:
+                    try:
+                        placeholders = ",".join(["?"] * len(db_missed_ids))
+                        cur = conn_db.cursor()
+                        cur.execute(
+                            f"""
+                            SELECT match_id, rank_score FROM hero_match_detail
+                            WHERE match_id IN ({placeholders})
+                            AND rank_score IS NOT NULL AND rank_score > 0
+                            """,
+                            tuple(db_missed_ids),
+                        )
+                        rows = cur.fetchall() or []
+                        cur.close()
+                        match_scores = defaultdict(list)
+                        for row in rows:
+                            mid = str(row[0])
+                            score = _rank_bucket_to_score(int(row[1]))
+                            if score is not None:
+                                match_scores[mid].append(score)
+                        for mid, scores in match_scores.items():
+                            if scores:
+                                match_score_map[mid] = sum(scores) / len(scores)
+                    finally:
+                        try:
+                            conn_db.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            if match_score_map:
+                for match in api_missed_matches:
+                    mid = str(match.get("matchId") or "")
+                    if not mid or mid in resolved_match_ids:
+                        continue
+                    avg_score = match_score_map.get(mid)
+                    if avg_score is None or avg_score <= 0:
+                        continue
+                    bucket = _score_bucket_key(avg_score)
+                    if bucket is None:
+                        continue
+                    resolved_match_ids.add(mid)
+                    sample_points.append(
+                        {
+                            "match_id": match.get("matchId"),
+                            "bucket": bucket,
+                            "avg_score": avg_score,
+                            "rank_label": _quick_dist_rank_label(avg_score),
+                            "count": int(bucket_counts.get(str(bucket), 0)),
+                            "begin_ts": _num(match.get("beginTs")),
+                            "map_guid": match.get("mapGuid"),
+                            "result": _int(match.get("matchRet")),
+                        }
+                    )
 
     return {
         "snapshot_date": snapshot.get("date"),
@@ -1684,10 +1839,10 @@ def _draw_quick_strength_distribution(draw, box, dist_data):
         return
 
     bucket_keys = _all_rank_bucket_keys()
-    visible_buckets = sorted(grouped_samples.keys())
+    visible_buckets = sorted(int(k) for k in grouped_samples.keys())
     first_idx = max(0, bucket_keys.index(min(visible_buckets)) - 1)
     last_idx = min(len(bucket_keys) - 1, bucket_keys.index(max(visible_buckets)) + 1)
-    visible_bucket_keys = bucket_keys[first_idx : last_idx + 1]
+    visible_bucket_keys = [int(k) for k in bucket_keys[first_idx : last_idx + 1]]
     bucket_x_map = {}
     if len(visible_bucket_keys) == 1:
         bucket_x_map[visible_bucket_keys[0]] = (inner_x1 + inner_x2) / 2
@@ -1703,7 +1858,7 @@ def _draw_quick_strength_distribution(draw, box, dist_data):
 
     draw.line((inner_x1, axis_y, inner_x2, axis_y), fill=(72, 94, 122, 140), width=2)
 
-    for label, lower, upper in QUICK_DIST_RANK_SPANS:
+    for lower, upper, label in QUICK_DIST_RANK_SPANS:
         rank_buckets = [bucket for bucket in visible_bucket_keys if lower <= bucket < upper]
         if not rank_buckets:
             continue

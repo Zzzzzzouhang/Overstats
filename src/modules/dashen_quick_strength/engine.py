@@ -213,11 +213,15 @@ class DashenQuickStrengthEngine:
         score_lookback: int = DEFAULT_SCORE_LOOKBACK,
         streak_history_pages: int = DEFAULT_STREAK_HISTORY_PAGES,
         match_concurrency: int = DEFAULT_MATCH_CONCURRENCY,
+        on_match_strength_computed: Optional[Any] = None,
     ) -> None:
         self.requests = requests
         self.score_lookback = max(0, min(MAX_SCORE_LOOKBACK, int(score_lookback)))
         self.streak_history_pages = max(1, int(streak_history_pages))
         self.match_concurrency = max(1, int(match_concurrency))
+        # Optional callback(match_records: list[dict], player_records: list[dict])
+        # Invoked after build() with aggregated persistence data.
+        self.on_match_strength_computed = on_match_strength_computed
 
     async def build(
         self,
@@ -327,8 +331,27 @@ class DashenQuickStrengthEngine:
         summary_score_range = _range_dict(int(round(score)) for score in valid_avg_scores)
         overall_avg_score = round(sum(valid_avg_scores) / len(valid_avg_scores), 1) if valid_avg_scores else 0.0
 
+        # Collect persistence data and strip internal keys from output
+        all_match_records: List[Dict[str, Any]] = []
+        all_player_records: List[Dict[str, Any]] = []
         for point in match_points:
             point.pop("_used_previous_season_fallback", None)
+            persist = point.pop("_persist_data", None)
+            if persist and isinstance(persist, dict):
+                mr = persist.get("match_record")
+                if mr:
+                    all_match_records.append(mr)
+                prs = persist.get("player_records") or []
+                all_player_records.extend(prs)
+
+        # Invoke persistence callback if registered
+        if self.on_match_strength_computed and (all_match_records or all_player_records):
+            try:
+                self.on_match_strength_computed(all_match_records, all_player_records)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                print(f"[dashen_quick_strength] on_match_strength_computed callback failed: {exc}")
 
         return {
             "summary": {
@@ -368,11 +391,13 @@ class DashenQuickStrengthEngine:
                 role_type = hero_role_map.get(hero_guid) or normalize_role_type(player.get("roleType"))
                 if not role_type:
                     continue
+                bnet_id = str(player.get("bnetId") or "").strip()
                 participants.append(
                     {
                         "side": side,
                         "player_token": player_token,
                         "role_type": role_type,
+                        "bnet_id": bnet_id,
                     }
                 )
 
@@ -437,6 +462,38 @@ class DashenQuickStrengthEngine:
 
         avg_score = round(sum(latest_role_scores) / len(latest_role_scores), 1) if latest_role_scores else 0.0
 
+        # Collect persistence data for DB write (used by on_match_strength_computed callback)
+        _persist_data = None
+        if avg_score > 0 and latest_role_scores:
+            valid_scores = [s for s in latest_role_scores if s > 0]
+            _persist_data = {
+                "match_record": {
+                    "match_id": match_id,
+                    "avg_score": avg_score,
+                    "player_count": len(valid_scores),
+                    "score_min": min(valid_scores) if valid_scores else None,
+                    "score_max": max(valid_scores) if valid_scores else None,
+                },
+                "player_records": [],
+            }
+            for participant, player_meta in zip(participants, meta_results):
+                if isinstance(player_meta, Exception) or not isinstance(player_meta, dict):
+                    continue
+                bnet_id = participant.get("bnet_id")
+                if not bnet_id:
+                    continue
+                role_type = participant["role_type"]
+                latest_score = player_meta.get("latest_role_scores", {}).get(role_type)
+                latest_season = player_meta.get("latest_role_seasons", {}).get(role_type)
+                if isinstance(latest_score, int) and latest_score > 0:
+                    _persist_data["player_records"].append({
+                        "player_bnet_id": bnet_id,
+                        "role_type": role_type,
+                        "rank_score": latest_score,
+                        "season": latest_season,
+                        "source_match_id": match_id,
+                    })
+
         return {
             "match_id": match_id,
             "begin_ts": _safe_int(source_match.get("beginTs")),
@@ -454,6 +511,7 @@ class DashenQuickStrengthEngine:
             "team_streak_avg": 0.0,
             "enemy_streak_avg": 0.0,
             "_used_previous_season_fallback": used_previous_fallback,
+            "_persist_data": _persist_data,
         }
 
     def _build_hero_role_map(self, config: Dict[str, Any]) -> Dict[str, str]:
@@ -492,4 +550,5 @@ class DashenQuickStrengthEngine:
             "team_streak_avg": 0.0,
             "enemy_streak_avg": 0.0,
             "_used_previous_season_fallback": False,
+            "_persist_data": None,
         }

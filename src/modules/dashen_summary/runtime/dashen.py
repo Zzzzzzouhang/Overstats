@@ -9,6 +9,12 @@ try:
     from overstats.src.client.apiclient import (
         dashen_api_client,
     )
+    from overstats.src.modules.dashen_request_cache import (
+        fetch_paginated_match_entries,
+        list_page_singleflight,
+        match_id_set_from_db,
+        season_key,
+    )
     from overstats.src.modules.season_config import (
         get_dashen_current_season as resolve_dashen_current_season,
         get_dashen_season_rollover_at,
@@ -16,6 +22,12 @@ try:
 except ModuleNotFoundError:
     from src.client.apiclient import (  # type: ignore[no-redef]
         dashen_api_client,
+    )
+    from src.modules.dashen_request_cache import (  # type: ignore[no-redef]
+        fetch_paginated_match_entries,
+        list_page_singleflight,
+        match_id_set_from_db,
+        season_key,
     )
     from src.modules.season_config import (
         get_dashen_current_season as resolve_dashen_current_season,
@@ -260,12 +272,15 @@ async def get_fight_match_list(
 ) -> Optional[Dict[str, Any]]:
     for request_season in iter_dashen_season_request_values(season_c):
         try:
-            payload = await _run_summary_request(
-                dashen_api_client.fight_query_match_list(
-                    token,
-                    game_mode=game_mode,
-                    page=int(page),
-                    season=request_season,
+            payload = await list_page_singleflight.do(
+                ("list", "fight", token, game_mode, season_key(request_season), int(page)),
+                lambda request_season=request_season: _run_summary_request(
+                    dashen_api_client.fight_query_match_list(
+                        token,
+                        game_mode=game_mode,
+                        page=int(page),
+                        season=request_season,
+                    )
                 )
             )
         except Exception:
@@ -295,47 +310,32 @@ async def _get_history_matchK(
     for logical_season in season_candidates:
         season_match_list: List[Dict[str, Any]] = []
         for request_season in iter_dashen_season_request_values(logical_season):
-            page = 1
-            while True:
-                tasks = [
-                    _run_summary_request(
-                        dashen_api_client.query_match_list(
-                            token,
-                            game_mode,
-                            page=page + offset,
-                            season=request_season,
-                        )
+            result = await fetch_paginated_match_entries(
+                source_kind="normal",
+                customer_token=token,
+                game_mode=game_mode,
+                season=request_season,
+                batch_size=batch_size,
+                fetch_page=lambda current_page, request_season=request_season: _run_summary_request(
+                    dashen_api_client.query_match_list(
+                        token,
+                        game_mode,
+                        page=current_page,
+                        season=request_season,
                     )
-                    for offset in range(batch_size)
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                batch_has_data = False
-                batch_max_begin_ts = 0
-                for payload in results:
-                    if isinstance(payload, Exception) or not isinstance(payload, dict):
-                        continue
-                    if payload.get("code") != 0:
-                        continue
-                    entries = _extract_match_entries(payload, "matchList", "recentMatchList")
-                    if not entries:
-                        continue
-                    batch_has_data = True
-                    for item in entries:
-                        entry = dict(item)
-                        entry["_dashenSeason"] = logical_season
-                        entry.setdefault("gameMode", game_mode)
-                        begin_ts = _safe_begin_ts(entry)
-                        batch_max_begin_ts = max(batch_max_begin_ts, begin_ts)
-                        if min_begin_ts is not None and begin_ts < int(min_begin_ts):
-                            continue
-                        season_match_list.append(entry)
-
-                if not batch_has_data:
-                    break
-                if min_begin_ts is not None and batch_max_begin_ts and batch_max_begin_ts < int(min_begin_ts):
-                    break
-                page += batch_size
+                ),
+                extract_entries=lambda payload: _extract_match_entries(payload, "matchList", "recentMatchList")
+                if isinstance(payload, dict) and payload.get("code") == 0
+                else [],
+                begin_ts_getter=_safe_begin_ts,
+                min_begin_ts=min_begin_ts,
+                existing_match_ids=match_id_set_from_db(db),
+            )
+            for item in result.matches:
+                entry = dict(item)
+                entry["_dashenSeason"] = logical_season
+                entry.setdefault("gameMode", game_mode)
+                season_match_list.append(entry)
 
             if season_match_list:
                 break
@@ -483,7 +483,9 @@ def _coerce_rank_score(value: Any) -> Optional[float]:
 
 async def match_rating_recent(match_id: str, token: str, config: Dict[str, Any]) -> tuple[Any, ...]:
     try:
-        payload = await dashen_api_client.query_match_info(token, str(match_id))
+        payload = await dashen_api_client.query_match_info(
+            token, str(match_id), game_mode="leisure"
+        )
     except Exception:
         return (-1, 0, 0, 0, 0, 0, 0, 0, [], [], 0, 0, 0, 0)
 

@@ -172,7 +172,9 @@ class DashenCompetitiveStrengthRequests:
         return list(matches[: int(limit)])
 
     async def get_match_detail(self, customer_token: str, match_id: str) -> Dict[str, Any]:
-        return await self.api_client.query_match_info(customer_token, str(match_id))
+        return await self.api_client.query_match_info(
+            customer_token, str(match_id), game_mode="sport"
+        )
 
     async def list_recent_competitive_payloads(
         self,

@@ -89,18 +89,12 @@ class DashenQuickStrengthModule:
         self,
         api_client: Optional[DashenAPIClient] = None,
         search_module: Optional[BnetSearchModule] = None,
-        on_match_strength_computed: Optional[Any] = None,
     ) -> None:
         self.requests = DashenQuickStrengthRequests(api_client)
         self.engine = DashenQuickStrengthEngine(
             self.requests,
-            on_match_strength_computed=on_match_strength_computed,
         )
         self.search_module = search_module or bnet_search_module
-
-    def set_on_match_strength_computed(self, callback: Optional[Any]) -> None:
-        """Set or replace the persistence callback on the underlying engine."""
-        self.engine.on_match_strength_computed = callback
 
     async def query_quick_strength(
         self,

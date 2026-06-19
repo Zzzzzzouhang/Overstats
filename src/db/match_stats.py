@@ -18,7 +18,50 @@ HERO_PERK_PICK_TABLE = "hero_perk_pick"
 HERO_PERK_SUMMARY_TABLE = "hero_perk_summary"
 MATCH_STRENGTH_CACHE_TABLE = "match_strength_cache"
 PLAYER_COMPETITIVE_RANK_TABLE = "player_competitive_rank"
+PLAYER_COMPETITIVE_RANK_FETCH_TABLE = "player_competitive_rank_fetch"
+MATCH_LIST_PAGE_CACHE_TABLE = "match_list_page_cache"
+MATCH_META_TABLE = "match_meta"
+MATCH_PLAYER_TABLE = "match_player"
 OVERALL_RANK_BUCKET_KEY = -1
+
+# Field order used when inserting match_meta rows.
+MATCH_META_FIELDS = (
+    "match_id",
+    "match_result",
+    "focus_player_side",
+    "match_mode",
+    "map_guid",
+    "start_time",
+    "game_time_sec",
+    "match_list_json",
+    "frozen",
+    "last_update",
+)
+
+# Field order used when inserting match_player rows.
+MATCH_PLAYER_FIELDS = (
+    "match_id",
+    "player_bnet_id",
+    "player_name",
+    "side",
+    "hero_guid",
+    "rank_bucket",
+    "role_type",
+    "kill",
+    "assist",
+    "death",
+    "hero_damage",
+    "healing",
+    "damage_blocked",
+    "friend_bnet_ids_json",
+    "hero_damage_taken",
+    "final_hit",
+    "solo_kills",
+    "target_competing_time",
+    "healing_taken",
+    "endorse_bnet_ids_json",
+    "last_update",
+)
 
 
 class IDPoolDB:
@@ -243,10 +286,114 @@ class IDPoolDB:
                 rank_score INTEGER NOT NULL,
                 season INTEGER,
                 source_match_id TEXT,
+                cache_week TEXT NOT NULL DEFAULT '',
+                checked_at INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (player_bnet_id, role_type)
             )
             """
+        )
+        self._ensure_columns(
+            connection,
+            PLAYER_COMPETITIVE_RANK_TABLE,
+            (
+                ("cache_week", "cache_week TEXT NOT NULL DEFAULT ''"),
+                ("checked_at", "checked_at INTEGER NOT NULL DEFAULT 0"),
+            ),
+        )
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {PLAYER_COMPETITIVE_RANK_FETCH_TABLE} (
+                player_bnet_id TEXT NOT NULL,
+                cache_week TEXT NOT NULL,
+                game_mode TEXT NOT NULL,
+                checked_at INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (player_bnet_id, cache_week, game_mode)
+            )
+            """
+        )
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {MATCH_LIST_PAGE_CACHE_TABLE} (
+                source_kind TEXT NOT NULL,
+                customer_token TEXT NOT NULL,
+                game_mode TEXT NOT NULL,
+                season_key TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{{}}',
+                match_ids_json TEXT NOT NULL DEFAULT '[]',
+                entry_count INTEGER NOT NULL DEFAULT 0,
+                fetched_at INTEGER NOT NULL DEFAULT 0,
+                stop_reason TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (source_kind, customer_token, game_mode, season_key, page)
+            )
+            """
+        )
+        # match_meta: stores per-match metadata (one row per match)
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {MATCH_META_TABLE} (
+                match_id TEXT PRIMARY KEY,
+                match_result INTEGER,
+                focus_player_side TEXT,
+                match_mode TEXT,
+                map_guid TEXT NOT NULL DEFAULT '',
+                start_time INTEGER NOT NULL DEFAULT 0,
+                game_time_sec INTEGER NOT NULL DEFAULT 0,
+                match_list_json TEXT,
+                frozen INTEGER NOT NULL DEFAULT 0,
+                last_update INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        # match_player: stores per-player per-match data (10 rows per match)
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {MATCH_PLAYER_TABLE} (
+                match_id TEXT NOT NULL,
+                player_bnet_id TEXT NOT NULL,
+                player_name TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                hero_guid TEXT NOT NULL DEFAULT '',
+                rank_bucket INTEGER,
+                role_type TEXT NOT NULL DEFAULT '',
+                kill INTEGER NOT NULL DEFAULT 0,
+                assist INTEGER NOT NULL DEFAULT 0,
+                death INTEGER NOT NULL DEFAULT 0,
+                hero_damage INTEGER NOT NULL DEFAULT 0,
+                healing INTEGER NOT NULL DEFAULT 0,
+                damage_blocked INTEGER NOT NULL DEFAULT 0,
+                friend_bnet_ids_json TEXT,
+                hero_damage_taken INTEGER NOT NULL DEFAULT 0,
+                final_hit INTEGER NOT NULL DEFAULT 0,
+                solo_kills INTEGER NOT NULL DEFAULT 0,
+                target_competing_time REAL NOT NULL DEFAULT 0,
+                healing_taken INTEGER NOT NULL DEFAULT 0,
+                endorse_bnet_ids_json TEXT,
+                last_update INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (match_id, player_bnet_id)
+            )
+            """
+        )
+        # Ensure new columns exist on older databases.
+        self._ensure_columns(
+            connection,
+            MATCH_META_TABLE,
+            (
+                ("frozen", "frozen INTEGER NOT NULL DEFAULT 0"),
+            ),
+        )
+        self._ensure_columns(
+            connection,
+            MATCH_PLAYER_TABLE,
+            (
+                ("hero_damage_taken", "hero_damage_taken INTEGER NOT NULL DEFAULT 0"),
+                ("final_hit", "final_hit INTEGER NOT NULL DEFAULT 0"),
+                ("solo_kills", "solo_kills INTEGER NOT NULL DEFAULT 0"),
+                ("target_competing_time", "target_competing_time REAL NOT NULL DEFAULT 0"),
+                ("healing_taken", "healing_taken INTEGER NOT NULL DEFAULT 0"),
+                ("endorse_bnet_ids_json", "endorse_bnet_ids_json TEXT"),
+            ),
         )
         index_statements = (
             f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{COMP_DATA_TABLE}_uniq "
@@ -267,6 +414,14 @@ class IDPoolDB:
             f"ON {HERO_PERK_SUMMARY_TABLE} (hero_guid, perk_level, rank_bucket_key, perk_guid)",
             f"CREATE INDEX IF NOT EXISTS idx_{PLAYER_COMPETITIVE_RANK_TABLE}_player "
             f"ON {PLAYER_COMPETITIVE_RANK_TABLE} (player_bnet_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_{PLAYER_COMPETITIVE_RANK_TABLE}_week_player "
+            f"ON {PLAYER_COMPETITIVE_RANK_TABLE} (cache_week, player_bnet_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_{MATCH_LIST_PAGE_CACHE_TABLE}_lookup "
+            f"ON {MATCH_LIST_PAGE_CACHE_TABLE} (source_kind, customer_token, game_mode, season_key, page)",
+            f"CREATE INDEX IF NOT EXISTS idx_{MATCH_PLAYER_TABLE}_bnet "
+            f"ON {MATCH_PLAYER_TABLE} (player_bnet_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_{MATCH_PLAYER_TABLE}_side "
+            f"ON {MATCH_PLAYER_TABLE} (match_id, side)",
         )
         for statement in index_statements:
             try:
@@ -428,6 +583,65 @@ class IDPoolDB:
             return [int(row[1]) for row in rows if row[1] is not None and int(row[1]) > 0]
         except Exception as exc:
             self._warn_once(f"match stats sqlite get_match_player_rank_scores failed: {type(exc).__name__}: {exc}")
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_hero_details_by_match_player(
+        self, match_id: str, player_bnet_id: str
+    ) -> List[Dict[str, Any]]:
+        """Return hero_match_detail rows for a specific player in a specific match.
+
+        Each row contains hero_guid, stat_map_json, use_time_sec, use_time_rate,
+        rank_score, rank_bucket, map_guid, start_time, game_time_sec.
+        Used by _load_detail_from_db to reconstruct heroList for the focus player.
+        """
+        normalized_match = str(match_id or "").strip()
+        normalized_player = str(player_bnet_id or "").strip()
+        if not normalized_match or not normalized_player:
+            return []
+        conn = self._get_connection()
+        if conn is None:
+            return []
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT hero_guid, stat_map_json, use_time_sec, use_time_rate,
+                           rank_score, rank_bucket, map_guid, start_time, game_time_sec
+                    FROM {HERO_MATCH_DETAIL_TABLE}
+                    WHERE match_id = ? AND player_bnet_id = ?
+                    """,
+                    (normalized_match, normalized_player),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            result: List[Dict[str, Any]] = []
+            for row in rows:
+                result.append(
+                    {
+                        "hero_guid": str(row[0] or ""),
+                        "stat_map_json": str(row[1] or "{}"),
+                        "use_time_sec": float(row[2] or 0),
+                        "use_time_rate": float(row[3] or 0),
+                        "rank_score": int(row[4]) if row[4] is not None else 0,
+                        "rank_bucket": int(row[5]) if row[5] is not None else 0,
+                        "map_guid": str(row[6] or ""),
+                        "start_time": int(row[7] or 0),
+                        "game_time_sec": int(row[8] or 0),
+                    }
+                )
+            return result
+        except Exception as exc:
+            self._warn_once(
+                f"match stats sqlite get_hero_details_by_match_player failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return []
         finally:
             try:
@@ -1279,6 +1493,58 @@ class IDPoolDB:
         )
         conn.execute("DROP TABLE IF EXISTS temp_perk_summary_key")
 
+    def _compute_match_frozen_flag(
+        self,
+        conn,
+        match_id: str,
+        match_player_rows: Optional[Sequence[Dict[str, Any]]],
+    ) -> int:
+        """Decide whether a match should be marked frozen based on roster stability.
+
+        frozen is sticky and set when the player roster (bnetId set + count) of the
+        incoming write is identical to the roster currently stored in DB. This is
+        the empirical "data has settled" signal used to skip future API refreshes.
+        - No existing row / no incoming players -> 0
+        - Already frozen -> stays 1
+        - Same bnetId set & same count as DB -> 1
+        - Otherwise -> 0
+        """
+        if not match_id:
+            return 0
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"SELECT frozen FROM {MATCH_META_TABLE} WHERE match_id = ?",
+                    (match_id,),
+                )
+                meta_row = cursor.fetchone()
+                cursor.execute(
+                    f"SELECT player_bnet_id FROM {MATCH_PLAYER_TABLE} WHERE match_id = ?",
+                    (match_id,),
+                )
+                old_bnets = {str(row[0] or "") for row in (cursor.fetchall() or [])}
+            finally:
+                cursor.close()
+        except Exception:
+            return 0
+
+        # Frozen is sticky: a match that has settled never reopens.
+        if meta_row is not None and int(meta_row[0] or 0) == 1:
+            return 1
+
+        new_bnets = {
+            str((row or {}).get("player_bnet_id") or "")
+            for row in (match_player_rows or [])
+            if str((row or {}).get("player_bnet_id") or "").strip()
+        }
+        if not new_bnets or not old_bnets:
+            return 0
+        # Compare roster fingerprint: same set of bnetIds implies same count.
+        if new_bnets == old_bnets:
+            return 1
+        return 0
+
     def write_match_detail_batch(
         self,
         *,
@@ -1287,17 +1553,94 @@ class IDPoolDB:
         perk_pick_rows: Sequence[Dict[str, Any]],
         comp_summary_keys: Iterable[tuple[str, str, Optional[int]]],
         perk_summary_keys: Iterable[tuple[str, int, Optional[int]]],
+        match_meta_row: Optional[Dict[str, Any]] = None,
+        match_player_rows: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, int]:
-        if not hero_detail_rows and not comp_data_rows and not perk_pick_rows:
-            return {"hero_details": 0, "comp_data": 0, "perk_picks": 0}
+        if (
+            not hero_detail_rows
+            and not comp_data_rows
+            and not perk_pick_rows
+            and not match_meta_row
+            and not match_player_rows
+        ):
+            return {"hero_details": 0, "comp_data": 0, "perk_picks": 0, "match_meta": 0, "match_players": 0}
 
         with self._write_lock:
             conn = self._get_write_connection()
             if conn is None:
-                return {"hero_details": 0, "comp_data": 0, "perk_picks": 0}
+                return {"hero_details": 0, "comp_data": 0, "perk_picks": 0, "match_meta": 0, "match_players": 0}
             try:
                 self._initialize_player_identity_table(conn)
                 self._initialize_match_detail_tables(conn)
+
+                # 1. INSERT OR REPLACE match_meta
+                match_meta_count = 0
+                if match_meta_row:
+                    match_id_for_meta = str(match_meta_row.get("match_id") or "")
+                    # Decide the frozen flag for this match before overwriting.
+                    # frozen is sticky: once a match's player roster is observed
+                    # to be unchanged across two writes, it stays frozen (the data
+                    # has settled). We compute it by comparing the new roster
+                    # (from match_player_rows) against the roster currently in DB.
+                    new_frozen = self._compute_match_frozen_flag(
+                        conn, match_id_for_meta, match_player_rows
+                    )
+                    match_meta_row = dict(match_meta_row)
+                    match_meta_row["frozen"] = new_frozen
+                    conn.execute(
+                        f"""
+                        INSERT OR REPLACE INTO {MATCH_META_TABLE} (
+                            match_id,
+                            match_result,
+                            focus_player_side,
+                            match_mode,
+                            map_guid,
+                            start_time,
+                            game_time_sec,
+                            match_list_json,
+                            frozen,
+                            last_update
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        tuple(match_meta_row.get(k) for k in MATCH_META_FIELDS),
+                    )
+                    match_meta_count = 1
+
+                # 2. INSERT OR REPLACE match_player (up to 10 rows per match)
+                match_player_count = 0
+                if match_player_rows:
+                    conn.executemany(
+                        f"""
+                        INSERT OR REPLACE INTO {MATCH_PLAYER_TABLE} (
+                            match_id,
+                            player_bnet_id,
+                            player_name,
+                            side,
+                            hero_guid,
+                            rank_bucket,
+                            role_type,
+                            kill,
+                            assist,
+                            death,
+                            hero_damage,
+                            healing,
+                            damage_blocked,
+                            friend_bnet_ids_json,
+                            hero_damage_taken,
+                            final_hit,
+                            solo_kills,
+                            target_competing_time,
+                            healing_taken,
+                            endorse_bnet_ids_json,
+                            last_update
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            tuple(row.get(k) for k in MATCH_PLAYER_FIELDS)
+                            for row in match_player_rows
+                        ],
+                    )
+                    match_player_count = len(match_player_rows)
 
                 if hero_detail_rows:
                     conn.executemany(
@@ -1416,15 +1759,483 @@ class IDPoolDB:
                     "hero_details": len(hero_detail_rows),
                     "comp_data": len(comp_data_rows),
                     "perk_picks": len(perk_pick_rows),
+                    "match_meta": match_meta_count,
+                    "match_players": match_player_count,
                 }
             except Exception as exc:
                 self._warn_once(f"match stats sqlite write_match_detail_batch failed: {type(exc).__name__}: {exc}")
-                return {"hero_details": 0, "comp_data": 0, "perk_picks": 0}
+                return {
+                    "hero_details": 0,
+                    "comp_data": 0,
+                    "perk_picks": 0,
+                    "match_meta": 0,
+                    "match_players": 0,
+                }
             finally:
                 try:
                     conn.close()
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # match_list batch write (from MatchListRecorder, INSERT OR IGNORE)
+    # ------------------------------------------------------------------
+
+    def write_match_list_batch(self, rows: Sequence[tuple]) -> int:
+        """Batch INSERT OR IGNORE match_meta rows from queryMatchList.
+
+        Each row is a tuple aligned with MATCH_META_FIELDS.
+        Uses INSERT OR IGNORE so queryMatchInfo data (more complete) is preserved.
+        """
+        if not rows:
+            return 0
+        with self._write_lock:
+            conn = self._get_write_connection()
+            if conn is None:
+                return 0
+            try:
+                self._initialize_match_detail_tables(conn)
+                placeholders = ",".join(["?"] * len(MATCH_META_FIELDS))
+                conn.executemany(
+                    f"INSERT OR IGNORE INTO {MATCH_META_TABLE} "
+                    f"({','.join(MATCH_META_FIELDS)}) VALUES ({placeholders})",
+                    rows,
+                )
+                conn.commit()
+                return len(rows)
+            except Exception as exc:
+                self._warn_once(
+                    f"match stats sqlite write_match_list_batch failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return 0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def write_match_list_page_cache_batch(self, rows: Sequence[Dict[str, Any]]) -> int:
+        """Upsert raw queryMatchList page payloads for observability and reuse."""
+        if not rows:
+            return 0
+        normalized_rows = []
+        for row in rows or []:
+            source_kind = str(row.get("source_kind") or "normal").strip() or "normal"
+            customer_token = str(row.get("customer_token") or "").strip()
+            game_mode = str(row.get("game_mode") or "").strip()
+            season_key = str(row.get("season_key") or "current").strip() or "current"
+            try:
+                page = int(row.get("page") or 0)
+            except (TypeError, ValueError):
+                page = 0
+            if not customer_token or not game_mode or page <= 0:
+                continue
+            normalized_rows.append(
+                (
+                    source_kind,
+                    customer_token,
+                    game_mode,
+                    season_key,
+                    page,
+                    str(row.get("payload_json") or "{}"),
+                    str(row.get("match_ids_json") or "[]"),
+                    int(row.get("entry_count") or 0),
+                    int(row.get("fetched_at") or int(time.time())),
+                    str(row.get("stop_reason") or ""),
+                )
+            )
+        if not normalized_rows:
+            return 0
+        with self._write_lock:
+            conn = self._get_write_connection()
+            if conn is None:
+                return 0
+            try:
+                self._initialize_match_detail_tables(conn)
+                conn.executemany(
+                    f"""
+                    INSERT INTO {MATCH_LIST_PAGE_CACHE_TABLE}
+                        (source_kind, customer_token, game_mode, season_key, page,
+                         payload_json, match_ids_json, entry_count, fetched_at, stop_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source_kind, customer_token, game_mode, season_key, page)
+                    DO UPDATE SET
+                        payload_json = excluded.payload_json,
+                        match_ids_json = excluded.match_ids_json,
+                        entry_count = excluded.entry_count,
+                        fetched_at = excluded.fetched_at,
+                        stop_reason = excluded.stop_reason
+                    """,
+                    normalized_rows,
+                )
+                conn.commit()
+                return len(normalized_rows)
+            except Exception as exc:
+                self._warn_once(
+                    f"match stats sqlite write_match_list_page_cache_batch failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return 0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def update_match_list_page_stop_reason(
+        self,
+        *,
+        source_kind: str,
+        customer_token: str,
+        game_mode: str,
+        season_key: str,
+        page: int,
+        stop_reason: str,
+    ) -> bool:
+        normalized_reason = str(stop_reason or "").strip()
+        if not normalized_reason:
+            return False
+        with self._write_lock:
+            conn = self._get_write_connection()
+            if conn is None:
+                return False
+            try:
+                self._initialize_match_detail_tables(conn)
+                conn.execute(
+                    f"""
+                    INSERT INTO {MATCH_LIST_PAGE_CACHE_TABLE}
+                        (source_kind, customer_token, game_mode, season_key, page,
+                         payload_json, match_ids_json, entry_count, fetched_at, stop_reason)
+                    VALUES (?, ?, ?, ?, ?, '{{}}', '[]', 0, ?, ?)
+                    ON CONFLICT(source_kind, customer_token, game_mode, season_key, page)
+                    DO UPDATE SET stop_reason = excluded.stop_reason
+                    """,
+                    (
+                        str(source_kind or "normal"),
+                        str(customer_token or ""),
+                        str(game_mode or ""),
+                        str(season_key or "current"),
+                        int(page),
+                        int(time.time()),
+                        normalized_reason,
+                    ),
+                )
+                conn.commit()
+                return True
+            except Exception as exc:
+                self._warn_once(
+                    f"match stats sqlite update_match_list_page_stop_reason failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return False
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def get_all_match_ids(self) -> set[str]:
+        """Return a snapshot of all known match ids in match_meta."""
+        conn = self._get_connection()
+        if conn is None:
+            return set()
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(f"SELECT match_id FROM {MATCH_META_TABLE}")
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            return {str(row[0] or "") for row in rows if str(row[0] or "").strip()}
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_all_match_ids failed: {type(exc).__name__}: {exc}")
+            return set()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # token → bnet_id resolution (for CountInfoRecorder)
+    # ------------------------------------------------------------------
+
+    def resolve_bnet_id_by_token(self, customer_token: str) -> str:
+        """Resolve a customer_token to a bnet_id.
+
+        Strategy: the customer_token is the Dashen token associated with a
+        specific player account.  We look up the most recent match_meta row
+        joined with match_player to find the focus player's bnet_id.
+        Falls back to scanning player_identity_map if needed.
+        """
+        token = str(customer_token or "").strip()
+        if not token:
+            return ""
+        conn = self._get_connection()
+        if conn is None:
+            return ""
+        try:
+            cursor = conn.cursor()
+            try:
+                # Strategy 1: find the most recent match_player entry whose
+                # friend_bnet_ids_json or endorse_bnet_ids_json references the
+                # token (these JSON blobs contain related player identifiers).
+                escaped = self._escape_like_pattern(token)
+                cursor.execute(
+                    f"SELECT player_bnet_id FROM {MATCH_PLAYER_TABLE} "
+                    f"WHERE friend_bnet_ids_json LIKE ? ESCAPE '!' "
+                    f"OR endorse_bnet_ids_json LIKE ? ESCAPE '!' "
+                    f"ORDER BY rowid DESC LIMIT 1",
+                    (f"%{escaped}%", f"%{escaped}%"),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return str(row[0] or "")
+
+                # Strategy 2: scan player_identity_map for a matching bnetid
+                # (the token value itself is sometimes used as a lookup key).
+                cursor.execute(
+                    f"SELECT bnetid FROM {PLAYER_IDENTITY_TABLE} "
+                    f"WHERE bnetid = ? OR battletag LIKE ? ESCAPE '!' "
+                    f"ORDER BY update_time DESC LIMIT 1",
+                    (token, f"%{escaped}%"),
+                )
+                id_row = cursor.fetchone()
+                if id_row:
+                    return str(id_row[0] or "")
+                return ""
+            finally:
+                cursor.close()
+        except Exception as exc:
+            self._warn_once(
+                f"match stats resolve_bnet_id_by_token failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return ""
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # match_meta / match_player read helpers (for summary DB fallback)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_player_result(meta: Dict[str, Any], player_side: str) -> int:
+        """Convert match_result (focus-player-relative) to the given player's side.
+
+        If the player is on the same side as the focus player, the result is
+        identical; otherwise it is inverted.
+        """
+        try:
+            match_result = int(meta.get("match_result") or 0)
+        except (TypeError, ValueError):
+            return 0
+        focus_side = str(meta.get("focus_player_side") or "team").strip()
+        if focus_side == str(player_side or "").strip():
+            return match_result
+        return -match_result
+
+    def get_match_meta(self, match_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+        """Return {match_id: {match_result, focus_player_side, match_mode, ...}}."""
+        if not match_ids:
+            return {}
+        conn = self._get_connection()
+        if conn is None:
+            return {}
+        try:
+            placeholders = ",".join(["?"] * len(match_ids))
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT match_id, match_result, focus_player_side, match_mode,
+                           map_guid, start_time, game_time_sec, match_list_json,
+                           frozen, last_update
+                    FROM {MATCH_META_TABLE}
+                    WHERE match_id IN ({placeholders})
+                    """,
+                    tuple(str(mid) for mid in match_ids),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            result: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                result[str(row[0])] = {
+                    "match_id": str(row[0]),
+                    "match_result": row[1],
+                    "focus_player_side": str(row[2] or "team"),
+                    "match_mode": str(row[3] or ""),
+                    "map_guid": str(row[4] or ""),
+                    "start_time": int(row[5] or 0),
+                    "game_time_sec": int(row[6] or 0),
+                    "match_list_json": row[7],
+                    "frozen": int(row[8] or 0),
+                    "last_update": int(row[9] or 0),
+                }
+            return result
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_match_meta failed: {type(exc).__name__}: {exc}")
+            return {}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_match_players(
+        self, match_ids: Sequence[str]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return {match_id: [{player_bnet_id, side, hero_guid, kill, death, ...}]}.
+
+        Used by summary DB fallback to reconstruct teammateList / enemyList.
+        """
+        if not match_ids:
+            return {}
+        conn = self._get_connection()
+        if conn is None:
+            return {}
+        try:
+            placeholders = ",".join(["?"] * len(match_ids))
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT match_id, player_bnet_id, player_name, side, hero_guid,
+                           rank_bucket, role_type, kill, assist, death,
+                           hero_damage, healing, damage_blocked, friend_bnet_ids_json,
+                           hero_damage_taken, final_hit, solo_kills,
+                           target_competing_time, healing_taken, endorse_bnet_ids_json
+                    FROM {MATCH_PLAYER_TABLE}
+                    WHERE match_id IN ({placeholders})
+                    ORDER BY match_id, side, player_bnet_id
+                    """,
+                    tuple(str(mid) for mid in match_ids),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            result: Dict[str, List[Dict[str, Any]]] = {str(mid): [] for mid in match_ids}
+            for row in rows:
+                match_id = str(row[0])
+                result.setdefault(match_id, []).append(
+                    {
+                        "match_id": match_id,
+                        "player_bnet_id": str(row[1]),
+                        "player_name": str(row[2] or ""),
+                        "side": str(row[3] or ""),
+                        "hero_guid": str(row[4] or ""),
+                        "rank_bucket": row[5],
+                        "role_type": str(row[6] or ""),
+                        "kill": int(row[7] or 0),
+                        "assist": int(row[8] or 0),
+                        "death": int(row[9] or 0),
+                        "hero_damage": int(row[10] or 0),
+                        "healing": int(row[11] or 0),
+                        "damage_blocked": int(row[12] or 0),
+                        "friend_bnet_ids_json": row[13],
+                        "hero_damage_taken": int(row[14] or 0),
+                        "final_hit": int(row[15] or 0),
+                        "solo_kills": int(row[16] or 0),
+                        "target_competing_time": float(row[17] or 0),
+                        "healing_taken": int(row[18] or 0),
+                        "endorse_bnet_ids_json": row[19],
+                    }
+                )
+            return result
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_match_players failed: {type(exc).__name__}: {exc}")
+            return {}
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_match_details_by_player(
+        self,
+        player_bnet_id: str,
+        *,
+        since_ts: int = 0,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Return a player's match list from DB (JOIN match_meta + match_player).
+
+        Each entry includes match_result already converted to the player's perspective.
+        Used by summary DB fallback to avoid re-fetching from API.
+        """
+        normalized_bnet = str(player_bnet_id or "").strip()
+        if not normalized_bnet:
+            return []
+        conn = self._get_connection()
+        if conn is None:
+            return []
+        try:
+            cursor = conn.cursor()
+            try:
+                if since_ts > 0:
+                    cursor.execute(
+                        f"""
+                        SELECT m.match_id, m.match_result, m.focus_player_side, m.match_mode,
+                               m.map_guid, m.start_time, m.game_time_sec, m.match_list_json,
+                               p.side
+                        FROM {MATCH_META_TABLE} m
+                        JOIN {MATCH_PLAYER_TABLE} p ON m.match_id = p.match_id
+                        WHERE p.player_bnet_id = ? AND m.start_time >= ?
+                        ORDER BY m.start_time DESC
+                        LIMIT ?
+                        """,
+                        (normalized_bnet, int(since_ts), int(limit)),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT m.match_id, m.match_result, m.focus_player_side, m.match_mode,
+                               m.map_guid, m.start_time, m.game_time_sec, m.match_list_json,
+                               p.side
+                        FROM {MATCH_META_TABLE} m
+                        JOIN {MATCH_PLAYER_TABLE} p ON m.match_id = p.match_id
+                        WHERE p.player_bnet_id = ?
+                        ORDER BY m.start_time DESC
+                        LIMIT ?
+                        """,
+                        (normalized_bnet, int(limit)),
+                    )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            results: List[Dict[str, Any]] = []
+            for row in rows:
+                meta = {
+                    "match_result": row[1],
+                    "focus_player_side": str(row[2] or "team"),
+                }
+                player_side = str(row[8] or "team")
+                results.append(
+                    {
+                        "match_id": str(row[0]),
+                        "match_result": self.get_player_result(meta, player_side),
+                        "match_mode": str(row[3] or ""),
+                        "map_guid": str(row[4] or ""),
+                        "start_time": int(row[5] or 0),
+                        "game_time_sec": int(row[6] or 0),
+                        "match_list_json": row[7],
+                        "player_side": player_side,
+                    }
+                )
+            return results
+        except Exception as exc:
+            self._warn_once(f"match stats sqlite get_match_details_by_player failed: {type(exc).__name__}: {exc}")
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def upsert_player_identity_records(self, rows: Iterable[Dict[str, Any]]) -> int:
         normalized_rows: Dict[str, tuple[str, str, str, str, int]] = {}
@@ -1597,59 +2408,13 @@ class IDPoolDB:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # match_strength_cache: per-match avg_score from dashen_quick_strength
-    # ------------------------------------------------------------------
-
-    def upsert_match_strength_batch(
-        self,
-        records: Sequence[Dict[str, Any]],
-    ) -> int:
-        """Batch upsert match strength records. Returns count of rows written."""
-        if not records:
-            return 0
-        with self._write_lock:
-            conn = self._get_write_connection()
-            if conn is None:
-                return 0
-            try:
-                self._initialize_match_detail_tables(conn)
-                now = int(time.time())
-                rows = [
-                    (
-                        str(r.get("match_id") or ""),
-                        float(r.get("avg_score") or 0),
-                        int(r.get("player_count") or 0),
-                        r.get("score_min"),
-                        r.get("score_max"),
-                        now,
-                    )
-                    for r in records
-                    if r.get("match_id") and float(r.get("avg_score") or 0) > 0
-                ]
-                if not rows:
-                    return 0
-                conn.executemany(
-                    f"""
-                    INSERT OR REPLACE INTO {MATCH_STRENGTH_CACHE_TABLE}
-                        (match_id, avg_score, player_count, score_min, score_max, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    rows,
-                )
-                conn.commit()
-                return len(rows)
-            except Exception as exc:
-                self._warn_once(f"match stats sqlite upsert_match_strength_batch failed: {type(exc).__name__}: {exc}")
-                return 0
-            finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
     def get_match_strength(self, match_ids: Sequence[str]) -> Dict[str, float]:
-        """Read cached avg_score for given match_ids. Returns {match_id: avg_score}."""
+        """Read cached avg_score for given match_ids from match_strength_cache.
+
+        Also attempts to compute from match_player + player_competitive_rank
+        when match_strength_cache has no data (backward-compatible).
+        Returns {match_id: avg_score}.
+        """
         if not match_ids:
             return {}
         conn = self._get_connection()
@@ -1659,17 +2424,50 @@ class IDPoolDB:
             placeholders = ",".join(["?"] * len(match_ids))
             cursor = conn.cursor()
             try:
+                # Tier A: read from match_strength_cache (legacy)
                 cursor.execute(
                     f"SELECT match_id, avg_score FROM {MATCH_STRENGTH_CACHE_TABLE} "
                     f"WHERE match_id IN ({placeholders}) AND avg_score > 0",
                     tuple(str(mid) for mid in match_ids),
                 )
                 rows = cursor.fetchall() or []
+                result = {
+                    str(r[0]): float(r[1])
+                    for r in rows
+                    if r[0] and float(r[1] or 0) > 0
+                }
+                if result:
+                    return result
+
+                # Tier B: compute from match_player + player_competitive_rank
+                cursor.execute(
+                    f"""
+                    SELECT mp.match_id,
+                           AVG(CAST(pcr.rank_score AS REAL)) AS avg_score
+                    FROM {MATCH_PLAYER_TABLE} mp
+                    JOIN {PLAYER_COMPETITIVE_RANK_TABLE} pcr
+                      ON mp.player_bnet_id = pcr.player_bnet_id
+                      AND mp.role_type = pcr.role_type
+                    WHERE mp.match_id IN ({placeholders})
+                      AND pcr.rank_score > 0
+                    GROUP BY mp.match_id
+                    HAVING avg_score > 0
+                    """,
+                    tuple(str(mid) for mid in match_ids),
+                )
+                computed_rows = cursor.fetchall() or []
             finally:
                 cursor.close()
-            return {str(r[0]): float(r[1]) for r in rows if r[0] and float(r[1] or 0) > 0}
+            return {
+                str(r[0]): float(r[1])
+                for r in computed_rows
+                if r[0] and float(r[1] or 0) > 0
+            }
         except Exception as exc:
-            self._warn_once(f"match stats sqlite get_match_strength failed: {type(exc).__name__}: {exc}")
+            self._warn_once(
+                f"match stats sqlite get_match_strength failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return {}
         finally:
             try:
@@ -1684,6 +2482,9 @@ class IDPoolDB:
     def upsert_player_competitive_ranks(
         self,
         records: Sequence[Dict[str, Any]],
+        *,
+        cache_week: str = "",
+        checked_at: Optional[int] = None,
     ) -> int:
         """Batch upsert player competitive rank records. Returns count of rows written."""
         if not records:
@@ -1694,7 +2495,7 @@ class IDPoolDB:
                 return 0
             try:
                 self._initialize_match_detail_tables(conn)
-                now = int(time.time())
+                now = int(checked_at or time.time())
                 rows = [
                     (
                         str(r.get("player_bnet_id") or ""),
@@ -1702,6 +2503,8 @@ class IDPoolDB:
                         int(r.get("rank_score") or 0),
                         r.get("season"),
                         str(r.get("source_match_id") or ""),
+                        str(r.get("cache_week") or cache_week or ""),
+                        int(r.get("checked_at") or now),
                         now,
                     )
                     for r in records
@@ -1714,8 +2517,9 @@ class IDPoolDB:
                 conn.executemany(
                     f"""
                     INSERT OR REPLACE INTO {PLAYER_COMPETITIVE_RANK_TABLE}
-                        (player_bnet_id, role_type, rank_score, season, source_match_id, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (player_bnet_id, role_type, rank_score, season, source_match_id,
+                         cache_week, checked_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
@@ -1733,8 +2537,26 @@ class IDPoolDB:
     def get_player_competitive_ranks(
         self,
         player_bnet_ids: Sequence[str],
+        cache_week: str = "",
     ) -> Dict[str, Dict[str, int]]:
         """Read competitive ranks for given players. Returns {bnet_id: {role_type: rank_score}}."""
+        records = self.get_player_competitive_rank_records(player_bnet_ids, cache_week=cache_week)
+        return {
+            player_id: {
+                role: int(data.get("rank_score") or 0)
+                for role, data in role_map.items()
+                if int(data.get("rank_score") or 0) > 0
+            }
+            for player_id, role_map in records.items()
+        }
+
+    def get_player_competitive_rank_records(
+        self,
+        player_bnet_ids: Sequence[str],
+        *,
+        cache_week: str = "",
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Read competitive rank records with metadata by player and role."""
         if not player_bnet_ids:
             return {}
         conn = self._get_connection()
@@ -1744,30 +2566,159 @@ class IDPoolDB:
             placeholders = ",".join(["?"] * len(player_bnet_ids))
             cursor = conn.cursor()
             try:
+                params: List[Any] = [str(pid) for pid in player_bnet_ids]
+                week_clause = ""
+                if cache_week:
+                    week_clause = " AND cache_week = ?"
+                    params.append(str(cache_week))
                 cursor.execute(
-                    f"SELECT player_bnet_id, role_type, rank_score FROM {PLAYER_COMPETITIVE_RANK_TABLE} "
-                    f"WHERE player_bnet_id IN ({placeholders}) AND rank_score > 0",
-                    tuple(str(pid) for pid in player_bnet_ids),
+                    f"""
+                    SELECT player_bnet_id, role_type, rank_score, season, source_match_id,
+                           cache_week, checked_at, updated_at
+                    FROM {PLAYER_COMPETITIVE_RANK_TABLE}
+                    WHERE player_bnet_id IN ({placeholders}) AND rank_score > 0{week_clause}
+                    """,
+                    tuple(params),
                 )
                 rows = cursor.fetchall() or []
             finally:
                 cursor.close()
-            result: Dict[str, Dict[str, int]] = {}
+            result: Dict[str, Dict[str, Dict[str, Any]]] = {}
             for row in rows:
                 pid = str(row[0])
                 role = str(row[1])
                 score = int(row[2])
                 if score > 0:
-                    result.setdefault(pid, {})[role] = score
+                    result.setdefault(pid, {})[role] = {
+                        "rank_score": score,
+                        "season": row[3],
+                        "source_match_id": str(row[4] or ""),
+                        "cache_week": str(row[5] or ""),
+                        "checked_at": int(row[6] or 0),
+                        "updated_at": int(row[7] or 0),
+                    }
             return result
         except Exception as exc:
-            self._warn_once(f"match stats sqlite get_player_competitive_ranks failed: {type(exc).__name__}: {exc}")
+            self._warn_once(f"match stats sqlite get_player_competitive_rank_records failed: {type(exc).__name__}: {exc}")
             return {}
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
+
+    def get_player_competitive_rank_fetch_markers(
+        self,
+        player_bnet_ids: Sequence[str],
+        *,
+        cache_week: str,
+        game_mode: str = "sport",
+    ) -> set[str]:
+        if not player_bnet_ids or not cache_week:
+            return set()
+        conn = self._get_connection()
+        if conn is None:
+            return set()
+        try:
+            placeholders = ",".join(["?"] * len(player_bnet_ids))
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT player_bnet_id FROM {PLAYER_COMPETITIVE_RANK_FETCH_TABLE}
+                    WHERE player_bnet_id IN ({placeholders}) AND cache_week = ? AND game_mode = ?
+                    """,
+                    tuple(str(pid) for pid in player_bnet_ids) + (str(cache_week), str(game_mode or "sport")),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            return {str(row[0] or "") for row in rows if str(row[0] or "").strip()}
+        except Exception as exc:
+            self._warn_once(
+                f"match stats sqlite get_player_competitive_rank_fetch_markers failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return set()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def upsert_player_competitive_rank_snapshot(
+        self,
+        player_bnet_id: str,
+        *,
+        cache_week: str,
+        game_mode: str = "sport",
+        role_rank_records: Sequence[Dict[str, Any]] = (),
+        checked_at: Optional[int] = None,
+    ) -> int:
+        """Write a player's weekly rank snapshot and fetch marker in one transaction."""
+        normalized_player_id = str(player_bnet_id or "").strip()
+        normalized_week = str(cache_week or "").strip()
+        if not normalized_player_id or not normalized_week:
+            return 0
+        now = int(checked_at or time.time())
+        rows = []
+        for record in role_rank_records or []:
+            role_type = str(record.get("role_type") or "").strip()
+            try:
+                rank_score = int(record.get("rank_score") or 0)
+            except (TypeError, ValueError):
+                rank_score = 0
+            if not role_type or rank_score <= 0:
+                continue
+            rows.append(
+                (
+                    normalized_player_id,
+                    role_type,
+                    rank_score,
+                    record.get("season"),
+                    str(record.get("source_match_id") or ""),
+                    normalized_week,
+                    now,
+                    now,
+                )
+            )
+        with self._write_lock:
+            conn = self._get_write_connection()
+            if conn is None:
+                return 0
+            try:
+                self._initialize_match_detail_tables(conn)
+                if rows:
+                    conn.executemany(
+                        f"""
+                        INSERT OR REPLACE INTO {PLAYER_COMPETITIVE_RANK_TABLE}
+                            (player_bnet_id, role_type, rank_score, season, source_match_id,
+                             cache_week, checked_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows,
+                    )
+                conn.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {PLAYER_COMPETITIVE_RANK_FETCH_TABLE}
+                        (player_bnet_id, cache_week, game_mode, checked_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (normalized_player_id, normalized_week, str(game_mode or "sport"), now),
+                )
+                conn.commit()
+                return len(rows)
+            except Exception as exc:
+                self._warn_once(
+                    f"match stats sqlite upsert_player_competitive_rank_snapshot failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return 0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def get_entry_ds_exact_ci_one(self, battletag: str, battlenum: Optional[int] = None) -> Optional[Dict[str, Any]]:
         return None

@@ -449,8 +449,11 @@ async def _build_image_base64(
     timer: StageTimer,
 ) -> str:
     customer_token = resolved_target["customer_token"]
+    focus_bnet_id = str(resolved_target.get("bnet_id") or "")
     timer.mark("REQUEST_READY", f"title={title_text}; match_count={len(matches)}; all_match_count={len(all_matches or [])}")
-    detail_task = asyncio.create_task(runtime.summary._fetch_details(customer_token, matches))
+    detail_task = asyncio.create_task(
+        runtime.summary._fetch_details(customer_token, matches, focus_bnet_id=focus_bnet_id)
+    )
     quick_dist_task = asyncio.create_task(runtime.summary._build_quick_strength_distribution_data(customer_token, matches))
     detail_pairs, quick_dist_data = await asyncio.gather(detail_task, quick_dist_task)
     timer.mark(

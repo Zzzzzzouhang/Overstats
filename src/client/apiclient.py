@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
+import contextvars
 from dataclasses import dataclass
 import hashlib
 import os
@@ -55,11 +56,19 @@ except ModuleNotFoundError:
 
 if TYPE_CHECKING:
     try:
-        from overstats.src.db.match_detail_recorder import MatchDetailRecorder
+        from overstats.src.db.match_detail_recorder import (
+            CountInfoRecorder,
+            MatchDetailRecorder,
+            MatchListRecorder,
+        )
         from overstats.src.db.player_identity import PlayerIdentityRecorder
         from overstats.src.db.request_metrics import RequestMetricsRecorder
     except ModuleNotFoundError:
-        from src.db.match_detail_recorder import MatchDetailRecorder
+        from src.db.match_detail_recorder import (
+            CountInfoRecorder,
+            MatchDetailRecorder,
+            MatchListRecorder,
+        )
         from src.db.player_identity import PlayerIdentityRecorder
         from src.db.request_metrics import RequestMetricsRecorder
 
@@ -806,6 +815,13 @@ def _build_default_netease_client() -> SafeClient:
     return SafeClient(raw_clients, labels=labels, groups=groups)
 
 
+# Per-task game_mode context to avoid race conditions when concurrent async
+# calls (e.g. asyncio.gather with "leisure" and "sport") share the same client.
+_current_game_mode_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_game_mode", default=""
+)
+
+
 class DashenAPIClient:
     """Request-only client for Dashen and adjacent public endpoints."""
 
@@ -828,6 +844,8 @@ class DashenAPIClient:
         self.match_detail_recorder = match_detail_recorder
         self.player_identity_recorder = player_identity_recorder
         self.request_metrics_recorder = request_metrics_recorder
+        self.match_list_recorder: Optional[Any] = None
+        self.count_info_recorder: Optional[Any] = None
         self.netease_client = netease_client or _build_default_netease_client()
         self.proxy_client = proxy_client or SafeClient(
             _build_async_client(INTERNATIONAL_PROXY),
@@ -907,9 +925,58 @@ class DashenAPIClient:
         if payload.get("code") != 0 or not isinstance(payload.get("data"), dict):
             return
         try:
-            await recorder.enqueue(str(url or ""), payload)
+            await recorder.enqueue(str(url or ""), payload, game_mode=_current_game_mode_var.get())
         except Exception as exc:
             print(f"[overstats] failed to record match detail url={url}: {exc}")
+
+    async def _record_match_list_payload(self, url: str, payload: Any) -> None:
+        """Record queryMatchList payloads into match_meta via MatchListRecorder."""
+        if not is_database_write_enabled():
+            return
+        recorder = self.match_list_recorder
+        if recorder is None or not isinstance(payload, dict):
+            return
+        try:
+            parsed_url = httpx.URL(str(url or ""))
+        except Exception:
+            return
+        path = str(parsed_url.path or "").rstrip("/")
+        host = (parsed_url.host or "").lower()
+        if host != DATAMSAPI_HOST or path not in {
+            "/v1/a19ld5tool/customer/queryMatchList",
+            "/v1/a19ld5tool/customer/fight/queryMatchList",
+        }:
+            return
+        if payload.get("code") != 0:
+            return
+        try:
+            await recorder.enqueue(
+                str(url or ""), payload, game_mode=_current_game_mode_var.get()
+            )
+        except Exception as exc:
+            print(f"[overstats] failed to record match list url={url}: {exc}")
+
+    async def _record_count_info_payload(self, url: str, payload: Any) -> None:
+        """Record queryCountInfo payloads into player_competitive_rank via CountInfoRecorder."""
+        if not is_database_write_enabled():
+            return
+        recorder = self.count_info_recorder
+        if recorder is None or not isinstance(payload, dict):
+            return
+        try:
+            parsed_url = httpx.URL(str(url or ""))
+        except Exception:
+            return
+        path = str(parsed_url.path or "").rstrip("/")
+        host = (parsed_url.host or "").lower()
+        if host != DATAMSAPI_HOST or path != "/v1/a19ld5tool/customer/queryCountInfo":
+            return
+        if payload.get("code") != 0:
+            return
+        try:
+            await recorder.enqueue(str(url or ""), payload)
+        except Exception as exc:
+            print(f"[overstats] failed to record count info url={url}: {exc}")
 
     async def request_json(
         self,
@@ -987,6 +1054,8 @@ class DashenAPIClient:
         if upstream_success:
             await self._record_player_identity_payload(request_url, payload)
             await self._record_match_detail_payload(request_url, payload)
+            await self._record_match_list_payload(request_url, payload)
+            await self._record_count_info_payload(request_url, payload)
         return payload
 
     async def request_bytes(self, url: str, *, use_proxy: bool = False, **kwargs: Any) -> bytes:
@@ -1076,13 +1145,17 @@ class DashenAPIClient:
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
         params = {"gameMode": game_mode, "token": customer_token, **_season_params(season)}
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/queryCountInfo",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params=params,
-        )
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/queryCountInfo",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params=params,
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
     async def query_match_list(
         self,
@@ -1092,22 +1165,30 @@ class DashenAPIClient:
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
         params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/queryMatchList",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params=params,
-        )
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/queryMatchList",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params=params,
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
-    async def query_match_info(self, customer_token: str, match_id: str) -> Dict[str, Any]:
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/queryMatchInfo",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params={"matchId": match_id, "token": customer_token},
-        )
+    async def query_match_info(self, customer_token: str, match_id: str, *, game_mode: str = "") -> Dict[str, Any]:
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/queryMatchInfo",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params={"matchId": match_id, "token": customer_token},
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
     async def fight_query_match_info(self, customer_token: str, match_id: str) -> Dict[str, Any]:
         return await self.request_json(
@@ -1146,13 +1227,17 @@ class DashenAPIClient:
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
         params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/fight/queryMatchList",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params=params,
-        )
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/fight/queryMatchList",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params=params,
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
     async def query_province_rank(
         self,

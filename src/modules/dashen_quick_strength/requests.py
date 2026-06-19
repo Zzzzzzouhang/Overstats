@@ -7,9 +7,21 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
     from overstats.src.client.apiclient import DashenAPIClient, dashen_api_client
+    from overstats.src.modules.dashen_request_cache import (
+        fetch_paginated_match_entries,
+        list_page_singleflight,
+        match_id_set_from_db,
+        season_key,
+    )
     from overstats.src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient, dashen_api_client
+    from src.modules.dashen_request_cache import (
+        fetch_paginated_match_entries,
+        list_page_singleflight,
+        match_id_set_from_db,
+        season_key,
+    )
     from src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 
 
@@ -134,36 +146,30 @@ class DashenQuickStrengthRequests:
         for logical_season in seasons:
             season_matches: List[Dict[str, Any]] = []
             for request_season in iter_dashen_season_request_values(logical_season):
-                page = 1
-                while count_unique_match_entries(season_matches) < int(limit):
-                    tasks = [
-                        self.api_client.query_match_list(
-                            customer_token,
-                            "leisure",
-                            page=page + offset,
-                            season=request_season,
-                        )
-                        for offset in range(max(1, int(pages_per_batch)))
-                    ]
-                    payloads = await asyncio.gather(*tasks, return_exceptions=True)
-                    batch_has_data = False
-                    for payload in payloads:
-                        if isinstance(payload, Exception) or not isinstance(payload, dict):
-                            continue
-                        if payload.get("code") != 0:
-                            continue
-                        entries = extract_match_entries(payload, "matchList", "recentMatchList")
-                        if not entries:
-                            continue
-                        batch_has_data = True
-                        for match in entries:
-                            item = dict(match)
-                            item["_dashenSeason"] = logical_season
-                            item.setdefault("gameMode", "leisure")
-                            season_matches.append(item)
-                    if not batch_has_data:
-                        break
-                    page += max(1, int(pages_per_batch))
+                result = await fetch_paginated_match_entries(
+                    source_kind="normal",
+                    customer_token=customer_token,
+                    game_mode="leisure",
+                    season=request_season,
+                    batch_size=max(1, int(pages_per_batch)),
+                    fetch_page=lambda current_page, request_season=request_season: self.api_client.query_match_list(
+                        customer_token,
+                        "leisure",
+                        page=current_page,
+                        season=request_season,
+                    ),
+                    extract_entries=lambda payload: extract_match_entries(payload, "matchList", "recentMatchList")
+                    if isinstance(payload, dict) and payload.get("code") == 0
+                    else [],
+                    begin_ts_getter=_match_begin_ts,
+                    existing_match_ids=match_id_set_from_db(),
+                    target_count=int(limit),
+                )
+                for match in result.matches:
+                    item = dict(match)
+                    item["_dashenSeason"] = logical_season
+                    item.setdefault("gameMode", "leisure")
+                    season_matches.append(item)
                 if season_matches:
                     break
             matches = merge_unique_match_entries(matches, season_matches)
@@ -172,7 +178,9 @@ class DashenQuickStrengthRequests:
         return list(matches[: int(limit)])
 
     async def get_match_detail(self, customer_token: str, match_id: str) -> Dict[str, Any]:
-        return await self.api_client.query_match_info(customer_token, str(match_id))
+        return await self.api_client.query_match_info(
+            customer_token, str(match_id), game_mode="leisure"
+        )
 
     async def list_recent_competitive_payloads(
         self,
@@ -249,11 +257,14 @@ class DashenQuickStrengthRequests:
             for page in range(start_page_num, max_page_num + 1):
                 last_page = page
                 try:
-                    payload = await self.api_client.query_match_list(
-                        customer_token,
-                        "leisure",
-                        page=page,
-                        season=request_season,
+                    payload = await list_page_singleflight.do(
+                        ("list", "normal", customer_token, "leisure", season_key(request_season), page),
+                        lambda page=page, request_season=request_season: self.api_client.query_match_list(
+                            customer_token,
+                            "leisure",
+                            page=page,
+                            season=request_season,
+                        ),
                     )
                 except Exception:
                     break

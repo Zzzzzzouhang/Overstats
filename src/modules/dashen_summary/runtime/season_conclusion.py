@@ -12,6 +12,7 @@ from collections import Counter, OrderedDict, defaultdict
 from functools import partial
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Dict, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from ....constants.backgrounds import build_random_map_background
@@ -34,8 +35,10 @@ from .stat_reference import get_cached_statmap_summary as _shared_get_cached_sta
 
 try:
     from overstats.src.modules.font_resolver import load_font
+    from overstats.src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
+    from src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
 
 
 def _read_env_int(name, default):
@@ -56,6 +59,10 @@ SUMMARY_EXTRA_ASSET_DIR = QUERY_TOOL_ASSET_DIR / "extra"
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "res", "query_tool.json")
 RANK_DISTRIBUTION_CACHE_DIR = os.path.join(MODULE_DIR, "cache", "rank_distribution_daily")
 SEASON_SUMMARY_URL_LIMIT = 6
+# Detail fetch: match age (seconds) beyond which data is considered settled.
+MATCH_DETAIL_AGE_FROZEN_SEC = max(600, _read_env_int("OVERSTATS_DETAIL_AGE_FROZEN_SEC", 4 * 3600))
+# Detail fetch: within the fresh window, DB data younger than this is trusted.
+MATCH_DETAIL_DB_FRESHNESS_SEC = max(60, _read_env_int("OVERSTATS_DETAIL_DB_FRESHNESS_SEC", 35 * 60))
 SEASON_SUMMARY_RENDER_CONCURRENCY = get_global_render_limit()
 SEASON_SUMMARY_RENDER_LOG_WAIT_MS = 200
 _SEASON_SUMMARY_URL_SEMAPHORES = {}
@@ -697,66 +704,67 @@ async def _fetch_normal_match_page(customer_token, game_mode, page):
 
 
 async def _fetch_normal_match_list(customer_token, game_mode):
+    result = await fetch_paginated_match_entries(
+        source_kind="normal",
+        customer_token=customer_token,
+        game_mode=game_mode,
+        season=int(season),
+        batch_size=SEASON_SUMMARY_URL_LIMIT,
+        fetch_page=lambda current_page: _limited_call(
+            lambda: dashen_api_client.query_match_list(
+                customer_token,
+                game_mode,
+                page=current_page,
+                season=int(season),
+            )
+        ),
+        extract_entries=lambda payload: _extract_match_entries(payload, "matchList", "recentMatchList")
+        if isinstance(payload, dict) and payload.get("code") == 0
+        else [],
+        begin_ts_getter=lambda item: int((item or {}).get("beginTs") or 0),
+        existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB),
+    )
     match_list = []
-    page = 1
-    batch_size = SEASON_SUMMARY_URL_LIMIT
-    while True:
-        pages = range(page, page + batch_size)
-        results = await asyncio.gather(
-            *[_fetch_normal_match_page(customer_token, game_mode, current_page) for current_page in pages]
-        )
-        batch_has_data = False
-        for entries in results:
-            if not entries:
-                continue
-            batch_has_data = True
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                item = dict(item)
-                item["_seasonSummaryMode"] = game_mode
-                item.setdefault("gameMode", game_mode)
-                match_list.append(item)
-        if not batch_has_data:
-            break
-        page += batch_size
+    for item in result.matches:
+        if not isinstance(item, dict):
+            continue
+        item = dict(item)
+        item["_seasonSummaryMode"] = game_mode
+        item.setdefault("gameMode", game_mode)
+        match_list.append(item)
     return match_list
 
 
 async def _fetch_fight_match_list(customer_token):
     all_matches = []
     for game_mode in ("QuickFight", "LeisureFight", "SportFight"):
-        page = 1
-        while True:
-            payloads = await asyncio.gather(
-                *[
-                    _limited_call(
-                        lambda game_mode=game_mode, current_page=page + offset: get_fight_match_list(
-                            customer_token,
-                            game_mode,
-                            current_page,
-                            season,
-                        )
-                    )
-                    for offset in range(SEASON_SUMMARY_URL_LIMIT)
-                ]
-            )
-            batch_has_data = False
-            for payload in payloads:
-                entries = _extract_match_entries(payload, "matchList", "recentMatchList")
-                if not entries:
-                    continue
-                batch_has_data = True
-                for item in entries:
-                    if not isinstance(item, dict):
-                        continue
-                    item = dict(item)
-                    item["gameMode"] = game_mode
-                    item["_seasonSummaryFight"] = True
-                    all_matches.append(item)
-            if not batch_has_data:
-                break
-            page += SEASON_SUMMARY_URL_LIMIT
+        result = await fetch_paginated_match_entries(
+            source_kind="fight",
+            customer_token=customer_token,
+            game_mode=game_mode,
+            season=int(season),
+            batch_size=SEASON_SUMMARY_URL_LIMIT,
+            fetch_page=lambda current_page, game_mode=game_mode: _limited_call(
+                lambda: get_fight_match_list(
+                    customer_token,
+                    game_mode,
+                    current_page,
+                    season,
+                )
+            ),
+            extract_entries=lambda payload: _extract_match_entries(payload, "matchList", "recentMatchList")
+            if isinstance(payload, dict) and payload.get("code") == 0
+            else [],
+            begin_ts_getter=lambda item: int((item or {}).get("beginTs") or 0),
+            existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB),
+        )
+        for item in result.matches:
+            if not isinstance(item, dict):
+                continue
+            item = dict(item)
+            item["gameMode"] = game_mode
+            item["_seasonSummaryFight"] = True
+            all_matches.append(item)
     return all_matches
 
 
@@ -791,7 +799,183 @@ async def _fetch_season_match_lists(customer_token):
     return deduped
 
 
-async def _fetch_details(customer_token, matches):
+def _load_detail_from_db(match_id: str, focus_bnet_id: str = "") -> Optional[Dict[str, Any]]:
+    """Try to reconstruct a queryMatchInfo-like detail dict from DB.
+
+    Returns None when the DB does not have complete data for this match.
+    The returned dict is compatible with _detail_root() and _find_me() consumers.
+    If focus_bnet_id is empty, the focus player is auto-detected as the row that
+    has friend_bnet_ids_json set.
+    """
+    try:
+        meta = _GROUP_TITLE_DB.get_match_meta([match_id]).get(match_id)
+        if not meta:
+            return None
+        players_by_match = _GROUP_TITLE_DB.get_match_players([match_id])
+        players = players_by_match.get(match_id, [])
+        if len(players) < 10:
+            return None
+
+        # Determine the focus player's side for matchRet conversion.
+        # If focus_bnet_id is empty, auto-detect: the focus player is the one
+        # with friend_bnet_ids_json set.
+        if not focus_bnet_id:
+            for p in players:
+                if p.get("friend_bnet_ids_json"):
+                    focus_bnet_id = p.get("player_bnet_id", "")
+                    break
+        focus_side = "team"
+        for p in players:
+            if p.get("player_bnet_id") == focus_bnet_id:
+                focus_side = p.get("side", "team")
+                break
+        match_ret = _GROUP_TITLE_DB.get_player_result(meta, focus_side)
+
+        def _build_player_dict(p: Dict[str, Any]) -> Dict[str, Any]:
+            friend_ids: list = []
+            raw_fj = p.get("friend_bnet_ids_json")
+            if raw_fj:
+                try:
+                    friend_ids = json.loads(raw_fj)
+                except Exception:
+                    friend_ids = []
+            endorse_ids: list = []
+            raw_ej = p.get("endorse_bnet_ids_json")
+            if raw_ej:
+                try:
+                    endorse_ids = json.loads(raw_ej)
+                except Exception:
+                    endorse_ids = []
+            return {
+                "bnetId": p.get("player_bnet_id"),
+                "name": p.get("player_name", ""),
+                "heroGuid": p.get("hero_guid", ""),
+                "kill": p.get("kill", 0),
+                "assist": p.get("assist", 0),
+                "death": p.get("death", 0),
+                "heroDamage": p.get("hero_damage", 0),
+                "cure": p.get("healing", 0),
+                "resistDamage": p.get("damage_blocked", 0),
+                "damageTaken": p.get("hero_damage_taken", 0),
+                "finalHit": p.get("final_hit", 0),
+                "soloKills": p.get("solo_kills", 0),
+                "targetCompetingTime": p.get("target_competing_time", 0),
+                "healingTaken": p.get("healing_taken", 0),
+                "rankInfo": {"rankScore": p.get("rank_bucket") or 0},
+                "friendBnetIds": friend_ids,
+                "endorserBnetIds": endorse_ids,
+            }
+
+        teammates = [_build_player_dict(p) for p in players if p.get("side") == "team"]
+        enemies = [_build_player_dict(p) for p in players if p.get("side") == "enemy"]
+
+        # CRITICAL: The side values in match_player are from the LATEST querier's
+        # perspective (due to INSERT OR REPLACE). If the current focus player is
+        # on the "enemy" side, we must swap teammates/enemies so that
+        # teammateList always represents the focus player's actual team.
+        # This fixes medals, friend/stranger classification, and highlight data.
+        if focus_side == "enemy":
+            teammates, enemies = enemies, teammates
+
+        # Reconstruct nameMap from player names.
+        name_map: Dict[str, str] = {}
+        for p in players:
+            bid = p.get("player_bnet_id")
+            pname = p.get("player_name", "")
+            if bid and pname:
+                name_map[str(bid)] = pname
+
+        # Load perk data for traitGuids reconstruction.
+        try:
+            conn = _GROUP_TITLE_DB._get_connection()
+            trait_map: Dict[str, list] = {}
+            mod_map: Dict[str, list] = {}
+            if conn is not None:
+                try:
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute(
+                            "SELECT player_bnet_id, perk_guid, perk_level "
+                            "FROM hero_perk_pick WHERE match_id = ?",
+                            (match_id,),
+                        )
+                        for row in cursor.fetchall() or []:
+                            bid = str(row[0])
+                            perk_guid = str(row[1])
+                            perk_level = int(row[2] or 0)
+                            target = trait_map if perk_level == 1 else mod_map
+                            target.setdefault(bid, []).append(perk_guid)
+                    finally:
+                        cursor.close()
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            def _inject_perks(player_list: list) -> list:
+                for pl in player_list:
+                    bid = str(pl.get("bnetId") or "")
+                    pl["traitGuids"] = trait_map.get(bid, [])
+                    pl["modGuids"] = mod_map.get(bid, [])
+                return player_list
+
+            teammates = _inject_perks(teammates)
+            enemies = _inject_perks(enemies)
+        except Exception:
+            pass
+
+        # Reconstruct heroList from hero_match_detail for the focus player.
+        # This is critical for _build_period_stat_highlights (亮眼表现) which
+        # reads me.heroList[].statMap to compute highlight data.
+        hero_list: list = []
+        try:
+            hero_details = _GROUP_TITLE_DB.get_hero_details_by_match_player(
+                match_id, focus_bnet_id
+            )
+            for hd in hero_details:
+                try:
+                    stat_map = json.loads(hd.get("stat_map_json") or "{}")
+                except Exception:
+                    stat_map = {}
+                if not stat_map:
+                    continue
+                hero_list.append({
+                    "heroGuid": hd.get("hero_guid", ""),
+                    "heroId": hd.get("hero_guid", ""),
+                    "userTimeSec": hd.get("use_time_sec", 0),
+                    "useTimeRate": hd.get("use_time_rate", 0),
+                    "statMap": stat_map,
+                })
+        except Exception:
+            pass
+
+        # If heroList is empty or game_time_sec is 0, the DB data is incomplete.
+        # This happens during concurrent execution when MatchListRecorder writes
+        # match_meta (with game_time_sec=0) before MatchDetailRecorder finishes,
+        # or when the MatchDetailRecorder async queue hasn't drained yet.
+        # Return None to force API fallback so rendering gets complete data.
+        if not hero_list or not meta.get("game_time_sec"):
+            return None
+
+        detail: Dict[str, Any] = {
+            "matchRet": match_ret,
+            "gameTimeSec": meta.get("game_time_sec", 0),
+            "mapGuid": meta.get("map_guid", ""),
+            "startTime": meta.get("start_time", 0),
+            "bnetId": focus_bnet_id,
+            "heroList": hero_list,
+            "teammateList": teammates,
+            "enemyList": enemies,
+            "nameMap": name_map,
+        }
+        return detail
+    except Exception as exc:
+        print(f"[season_conclusion] _load_detail_from_db failed for {match_id}: {exc}")
+        return None
+
+
+async def _fetch_details(customer_token, matches, focus_bnet_id=""):
     async def fetch_one(match):
         match_id = match.get("matchId")
         if not match_id:
@@ -799,6 +983,8 @@ async def _fetch_details(customer_token, matches):
         is_fight_match = _is_fight(match)
         now_ts = time.time()
         cache_key = (str(customer_token), str(match_id), "fight" if is_fight_match else "normal")
+
+        # ── Layer 1: in-memory cache (30-min TTL, unchanged) ──
         cached = _SUMMARY_DETAIL_CACHE.get(cache_key)
         if cached and cached.get("expiry", 0) > now_ts:
             try:
@@ -807,22 +993,70 @@ async def _fetch_details(customer_token, matches):
                 pass
             return match, cached.get("data")
 
+        # ── Fight matches: always go straight to API + cache ──
         if is_fight_match:
             payload = await _limited_call(lambda: ds_get_single_fight_match(customer_token, match_id))
-        else:
-            payload = await _limited_call(lambda: ds_get_single_match(customer_token, match_id))
-        if payload and payload.get("code") == 0:
-            data = payload.get("data") or {}
-            _SUMMARY_DETAIL_CACHE[cache_key] = {
-                "expiry": now_ts + SUMMARY_DETAIL_CACHE_TTL,
-                "data": data,
-            }
-            while len(_SUMMARY_DETAIL_CACHE) > SUMMARY_DETAIL_CACHE_MAX:
-                _SUMMARY_DETAIL_CACHE.popitem(last=False)
-            return match, data
-        return match, None
+            if payload and payload.get("code") == 0:
+                data = payload.get("data") or {}
+                _SUMMARY_DETAIL_CACHE[cache_key] = {
+                    "expiry": now_ts + SUMMARY_DETAIL_CACHE_TTL,
+                    "data": data,
+                }
+                while len(_SUMMARY_DETAIL_CACHE) > SUMMARY_DETAIL_CACHE_MAX:
+                    _SUMMARY_DETAIL_CACHE.popitem(last=False)
+                return match, data
+            return match, None
+
+        # ── Normal matches: frozen / age-aware DB-first logic ──
+        # Read match_meta to get frozen, last_update, start_time (game start).
+        db_meta = _GROUP_TITLE_DB.get_match_meta([str(match_id)]).get(str(match_id))
+        match_ts = (int(match.get("beginTs") or 0) / 1000) or (db_meta or {}).get("start_time", 0)
+        age_sec = now_ts - match_ts if match_ts > 0 else 0
+
+        # Layer 2: frozen flag takes absolute priority.
+        if db_meta and db_meta.get("frozen"):
+            db_detail = _load_detail_from_db(str(match_id), focus_bnet_id)
+            if db_detail is not None:
+                return match, db_detail
+
+        # Layer 3: age-based decisions.
+        if age_sec > MATCH_DETAIL_AGE_FROZEN_SEC:
+            # Data has settled — trust DB if the write itself happened after
+            # the game had settled (db_last_update - match_ts > threshold).
+            db_last_update = (db_meta or {}).get("last_update", 0)
+            db_detail = _load_detail_from_db(str(match_id), focus_bnet_id)
+            if db_detail is not None and (db_last_update - match_ts) > MATCH_DETAIL_AGE_FROZEN_SEC:
+                return match, db_detail
+            # DB missing or written while data was still fresh → refresh once.
+            return await _fetch_and_cache(match, match_id, customer_token, cache_key, now_ts)
+
+        # age_sec ≤ threshold: data may still be changing.
+        if db_meta:
+            db_last_update = (db_meta or {}).get("last_update", 0)
+            if now_ts - db_last_update <= MATCH_DETAIL_DB_FRESHNESS_SEC:
+                # DB is still fresh enough → trust it, skip API.
+                db_detail = _load_detail_from_db(str(match_id), focus_bnet_id)
+                if db_detail is not None:
+                    return match, db_detail
+        # DB missing / stale → refresh from API.
+        return await _fetch_and_cache(match, match_id, customer_token, cache_key, now_ts)
 
     return await asyncio.gather(*(fetch_one(match) for match in matches))
+
+
+async def _fetch_and_cache(match, match_id, customer_token, cache_key, now_ts):
+    """Fetch a single normal match from API, cache the result, return (match, data)."""
+    payload = await _limited_call(lambda: ds_get_single_match(customer_token, match_id))
+    if payload and payload.get("code") == 0:
+        data = payload.get("data") or {}
+        _SUMMARY_DETAIL_CACHE[cache_key] = {
+            "expiry": now_ts + SUMMARY_DETAIL_CACHE_TTL,
+            "data": data,
+        }
+        while len(_SUMMARY_DETAIL_CACHE) > SUMMARY_DETAIL_CACHE_MAX:
+            _SUMMARY_DETAIL_CACHE.popitem(last=False)
+        return match, data
+    return match, None
 
 
 def _find_me(detail, resolved_target):
@@ -1465,7 +1699,7 @@ async def _build_quick_strength_distribution_data(customer_token, matches):
             }
         )
 
-    # Tier 2 fallback: match_strength_cache (populated by dashen_quick_strength, DB-only)
+    # Tier 2 fallback: match_strength_cache or computed from match_player + player_competitive_rank
     cache_missed_ids = [str(m.get("matchId")) for m in api_missed_matches if m.get("matchId")]
     if cache_missed_ids and len(sample_points) < len(sampled_matches):
         try:

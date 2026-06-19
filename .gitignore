@@ -15,6 +15,7 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+.qoder/
 
 # OS files
 .DS_Store
@@ -36,3 +37,7 @@ api_test_data.json
 !/test/test_blizzard_profile.py
 !/test/test_ow_guess_catalog.py
 !/test/test_ow_hero_leaderboard_service.py
+src/db/match_stats.sqlite3.old
+.gitignore
+.vibe/review_diff.txt
+CUsersDocumorialAppDataLocalTempseason_diff.txt

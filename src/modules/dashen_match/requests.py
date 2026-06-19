@@ -7,9 +7,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
     from overstats.src.client.apiclient import DashenAPIClient, dashen_api_client
+    from overstats.src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
     from overstats.src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient, dashen_api_client
+    from src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
     from src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 
 
@@ -346,22 +348,29 @@ class DashenMatchRequests:
     ) -> List[Dict[str, Any]]:
         matches: List[Dict[str, Any]] = []
         for game_mode in game_modes:
-            page = 1
-            while True:
-                tasks = [
-                    self.api_client.query_match_list(customer_token, game_mode, page=page + offset, season=season)
-                    for offset in range(pages_per_batch)
-                ]
-                batch = await asyncio.gather(*tasks, return_exceptions=True)
-                batch_matches = self._extract_history_batch(batch, min_begin_ts=min_begin_ts)
-                if not batch_matches:
-                    break
-                for match in batch_matches:
-                    match.setdefault("gameMode", game_mode)
-                matches = merge_unique_match_entries(matches, batch_matches)
-                if self._batch_is_older_than(batch_matches, min_begin_ts):
-                    break
-                page += pages_per_batch
+            result = await fetch_paginated_match_entries(
+                source_kind="normal",
+                customer_token=customer_token,
+                game_mode=str(game_mode),
+                season=season,
+                batch_size=pages_per_batch,
+                fetch_page=lambda current_page, game_mode=game_mode: self.api_client.query_match_list(
+                    customer_token,
+                    game_mode,
+                    page=current_page,
+                    season=season,
+                ),
+                extract_entries=lambda payload: extract_match_entries(payload, "matchList", "recentMatchList")
+                if isinstance(payload, dict) and payload.get("code") == 0
+                else [],
+                begin_ts_getter=_match_begin_ts,
+                min_begin_ts=min_begin_ts,
+                existing_match_ids=match_id_set_from_db(),
+            )
+            batch_matches = [dict(match) for match in result.matches]
+            for match in batch_matches:
+                match.setdefault("gameMode", game_mode)
+            matches = merge_unique_match_entries(matches, batch_matches)
         return matches
 
     async def _fetch_history_for_fight_modes(
@@ -375,22 +384,29 @@ class DashenMatchRequests:
     ) -> List[Dict[str, Any]]:
         matches: List[Dict[str, Any]] = []
         for game_mode in fight_modes:
-            page = 1
-            while True:
-                tasks = [
-                    self.api_client.fight_query_match_list(customer_token, game_mode, page=page + offset, season=season)
-                    for offset in range(pages_per_batch)
-                ]
-                batch = await asyncio.gather(*tasks, return_exceptions=True)
-                batch_matches = self._extract_history_batch(batch, min_begin_ts=min_begin_ts)
-                if not batch_matches:
-                    break
-                for match in batch_matches:
-                    match["gameMode"] = game_mode
-                matches = merge_unique_match_entries(matches, batch_matches)
-                if self._batch_is_older_than(batch_matches, min_begin_ts):
-                    break
-                page += pages_per_batch
+            result = await fetch_paginated_match_entries(
+                source_kind="fight",
+                customer_token=customer_token,
+                game_mode=str(game_mode),
+                season=season,
+                batch_size=pages_per_batch,
+                fetch_page=lambda current_page, game_mode=game_mode: self.api_client.fight_query_match_list(
+                    customer_token,
+                    game_mode,
+                    page=current_page,
+                    season=season,
+                ),
+                extract_entries=lambda payload: extract_match_entries(payload, "matchList", "recentMatchList")
+                if isinstance(payload, dict) and payload.get("code") == 0
+                else [],
+                begin_ts_getter=_match_begin_ts,
+                min_begin_ts=min_begin_ts,
+                existing_match_ids=match_id_set_from_db(),
+            )
+            batch_matches = [dict(match) for match in result.matches]
+            for match in batch_matches:
+                match["gameMode"] = game_mode
+            matches = merge_unique_match_entries(matches, batch_matches)
         return matches
 
     def _extract_history_batch(self, payloads: Sequence[Any], *, min_begin_ts: Optional[int]) -> List[Dict[str, Any]]:

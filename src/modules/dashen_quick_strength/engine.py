@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from .requests import DashenQuickStrengthRequests, get_live_dashen_season
+
+try:
+    from overstats.src.db.match_stats import IDPoolDB
+    from overstats.src.modules.dashen_request_cache import current_cache_week, rank_singleflight
+except ModuleNotFoundError:
+    from src.db.match_stats import IDPoolDB
+    from src.modules.dashen_request_cache import current_cache_week, rank_singleflight
 
 
 DEFAULT_MATCH_LIMIT = 12
@@ -205,6 +213,54 @@ def _build_player_competitive_meta(
     }
 
 
+def _build_player_competitive_meta_from_scores(
+    scores_by_role: Dict[str, int],
+    *,
+    live_season: int,
+) -> Dict[str, Any]:
+    normalized_scores = {
+        normalize_role_type(role): int(score)
+        for role, score in (scores_by_role or {}).items()
+        if normalize_role_type(role) and int(score or 0) > 0
+    }
+    return {
+        "recent_payloads": [],
+        "latest_role_scores": dict(normalized_scores),
+        "latest_role_seasons": {role: int(live_season) for role in normalized_scores},
+        "current_role_scores": dict(normalized_scores),
+    }
+
+
+def _rank_records_from_payloads(
+    recent_payloads: Sequence[tuple[int, List[Dict[str, Any]]]],
+    *,
+    player_bnet_id: str,
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    seen_roles: set[str] = set()
+    for season_num, guide_count_data in recent_payloads or []:
+        for row in guide_count_data or []:
+            if not isinstance(row, dict):
+                continue
+            role_type = normalize_role_type(row.get("roleType"))
+            if not role_type or role_type in seen_roles:
+                continue
+            score = convert_rank_score((row.get("lastRankInfo") or {}).get("rankScore"))
+            if score is None:
+                continue
+            seen_roles.add(role_type)
+            records.append(
+                {
+                    "player_bnet_id": player_bnet_id,
+                    "role_type": role_type,
+                    "rank_score": score,
+                    "season": int(season_num),
+                    "source_match_id": "",
+                }
+            )
+    return records
+
+
 class DashenQuickStrengthEngine:
     def __init__(
         self,
@@ -213,15 +269,11 @@ class DashenQuickStrengthEngine:
         score_lookback: int = DEFAULT_SCORE_LOOKBACK,
         streak_history_pages: int = DEFAULT_STREAK_HISTORY_PAGES,
         match_concurrency: int = DEFAULT_MATCH_CONCURRENCY,
-        on_match_strength_computed: Optional[Any] = None,
     ) -> None:
         self.requests = requests
         self.score_lookback = max(0, min(MAX_SCORE_LOOKBACK, int(score_lookback)))
         self.streak_history_pages = max(1, int(streak_history_pages))
         self.match_concurrency = max(1, int(match_concurrency))
-        # Optional callback(match_records: list[dict], player_records: list[dict])
-        # Invoked after build() with aggregated persistence data.
-        self.on_match_strength_computed = on_match_strength_computed
 
     async def build(
         self,
@@ -253,8 +305,11 @@ class DashenQuickStrengthEngine:
         hero_role_map = self._build_hero_role_map(config)
         match_detail_cache: Dict[str, Dict[str, Any]] = {}
         match_detail_tasks: Dict[str, asyncio.Task[Dict[str, Any]]] = {}
+        rank_db = IDPoolDB()
+        rank_cache_week = current_cache_week()
+        player_rank_records: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        player_rank_markers: set[str] = set()
         player_competitive_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
-        player_competitive_tasks: Dict[tuple[str, str], asyncio.Task[Dict[str, Any]]] = {}
         semaphore = asyncio.Semaphore(self.match_concurrency)
 
         async def get_match_detail(match_id: str) -> Dict[str, Any]:
@@ -271,29 +326,87 @@ class DashenQuickStrengthEngine:
                 match_detail_tasks.pop(cache_key, None)
             return match_detail_cache[cache_key]
 
-        async def get_player_competitive_meta(player_token: str, role_type: str) -> Dict[str, Any]:
-            cache_key = (str(player_token or ""), normalize_role_type(role_type))
+        async def get_player_competitive_meta(player_token: str, role_type: str, player_bnet_id: str = "") -> Dict[str, Any]:
+            normalized_bnet = str(player_bnet_id or "").strip()
+            cache_subject = normalized_bnet or str(player_token or "")
+            cache_key = (cache_subject, normalize_role_type(role_type))
             if cache_key in player_competitive_cache:
                 return player_competitive_cache[cache_key]
-            task = player_competitive_tasks.get(cache_key)
-            if task is None:
-                async def _load_competitive_meta() -> Dict[str, Any]:
-                    recent_payloads = await self.requests.list_recent_competitive_payloads(
-                        cache_key[0],
-                        current_season=live_season,
-                        max_lookback=self.score_lookback,
-                        required_role=cache_key[1],
+
+            if normalized_bnet:
+                if normalized_bnet not in player_rank_records:
+                    records = await asyncio.to_thread(
+                        rank_db.get_player_competitive_rank_records,
+                        [normalized_bnet],
+                        cache_week=rank_cache_week,
                     )
-                    return _build_player_competitive_meta(
-                        recent_payloads,
+                    player_rank_records.update(records)
+                cached_roles = player_rank_records.get(normalized_bnet) or {}
+                if cached_roles:
+                    scores_by_role = {
+                        role: int(record.get("rank_score") or 0)
+                        for role, record in cached_roles.items()
+                        if int(record.get("rank_score") or 0) > 0
+                    }
+                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_scores(
+                        scores_by_role,
                         live_season=live_season,
                     )
-                task = asyncio.create_task(_load_competitive_meta())
-                player_competitive_tasks[cache_key] = task
-            try:
-                player_competitive_cache[cache_key] = await task
-            finally:
-                player_competitive_tasks.pop(cache_key, None)
+                    return player_competitive_cache[cache_key]
+
+                if normalized_bnet not in player_rank_markers:
+                    markers = await asyncio.to_thread(
+                        rank_db.get_player_competitive_rank_fetch_markers,
+                        [normalized_bnet],
+                        cache_week=rank_cache_week,
+                        game_mode="sport",
+                    )
+                    player_rank_markers.update(markers)
+                if normalized_bnet in player_rank_markers:
+                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_scores(
+                        {},
+                        live_season=live_season,
+                    )
+                    return player_competitive_cache[cache_key]
+
+            async def _load_competitive_meta() -> Dict[str, Any]:
+                recent_payloads = await self.requests.list_recent_competitive_payloads(
+                    str(player_token or ""),
+                    current_season=live_season,
+                    max_lookback=self.score_lookback,
+                    required_role=cache_key[1],
+                )
+                if normalized_bnet:
+                    records = _rank_records_from_payloads(recent_payloads, player_bnet_id=normalized_bnet)
+                    await asyncio.to_thread(
+                        rank_db.upsert_player_competitive_rank_snapshot,
+                        normalized_bnet,
+                        cache_week=rank_cache_week,
+                        game_mode="sport",
+                        role_rank_records=records,
+                        checked_at=int(time.time()),
+                    )
+                    player_rank_markers.add(normalized_bnet)
+                    player_rank_records[normalized_bnet] = {
+                        str(record.get("role_type") or ""): {
+                            "rank_score": int(record.get("rank_score") or 0),
+                            "season": record.get("season"),
+                            "cache_week": rank_cache_week,
+                        }
+                        for record in records
+                    }
+                return _build_player_competitive_meta(
+                    recent_payloads,
+                    live_season=live_season,
+                )
+
+            if normalized_bnet:
+                player_competitive_cache[cache_key] = await rank_singleflight.do(
+                    ("rank", rank_cache_week, normalized_bnet),
+                    _load_competitive_meta,
+                )
+            else:
+                player_competitive_cache[cache_key] = await _load_competitive_meta()
             return player_competitive_cache[cache_key]
 
         async def build_one(source_match: Dict[str, Any]) -> Dict[str, Any]:
@@ -331,27 +444,9 @@ class DashenQuickStrengthEngine:
         summary_score_range = _range_dict(int(round(score)) for score in valid_avg_scores)
         overall_avg_score = round(sum(valid_avg_scores) / len(valid_avg_scores), 1) if valid_avg_scores else 0.0
 
-        # Collect persistence data and strip internal keys from output
-        all_match_records: List[Dict[str, Any]] = []
-        all_player_records: List[Dict[str, Any]] = []
+        # Strip internal keys from output
         for point in match_points:
             point.pop("_used_previous_season_fallback", None)
-            persist = point.pop("_persist_data", None)
-            if persist and isinstance(persist, dict):
-                mr = persist.get("match_record")
-                if mr:
-                    all_match_records.append(mr)
-                prs = persist.get("player_records") or []
-                all_player_records.extend(prs)
-
-        # Invoke persistence callback if registered
-        if self.on_match_strength_computed and (all_match_records or all_player_records):
-            try:
-                self.on_match_strength_computed(all_match_records, all_player_records)
-            except Exception as exc:
-                import traceback
-                traceback.print_exc()
-                print(f"[dashen_quick_strength] on_match_strength_computed callback failed: {exc}")
 
         return {
             "summary": {
@@ -409,6 +504,7 @@ class DashenQuickStrengthEngine:
                 get_player_competitive_meta(
                     item["player_token"],
                     item["role_type"],
+                    item.get("bnet_id", ""),
                 )
                 for item in participants
             ),
@@ -462,38 +558,6 @@ class DashenQuickStrengthEngine:
 
         avg_score = round(sum(latest_role_scores) / len(latest_role_scores), 1) if latest_role_scores else 0.0
 
-        # Collect persistence data for DB write (used by on_match_strength_computed callback)
-        _persist_data = None
-        if avg_score > 0 and latest_role_scores:
-            valid_scores = [s for s in latest_role_scores if s > 0]
-            _persist_data = {
-                "match_record": {
-                    "match_id": match_id,
-                    "avg_score": avg_score,
-                    "player_count": len(valid_scores),
-                    "score_min": min(valid_scores) if valid_scores else None,
-                    "score_max": max(valid_scores) if valid_scores else None,
-                },
-                "player_records": [],
-            }
-            for participant, player_meta in zip(participants, meta_results):
-                if isinstance(player_meta, Exception) or not isinstance(player_meta, dict):
-                    continue
-                bnet_id = participant.get("bnet_id")
-                if not bnet_id:
-                    continue
-                role_type = participant["role_type"]
-                latest_score = player_meta.get("latest_role_scores", {}).get(role_type)
-                latest_season = player_meta.get("latest_role_seasons", {}).get(role_type)
-                if isinstance(latest_score, int) and latest_score > 0:
-                    _persist_data["player_records"].append({
-                        "player_bnet_id": bnet_id,
-                        "role_type": role_type,
-                        "rank_score": latest_score,
-                        "season": latest_season,
-                        "source_match_id": match_id,
-                    })
-
         return {
             "match_id": match_id,
             "begin_ts": _safe_int(source_match.get("beginTs")),
@@ -511,7 +575,6 @@ class DashenQuickStrengthEngine:
             "team_streak_avg": 0.0,
             "enemy_streak_avg": 0.0,
             "_used_previous_season_fallback": used_previous_fallback,
-            "_persist_data": _persist_data,
         }
 
     def _build_hero_role_map(self, config: Dict[str, Any]) -> Dict[str, str]:
@@ -550,5 +613,4 @@ class DashenQuickStrengthEngine:
             "team_streak_avg": 0.0,
             "enemy_streak_avg": 0.0,
             "_used_previous_season_fallback": False,
-            "_persist_data": None,
         }

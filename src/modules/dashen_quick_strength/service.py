@@ -104,8 +104,10 @@ class DashenQuickStrengthModule:
     ) -> DashenQuickStrengthOutput:
         query, resolved_bnet = await self._resolve_query(query)
         config = self._load_ow_config()
+        resolved_bnet_id = resolved_bnet.bnet_id if resolved_bnet else (query.bnet_id or "")
         computed = await self.engine.build(
             customer_token=query.customer_token,
+            bnet_id=resolved_bnet_id,
             limit=normalize_limit(query.limit),
             include_previous_season=bool(query.include_previous_season),
             config=config,

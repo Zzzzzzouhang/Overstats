@@ -67,9 +67,26 @@ def season_key(season: Any) -> str:
     return str(season)
 
 
-def match_id_set_from_db(db: Optional[IDPoolDB] = None) -> set[str]:
+def match_id_set_from_db(
+    db: Optional[IDPoolDB] = None,
+    *,
+    bnet_id: str = "",
+    customer_token: str = "",
+    limit: int = 1000,
+) -> set[str]:
+    """Return a set of known match_ids for stop-condition deduplication.
+
+    - If *bnet_id* is provided, return only that player's match_ids (max *limit*).
+    - Else if *customer_token* is provided, resolve to bnet_id first.
+    - Else fall back to the global set (backward compatible).
+    """
     db = db or IDPoolDB()
     try:
+        resolved_bnet = str(bnet_id or "").strip()
+        if not resolved_bnet and customer_token:
+            resolved_bnet = str(db.resolve_bnet_id_by_token(customer_token) or "").strip()
+        if resolved_bnet:
+            return db.get_player_match_ids(resolved_bnet, limit=limit)
         return db.get_all_match_ids()
     except Exception:
         return set()
@@ -95,6 +112,7 @@ async def fetch_paginated_match_entries(
     begin_ts_getter: BeginTsGetter,
     min_begin_ts: Optional[int] = None,
     existing_match_ids: Optional[set[str]] = None,
+    bnet_id: str = "",
     stop_from_page: int = 4,
     target_count: Optional[int] = None,
     db: Optional[IDPoolDB] = None,
@@ -102,7 +120,14 @@ async def fetch_paginated_match_entries(
     """Fetch match-list pages with per-page singleflight and DB-snapshot stopping."""
 
     db_adapter = db or IDPoolDB()
-    snapshot_ids = set(existing_match_ids) if existing_match_ids is not None else match_id_set_from_db(db_adapter)
+    if existing_match_ids is not None:
+        snapshot_ids = set(existing_match_ids)
+    else:
+        snapshot_ids = match_id_set_from_db(
+            db_adapter,
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+        )
     normalized_batch_size = max(1, int(batch_size or 1))
     first_stop_page = max(1, int(stop_from_page or 4))
     page = 1

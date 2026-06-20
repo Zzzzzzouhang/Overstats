@@ -295,6 +295,7 @@ async def _get_history_matchK(
     token: str,
     game_mode: str,
     *,
+    bnet_id: str = "",
     season_c: Optional[int] = None,
     minimum_match_count: int = 0,
     merge_all_recent_seasons: bool = False,
@@ -329,7 +330,7 @@ async def _get_history_matchK(
                 else [],
                 begin_ts_getter=_safe_begin_ts,
                 min_begin_ts=min_begin_ts,
-                existing_match_ids=match_id_set_from_db(db),
+                existing_match_ids=match_id_set_from_db(db, bnet_id=bnet_id),
             )
             for item in result.matches:
                 entry = dict(item)
@@ -356,10 +357,12 @@ async def get_history_comp_matchK(
     minimum_match_count: int = 0,
     merge_all_recent_seasons: bool = False,
     min_begin_ts: Optional[int] = None,
+    bnet_id: str = "",
 ) -> List[Dict[str, Any]]:
     return await _get_history_matchK(
         token,
         "sport",
+        bnet_id=bnet_id,
         season_c=season_c,
         minimum_match_count=minimum_match_count,
         merge_all_recent_seasons=merge_all_recent_seasons,
@@ -373,10 +376,12 @@ async def get_history_leis_matchK(
     minimum_match_count: int = 0,
     merge_all_recent_seasons: bool = False,
     min_begin_ts: Optional[int] = None,
+    bnet_id: str = "",
 ) -> List[Dict[str, Any]]:
     return await _get_history_matchK(
         token,
         "leisure",
+        bnet_id=bnet_id,
         season_c=season_c,
         minimum_match_count=minimum_match_count,
         merge_all_recent_seasons=merge_all_recent_seasons,

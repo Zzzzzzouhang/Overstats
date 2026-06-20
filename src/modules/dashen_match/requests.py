@@ -184,6 +184,7 @@ class DashenMatchRequests:
         self,
         customer_token: str,
         *,
+        bnet_id: str = "",
         game_modes: Sequence[str] = ("sport", "leisure"),
         fight_modes: Sequence[str] = DEFAULT_FIGHT_MODES,
         seasons: Optional[Sequence[int]] = None,
@@ -198,6 +199,7 @@ class DashenMatchRequests:
             for request_season in iter_dashen_season_request_values(logical_season):
                 normal = await self._fetch_history_for_modes(
                     customer_token,
+                    bnet_id=bnet_id,
                     game_modes=game_modes,
                     season=request_season,
                     pages_per_batch=pages_per_batch,
@@ -205,6 +207,7 @@ class DashenMatchRequests:
                 )
                 fight = await self._fetch_history_for_fight_modes(
                     customer_token,
+                    bnet_id=bnet_id,
                     fight_modes=fight_modes,
                     season=request_season,
                     pages_per_batch=pages_per_batch,
@@ -341,6 +344,7 @@ class DashenMatchRequests:
         self,
         customer_token: str,
         *,
+        bnet_id: str = "",
         game_modes: Sequence[str],
         season: Optional[int],
         pages_per_batch: int,
@@ -365,7 +369,7 @@ class DashenMatchRequests:
                 else [],
                 begin_ts_getter=_match_begin_ts,
                 min_begin_ts=min_begin_ts,
-                existing_match_ids=match_id_set_from_db(),
+                bnet_id=bnet_id,
             )
             batch_matches = [dict(match) for match in result.matches]
             for match in batch_matches:
@@ -377,6 +381,7 @@ class DashenMatchRequests:
         self,
         customer_token: str,
         *,
+        bnet_id: str = "",
         fight_modes: Sequence[str],
         season: Optional[int],
         pages_per_batch: int,
@@ -401,7 +406,7 @@ class DashenMatchRequests:
                 else [],
                 begin_ts_getter=_match_begin_ts,
                 min_begin_ts=min_begin_ts,
-                existing_match_ids=match_id_set_from_db(),
+                bnet_id=bnet_id,
             )
             batch_matches = [dict(match) for match in result.matches]
             for match in batch_matches:

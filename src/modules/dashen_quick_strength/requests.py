@@ -137,6 +137,7 @@ class DashenQuickStrengthRequests:
         self,
         customer_token: str,
         *,
+        bnet_id: str = "",
         limit: int,
         include_previous_season: bool,
         pages_per_batch: int = 1,
@@ -162,7 +163,7 @@ class DashenQuickStrengthRequests:
                     if isinstance(payload, dict) and payload.get("code") == 0
                     else [],
                     begin_ts_getter=_match_begin_ts,
-                    existing_match_ids=match_id_set_from_db(),
+                    bnet_id=bnet_id,
                     target_count=int(limit),
                 )
                 for match in result.matches:

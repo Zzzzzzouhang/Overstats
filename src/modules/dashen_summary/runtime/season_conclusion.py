@@ -53,7 +53,7 @@ def _read_env_int(name, default):
 
 MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-RESOURCE_DIR = PROJECT_ROOT / "res"
+RESOURCE_DIR = PROJECT_ROOT / "res" 
 QUERY_TOOL_ASSET_DIR = RESOURCE_DIR / "query_tool_assets"
 SUMMARY_EXTRA_ASSET_DIR = QUERY_TOOL_ASSET_DIR / "extra"
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "res", "query_tool.json")
@@ -703,7 +703,7 @@ async def _fetch_normal_match_page(customer_token, game_mode, page):
     return _extract_match_entries(payload, "matchList", "recentMatchList")
 
 
-async def _fetch_normal_match_list(customer_token, game_mode):
+async def _fetch_normal_match_list(customer_token, game_mode, bnet_id=""):
     result = await fetch_paginated_match_entries(
         source_kind="normal",
         customer_token=customer_token,
@@ -722,7 +722,7 @@ async def _fetch_normal_match_list(customer_token, game_mode):
         if isinstance(payload, dict) and payload.get("code") == 0
         else [],
         begin_ts_getter=lambda item: int((item or {}).get("beginTs") or 0),
-        existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB),
+        existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB, bnet_id=bnet_id),
     )
     match_list = []
     for item in result.matches:
@@ -735,7 +735,7 @@ async def _fetch_normal_match_list(customer_token, game_mode):
     return match_list
 
 
-async def _fetch_fight_match_list(customer_token):
+async def _fetch_fight_match_list(customer_token, bnet_id=""):
     all_matches = []
     for game_mode in ("QuickFight", "LeisureFight", "SportFight"):
         result = await fetch_paginated_match_entries(
@@ -756,7 +756,7 @@ async def _fetch_fight_match_list(customer_token):
             if isinstance(payload, dict) and payload.get("code") == 0
             else [],
             begin_ts_getter=lambda item: int((item or {}).get("beginTs") or 0),
-            existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB),
+            existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB, bnet_id=bnet_id),
         )
         for item in result.matches:
             if not isinstance(item, dict):
@@ -768,11 +768,11 @@ async def _fetch_fight_match_list(customer_token):
     return all_matches
 
 
-async def _fetch_season_match_lists(customer_token):
+async def _fetch_season_match_lists(customer_token, bnet_id=""):
     quick, comp, fight = await asyncio.gather(
-        _fetch_normal_match_list(customer_token, "leisure"),
-        _fetch_normal_match_list(customer_token, "sport"),
-        _fetch_fight_match_list(customer_token),
+        _fetch_normal_match_list(customer_token, "leisure", bnet_id=bnet_id),
+        _fetch_normal_match_list(customer_token, "sport", bnet_id=bnet_id),
+        _fetch_fight_match_list(customer_token, bnet_id=bnet_id),
     )
 
     matches = []
@@ -4064,7 +4064,8 @@ async def _render_season_conclusion_locked(
     if not customer_token:
         await bot.finish(ev, "没有找到该玩家的大神 token，无法生成赛季总结。")
 
-    matches = await _fetch_season_match_lists(customer_token)
+    bnet_id = str(resolved_target.get("bnet_id") or "").strip()
+    matches = await _fetch_season_match_lists(customer_token, bnet_id=bnet_id)
     if not matches:
         await bot.finish(ev, "本赛季没有查到可用于总结的对局。")
 

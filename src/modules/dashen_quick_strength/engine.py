@@ -279,6 +279,7 @@ class DashenQuickStrengthEngine:
         self,
         *,
         customer_token: str,
+        bnet_id: str = "",
         limit: int,
         include_previous_season: bool,
         config: Dict[str, Any],
@@ -287,6 +288,7 @@ class DashenQuickStrengthEngine:
         live_season = int(get_live_dashen_season())
         recent_matches = await self.requests.list_recent_quick_matches(
             customer_token,
+            bnet_id=bnet_id,
             limit=match_limit,
             include_previous_season=include_previous_season,
         )

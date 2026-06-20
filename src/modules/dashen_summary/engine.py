@@ -329,17 +329,20 @@ async def _get_summary_match_lists_with_fight(
     customer_token: str,
     include_previous_season: bool = True,
     min_begin_ts: Optional[int] = None,
+    bnet_id: str = "",
 ) -> List[Dict[str, Any]]:
     tasks = [
         runtime.dashen.get_history_leis_matchK(
             customer_token,
             merge_all_recent_seasons=include_previous_season,
             min_begin_ts=min_begin_ts,
+            bnet_id=bnet_id,
         ),
         runtime.dashen.get_history_comp_matchK(
             customer_token,
             merge_all_recent_seasons=include_previous_season,
             min_begin_ts=min_begin_ts,
+            bnet_id=bnet_id,
         ),
         _get_summary_fight_match_list(runtime, customer_token, "QuickFight", include_previous_season, min_begin_ts),
         _get_summary_fight_match_list(runtime, customer_token, "LeisureFight", include_previous_season, min_begin_ts),
@@ -510,11 +513,13 @@ async def render_summary_payload(query: Any) -> Dict[str, Any]:
         if scope == "yesterday":
             reference_time = _yesterday_period([])[1]
         include_previous = _should_include_previous_season(runtime, title_text, reference_time=reference_time)
+        bnet_id = str(resolved.get("bnet_id") or "").strip()
         all_raw_matches = await _get_summary_match_lists_with_fight(
             runtime,
             customer_token,
             include_previous_season=include_previous,
             min_begin_ts=_summary_recent_fetch_min_ts(),
+            bnet_id=bnet_id,
         )
         all_raw_matches.sort(key=lambda item: item.get("beginTs") or 0, reverse=True)
         timer.mark("MATCH_LIST_FETCHED", f"raw_count={len(all_raw_matches)}")

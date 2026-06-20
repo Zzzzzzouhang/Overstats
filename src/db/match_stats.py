@@ -1957,6 +1957,42 @@ class IDPoolDB:
             except Exception:
                 pass
 
+    def get_player_match_ids(self, bnet_id: str, limit: int = 1000) -> set[str]:
+        """Return match_ids for a specific player from match_player table.
+
+        Uses the existing idx_match_player_bnet index for efficient lookup.
+        Returns at most *limit* match ids (default 1000).
+        """
+        normalized = str(bnet_id or "").strip()
+        if not normalized:
+            return set()
+        conn = self._get_connection()
+        if conn is None:
+            return set()
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"SELECT DISTINCT match_id FROM {MATCH_PLAYER_TABLE} "
+                    f"WHERE player_bnet_id = ? LIMIT ?",
+                    (normalized, int(limit)),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            return {str(row[0] or "") for row in rows if str(row[0] or "").strip()}
+        except Exception as exc:
+            self._warn_once(
+                f"match stats sqlite get_player_match_ids failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return set()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # token → bnet_id resolution (for CountInfoRecorder)
     # ------------------------------------------------------------------

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import datetime
 import importlib
+import json
 import os
 from pathlib import Path
 import sys
@@ -20,6 +22,10 @@ try:
 except ModuleNotFoundError:
     from src.client.apiclient import dashen_api_client
 
+try:
+    from overstats.src.modules.dashen_request_cache import cache_owner_key, fetch_paginated_match_entries
+except ModuleNotFoundError:
+    from src.modules.dashen_request_cache import cache_owner_key, fetch_paginated_match_entries
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 MIG_ROOT = Path(__file__).resolve().parents[4]
@@ -34,6 +40,7 @@ DEFAULT_WEATHER_LOOKBACK_DAYS = 45
 DEFAULT_WEATHER_CACHE_TTL = 600
 DEFAULT_WEATHER_CACHE_MAX = 256
 DEFAULT_FIGHT_PAGE_BATCH = 2
+DEFAULT_FULL_MATCH_LIST_REFRESH_DAYS = 3
 
 _RUNTIME: "SummaryRuntime | None" = None
 _WEATHER_MATCH_CACHE: Dict[Tuple[str, bool, int, str], Dict[str, Any]] = {}
@@ -74,7 +81,10 @@ FIGHT_PAGE_BATCH = max(
     1,
     _read_env_int("OVERSTATS_SUMMARY_FIGHT_PAGE_BATCH", DEFAULT_FIGHT_PAGE_BATCH),
 )
-
+SUMMARY_FULL_MATCH_LIST_REFRESH_DAYS = max(
+    1,
+    _read_env_int("OVERSTATS_SUMMARY_FULL_MATCH_LIST_REFRESH_DAYS", DEFAULT_FULL_MATCH_LIST_REFRESH_DAYS),
+)
 
 @dataclass(frozen=True)
 class SummaryRuntime:
@@ -263,6 +273,43 @@ def _summary_recent_fetch_min_ts(days: Optional[int] = None) -> int:
     return int((time.time() - lookback_days * 24 * 3600) * 1000)
 
 
+def _summary_match_list_min_begin_ts(
+    runtime: SummaryRuntime,
+    customer_token: str,
+    bnet_id: str,
+) -> Tuple[Optional[int], str]:
+    owner_key = cache_owner_key(customer_token=customer_token, bnet_id=bnet_id)
+    db_adapter = getattr(runtime.dashen, "db", None)
+    last_fetched_at = 0
+    if db_adapter is not None:
+        try:
+            last_fetched_at = int(
+                db_adapter.get_match_list_last_fetched_at(
+                    customer_token=owner_key,
+                    source_kinds=("normal", "fight"),
+                )
+                or 0
+            )
+        except Exception:
+            last_fetched_at = 0
+
+    now_ts = int(time.time())
+    max_age_sec = int(SUMMARY_FULL_MATCH_LIST_REFRESH_DAYS) * 24 * 3600
+    age_sec = now_ts - last_fetched_at if last_fetched_at > 0 else 0
+    if last_fetched_at <= 0 or age_sec > max_age_sec:
+        reason = "missing" if last_fetched_at <= 0 else "expired"
+        return None, (
+            f"full_scan=1; reason={reason}; owner_key={owner_key}; "
+            f"last_fetched_at={last_fetched_at}; age_sec={age_sec}; max_age_sec={max_age_sec}"
+        )
+
+    min_begin_ts = _summary_recent_fetch_min_ts()
+    return min_begin_ts, (
+        f"full_scan=0; owner_key={owner_key}; last_fetched_at={last_fetched_at}; "
+        f"age_sec={age_sec}; max_age_sec={max_age_sec}; min_begin_ts={min_begin_ts}"
+    )
+
+
 def _should_include_previous_season(runtime: SummaryRuntime, title_text: str, reference_time: Optional[datetime.datetime] = None) -> bool:
     rollover = getattr(runtime.dashen, "DASHEN_SEASON_ROLLOVER_AT", None)
     if not isinstance(rollover, datetime.datetime):
@@ -281,6 +328,7 @@ async def _get_summary_fight_match_list(
     game_mode: str,
     include_previous_season: bool = True,
     min_begin_ts: Optional[int] = None,
+    bnet_id: str = "",
 ) -> List[Dict[str, Any]]:
     match_list: List[Dict[str, Any]] = []
     season_candidates = (
@@ -289,36 +337,37 @@ async def _get_summary_fight_match_list(
         else runtime.dashen.get_recent_dashen_seasons(include_previous=False)
     )
     for match_season in season_candidates:
+        result = await fetch_paginated_match_entries(
+            source_kind="fight",
+            customer_token=customer_token,
+            game_mode=game_mode,
+            season=match_season,
+            batch_size=FIGHT_PAGE_BATCH,
+            fetch_page=lambda current_page, match_season=match_season: runtime.dashen._run_summary_request(
+                runtime.dashen.dashen_api_client.fight_query_match_list(
+                    customer_token,
+                    game_mode=game_mode,
+                    page=current_page,
+                    season=match_season,
+                )
+            ),
+            extract_entries=lambda payload: _extract_match_entries(payload, "matchList", "recentMatchList")
+            if isinstance(payload, dict) and payload.get("code") == 0
+            else [],
+            begin_ts_getter=_summary_match_begin_ts,
+            min_begin_ts=min_begin_ts,
+            bnet_id=bnet_id,
+            db=getattr(runtime.dashen, "db", None),
+        )
         season_match_list = []
-        page = 1
-        while True:
-            batch_tasks = [
-                runtime.dashen.get_fight_match_list(customer_token, game_mode, page + offset, match_season)
-                for offset in range(FIGHT_PAGE_BATCH)
-            ]
-            batch_payloads = await asyncio.gather(*batch_tasks)
-            batch_has_data = False
-            batch_max_begin_ts = 0
-            for payload in batch_payloads:
-                fight_matches = _extract_match_entries(payload, "matchList", "recentMatchList")
-                if not fight_matches:
-                    continue
-                batch_has_data = True
-                for match in fight_matches:
-                    item = dict(match)
-                    item["gameMode"] = game_mode
-                    item["_summaryFightOnly"] = True
-                    item["_dashenSeason"] = match_season
-                    begin_ts = _summary_match_begin_ts(item)
-                    batch_max_begin_ts = max(batch_max_begin_ts, begin_ts)
-                    if min_begin_ts is not None and begin_ts < int(min_begin_ts):
-                        continue
-                    season_match_list.append(item)
-            if not batch_has_data:
-                break
-            if min_begin_ts is not None and batch_max_begin_ts and batch_max_begin_ts < int(min_begin_ts):
-                break
-            page += FIGHT_PAGE_BATCH
+        for match in result.matches:
+            if not isinstance(match, dict):
+                continue
+            item = dict(match)
+            item["gameMode"] = game_mode
+            item["_summaryFightOnly"] = True
+            item["_dashenSeason"] = match_season
+            season_match_list.append(item)
         if season_match_list:
             match_list = _merge_unique_match_entries(match_list, season_match_list)
     return match_list
@@ -344,9 +393,9 @@ async def _get_summary_match_lists_with_fight(
             min_begin_ts=min_begin_ts,
             bnet_id=bnet_id,
         ),
-        _get_summary_fight_match_list(runtime, customer_token, "QuickFight", include_previous_season, min_begin_ts),
-        _get_summary_fight_match_list(runtime, customer_token, "LeisureFight", include_previous_season, min_begin_ts),
-        _get_summary_fight_match_list(runtime, customer_token, "SportFight", include_previous_season, min_begin_ts),
+        _get_summary_fight_match_list(runtime, customer_token, "QuickFight", include_previous_season, min_begin_ts, bnet_id),
+        _get_summary_fight_match_list(runtime, customer_token, "LeisureFight", include_previous_season, min_begin_ts, bnet_id),
+        _get_summary_fight_match_list(runtime, customer_token, "SportFight", include_previous_season, min_begin_ts, bnet_id),
     ]
     result_lists = await asyncio.gather(*tasks)
     all_matches = []
@@ -385,16 +434,12 @@ async def _get_weather_matches(
     if cached and cached.get("expiry", 0) > now_ts:
         return [dict(match) for match in cached.get("matches", []) if isinstance(match, dict)]
 
-    try:
-        weather_matches = await _get_summary_match_lists_with_fight(
-            runtime,
-            customer_token,
-            include_previous_season=include_previous_season,
-            min_begin_ts=_summary_recent_fetch_min_ts(SUMMARY_WEATHER_FETCH_LOOKBACK_DAYS),
-        )
-    except Exception:
-        return fallback_matches
-
+    weather_min_ts = _summary_recent_fetch_min_ts(SUMMARY_WEATHER_FETCH_LOOKBACK_DAYS)
+    weather_matches = [
+        dict(match)
+        for match in (fallback_matches or [])
+        if isinstance(match, dict) and _summary_match_begin_ts(match) >= weather_min_ts
+    ]
     weather_matches = [match for match in weather_matches if isinstance(match, dict)]
     weather_matches.sort(key=lambda item: item.get("beginTs") or 0, reverse=True)
     _WEATHER_MATCH_CACHE[cache_key] = {
@@ -443,6 +488,40 @@ def _week_period(all_matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return matches
 
 
+def _summary_detail_decision_extra(runtime: SummaryRuntime) -> str:
+    try:
+        decisions = runtime.summary.get_last_summary_detail_decisions()
+    except Exception:
+        decisions = []
+    if not decisions:
+        return ""
+    reason_counts = Counter(str(item.get("reason") or "") for item in decisions)
+    api_items = [item for item in decisions if item.get("api_fetch")]
+    api_preview = [
+        {
+            "match_id": item.get("match_id"),
+            "reason": item.get("reason"),
+            "db_frozen": item.get("db_frozen"),
+            "age_sec": item.get("age_sec"),
+            "db_game_time_sec": item.get("db_game_time_sec"),
+            "db_last_update": item.get("db_last_update"),
+        }
+        for item in api_items[:200]
+    ]
+    try:
+        return json.dumps(
+            {
+                "reason_counts": dict(reason_counts),
+                "api_fetch_count": len(api_items),
+                "api_fetches": api_preview,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except Exception:
+        return f"reason_counts={dict(reason_counts)}; api_fetch_count={len(api_items)}"
+
+
 async def _build_image_base64(
     runtime: SummaryRuntime,
     resolved_target: Dict[str, Any],
@@ -463,6 +542,9 @@ async def _build_image_base64(
         "DETAIL_AND_QUICK_DIST_DONE",
         f"detail_count={len(detail_pairs)}; quick_dist_points={len((quick_dist_data or {}).get('sampled_matches') or [])}",
     )
+    decision_extra = _summary_detail_decision_extra(runtime)
+    if decision_extra:
+        timer.mark("DETAIL_DECISIONS", decision_extra)
     stats = runtime.summary._build_stats(matches, detail_pairs, resolved_target)
     timer.mark("STATS_DONE")
 
@@ -514,11 +596,17 @@ async def render_summary_payload(query: Any) -> Dict[str, Any]:
             reference_time = _yesterday_period([])[1]
         include_previous = _should_include_previous_season(runtime, title_text, reference_time=reference_time)
         bnet_id = str(resolved.get("bnet_id") or "").strip()
+        match_list_min_begin_ts, match_list_refresh_extra = _summary_match_list_min_begin_ts(
+            runtime,
+            customer_token,
+            bnet_id,
+        )
+        timer.mark("MATCH_LIST_REFRESH_DECISION", match_list_refresh_extra)
         all_raw_matches = await _get_summary_match_lists_with_fight(
             runtime,
             customer_token,
             include_previous_season=include_previous,
-            min_begin_ts=_summary_recent_fetch_min_ts(),
+            min_begin_ts=match_list_min_begin_ts,
             bnet_id=bnet_id,
         )
         all_raw_matches.sort(key=lambda item: item.get("beginTs") or 0, reverse=True)

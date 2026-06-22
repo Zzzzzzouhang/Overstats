@@ -10,7 +10,6 @@ try:
     from overstats.src.modules.dashen_request_cache import (
         fetch_paginated_match_entries,
         list_page_singleflight,
-        match_id_set_from_db,
         season_key,
     )
     from overstats.src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
@@ -19,7 +18,6 @@ except ModuleNotFoundError:
     from src.modules.dashen_request_cache import (
         fetch_paginated_match_entries,
         list_page_singleflight,
-        match_id_set_from_db,
         season_key,
     )
     from src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
@@ -164,7 +162,6 @@ class DashenQuickStrengthRequests:
                     else [],
                     begin_ts_getter=_match_begin_ts,
                     bnet_id=bnet_id,
-                    target_count=int(limit),
                 )
                 for match in result.matches:
                     item = dict(match)

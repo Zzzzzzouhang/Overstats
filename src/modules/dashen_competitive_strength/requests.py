@@ -7,9 +7,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
     from overstats.src.client.apiclient import DashenAPIClient, dashen_api_client
+    from overstats.src.modules.dashen_detail_cache import normal_detail_payload_from_db
+    from overstats.src.modules.dashen_request_cache import fetch_match_list_page_cached
     from overstats.src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient, dashen_api_client
+    from src.modules.dashen_detail_cache import normal_detail_payload_from_db
+    from src.modules.dashen_request_cache import fetch_match_list_page_cached
     from src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 
 
@@ -117,6 +121,29 @@ def merge_unique_match_entries(
     return merged_entries
 
 
+def _competitive_detail_payload_complete(payload: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(payload, dict) or payload.get("code") != 0:
+        return False
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    if not isinstance(data.get("teammateList"), list) or not isinstance(data.get("enemyList"), list):
+        return False
+    players = list(data.get("teammateList") or []) + list(data.get("enemyList") or [])
+    if len(players) < 10:
+        return False
+    for player in players:
+        if not isinstance(player, dict):
+            return False
+        if not str(player.get("customerToken") or "").strip():
+            return False
+        try:
+            rank_score = int(((player.get("rankInfo") or {}).get("rankScore")) or 0)
+        except (TypeError, ValueError):
+            rank_score = 0
+        if rank_score <= 0:
+            return False
+    return True
+
+
 class DashenCompetitiveStrengthRequests:
     def __init__(self, api_client: Optional[DashenAPIClient] = None) -> None:
         self.api_client = api_client or dashen_api_client
@@ -137,11 +164,18 @@ class DashenCompetitiveStrengthRequests:
                 page = 1
                 while count_unique_match_entries(season_matches) < int(limit):
                     tasks = [
-                        self.api_client.query_match_list(
-                            customer_token,
-                            "sport",
-                            page=page + offset,
+                        fetch_match_list_page_cached(
+                            source_kind="normal",
+                            customer_token=customer_token,
+                            game_mode="sport",
                             season=request_season,
+                            page=page + offset,
+                            fetch_page=lambda current_page, request_season=request_season: self.api_client.query_match_list(
+                                customer_token,
+                                "sport",
+                                page=current_page,
+                                season=request_season,
+                            ),
                         )
                         for offset in range(max(1, int(pages_per_batch)))
                     ]
@@ -172,6 +206,14 @@ class DashenCompetitiveStrengthRequests:
         return list(matches[: int(limit)])
 
     async def get_match_detail(self, customer_token: str, match_id: str) -> Dict[str, Any]:
+        cached_payload = normal_detail_payload_from_db(
+            str(match_id),
+            require_hero_list=False,
+            include_competitive_fields=True,
+            report_hit=False,
+        )
+        if _competitive_detail_payload_complete(cached_payload):
+            return cached_payload  # type: ignore[return-value]
         return await self.api_client.query_match_info(
             customer_token, str(match_id), game_mode="sport"
         )

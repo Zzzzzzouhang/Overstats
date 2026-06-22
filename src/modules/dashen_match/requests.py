@@ -7,11 +7,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
     from overstats.src.client.apiclient import DashenAPIClient, dashen_api_client
-    from overstats.src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
+    from overstats.src.modules.dashen_request_cache import fetch_paginated_match_entries
     from overstats.src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient, dashen_api_client
-    from src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
+    from src.modules.dashen_request_cache import fetch_paginated_match_entries
     from src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 
 
@@ -307,33 +307,47 @@ class DashenMatchRequests:
         *,
         include_fight: bool,
     ) -> List[Dict[str, Any]]:
-        tasks = [
-            self.api_client.query_count_info(customer_token, "leisure", season=season),
-            self.api_client.query_count_info(customer_token, "sport", season=season),
-            self.api_client.query_match_list(customer_token, "leisure", page=2, season=season),
-            self.api_client.query_match_list(customer_token, "sport", page=2, season=season),
+        request_specs: List[tuple[Any, Optional[str]]] = [
+            (lambda: self.api_client.query_count_info(customer_token, "leisure", season=season), None),
+            (lambda: self.api_client.query_count_info(customer_token, "sport", season=season), None),
+            (lambda: self.api_client.query_match_list(customer_token, "leisure", page=2, season=season), None),
+            (lambda: self.api_client.query_match_list(customer_token, "sport", page=2, season=season), None),
         ]
-        fight_task_meta = []
         if include_fight:
             for page in (1, 2):
                 for game_mode in DEFAULT_FIGHT_MODES:
-                    tasks.append(
-                        self.api_client.fight_query_match_list(
-                            customer_token,
-                            game_mode=game_mode,
-                            page=page,
-                            season=season,
+                    request_specs.append(
+                        (
+                            lambda game_mode=game_mode, page=page: self.api_client.fight_query_match_list(
+                                customer_token,
+                                game_mode=game_mode,
+                                page=page,
+                                season=season,
+                            ),
+                            game_mode,
                         )
                     )
-                    fight_task_meta.append((len(tasks) - 1, game_mode))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        async def fetch_one(factory: Any) -> Any:
+            last_result: Any = None
+            for attempt in range(2):
+                try:
+                    last_result = await factory()
+                except Exception as exc:
+                    last_result = exc
+                if isinstance(last_result, dict) and last_result.get("code") == 0:
+                    return last_result
+                if attempt == 0:
+                    await asyncio.sleep(0.15 * (attempt + 1))
+            return last_result
+
+        results = await asyncio.gather(*(fetch_one(factory) for factory, _ in request_specs), return_exceptions=True)
         payloads: List[Dict[str, Any]] = []
-        fight_mode_by_index = dict(fight_task_meta)
-        for idx, result in enumerate(results):
+        for (result, (_, game_mode)) in zip(results, request_specs):
             if isinstance(result, Exception) or not isinstance(result, dict):
                 continue
-            game_mode = fight_mode_by_index.get(idx)
+            if result.get("code") != 0:
+                continue
             if game_mode:
                 for match in extract_match_entries(result, "matchList", "recentMatchList"):
                     match["gameMode"] = game_mode

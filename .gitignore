@@ -41,3 +41,5 @@ src/db/match_stats.sqlite3.old
 .gitignore
 .vibe/review_diff.txt
 CUsersDocumorialAppDataLocalTempseason_diff.txt
+/openspec
+src/db/request_metrics.sqlite3-journal

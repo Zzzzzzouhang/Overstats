@@ -7,9 +7,13 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 
 try:
     from overstats.src.client.apiclient import DashenAPIClient, dashen_api_client
+    from overstats.src.modules.dashen_detail_cache import normal_detail_payload_from_db
+    from overstats.src.modules.dashen_request_cache import cache_owner_key, fetch_match_list_page_cached
     from overstats.src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient, dashen_api_client
+    from src.modules.dashen_detail_cache import normal_detail_payload_from_db
+    from src.modules.dashen_request_cache import cache_owner_key, fetch_match_list_page_cached
     from src.modules.season_config import get_dashen_current_season, get_dashen_season_rollover_at
 
 
@@ -116,6 +120,15 @@ def merge_unique_match_entries(
             merged_entries.append(item)
     merged_entries.sort(key=_begin_ts, reverse=True)
     return merged_entries
+
+
+def _focus_bnet_from_customer_token(customer_token: str) -> str:
+    owner_key = cache_owner_key(customer_token=customer_token)
+    if owner_key.startswith("dashen_bnet:"):
+        return owner_key.split(":", 1)[1]
+    if owner_key.startswith("bnet:"):
+        return owner_key.split(":", 1)[1]
+    return ""
 
 
 def _profile_value_has_meaningful_content(value: Any) -> bool:
@@ -356,11 +369,18 @@ class DashenProfileRequests:
     ) -> Optional[Dict[str, Any]]:
         for request_season in iter_dashen_season_request_values(logical_season):
             try:
-                payload = await self.api_client.query_match_list(
-                    customer_token,
-                    game_mode,
-                    page=page,
+                payload = await fetch_match_list_page_cached(
+                    source_kind="normal",
+                    customer_token=customer_token,
+                    game_mode=game_mode,
                     season=request_season,
+                    page=page,
+                    fetch_page=lambda current_page, request_season=request_season: self.api_client.query_match_list(
+                        customer_token,
+                        game_mode,
+                        page=current_page,
+                        season=request_season,
+                    ),
                 )
             except Exception:
                 continue
@@ -408,6 +428,13 @@ class DashenProfileRequests:
         return None
 
     async def get_match_detail(self, customer_token: str, match_id: str) -> Dict[str, Any]:
+        cached_payload = normal_detail_payload_from_db(
+            str(match_id),
+            focus_bnet_id=_focus_bnet_from_customer_token(customer_token),
+            require_hero_list=False,
+        )
+        if cached_payload is not None:
+            return cached_payload
         return await self.api_client.query_match_info(customer_token, str(match_id))
 
     async def get_fight_match_detail(self, customer_token: str, match_id: str) -> Dict[str, Any]:
@@ -423,11 +450,18 @@ class DashenProfileRequests:
     ) -> Optional[Dict[str, Any]]:
         for request_season in iter_dashen_season_request_values(logical_season):
             try:
-                payload = await self.api_client.fight_query_match_list(
-                    customer_token,
+                payload = await fetch_match_list_page_cached(
+                    source_kind="fight",
+                    customer_token=customer_token,
                     game_mode=game_mode,
-                    page=page,
                     season=request_season,
+                    page=page,
+                    fetch_page=lambda current_page, request_season=request_season: self.api_client.fight_query_match_list(
+                        customer_token,
+                        game_mode=game_mode,
+                        page=current_page,
+                        season=request_season,
+                    ),
                 )
             except Exception:
                 continue

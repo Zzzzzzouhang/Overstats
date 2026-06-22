@@ -23,7 +23,6 @@ from .dashen import (
     ds_get_single_match,
     get_icon,
     get_fight_match_list,
-    match_rating_recent,
     ranking_dist2,
     season,
 )
@@ -35,10 +34,21 @@ from .stat_reference import get_cached_statmap_summary as _shared_get_cached_sta
 
 try:
     from overstats.src.modules.font_resolver import load_font
-    from overstats.src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
+    from overstats.src.modules.dashen_request_cache import fetch_paginated_match_entries
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
-    from src.modules.dashen_request_cache import fetch_paginated_match_entries, match_id_set_from_db
+    from src.modules.dashen_request_cache import fetch_paginated_match_entries
+
+
+def _report_cache_hit(source: str, count: int = 1) -> None:
+    try:
+        from overstats.src.server import report_db_cache_hit
+    except ModuleNotFoundError:
+        try:
+            from src.server import report_db_cache_hit
+        except ModuleNotFoundError:
+            return
+    report_db_cache_hit(source, count)
 
 
 def _read_env_int(name, default):
@@ -75,6 +85,7 @@ _SUMMARY_FONT_CACHE = {}
 _SUMMARY_MASK_CACHE = {}
 _SUMMARY_STATMAP_REFERENCE_CACHE = OrderedDict()
 _SUMMARY_DETAIL_CACHE = OrderedDict()
+_LAST_SUMMARY_DETAIL_DECISIONS = []
 SUMMARY_PRELOAD_IMAGES_ENABLED = os.getenv("OVERSTATS_PRELOAD_IMAGES", "1").strip().lower() not in {"0", "false", "no", "off"}
 SUMMARY_PRELOAD_IMAGE_BUDGET_MB = max(64, _read_env_int("OVERSTATS_SUMMARY_PRELOAD_IMAGE_MB", 128))
 SUMMARY_PRELOAD_IMAGE_BUDGET_BYTES = SUMMARY_PRELOAD_IMAGE_BUDGET_MB * 1024 * 1024
@@ -722,7 +733,6 @@ async def _fetch_normal_match_list(customer_token, game_mode, bnet_id=""):
         if isinstance(payload, dict) and payload.get("code") == 0
         else [],
         begin_ts_getter=lambda item: int((item or {}).get("beginTs") or 0),
-        existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB, bnet_id=bnet_id),
     )
     match_list = []
     for item in result.matches:
@@ -756,7 +766,6 @@ async def _fetch_fight_match_list(customer_token, bnet_id=""):
             if isinstance(payload, dict) and payload.get("code") == 0
             else [],
             begin_ts_getter=lambda item: int((item or {}).get("beginTs") or 0),
-            existing_match_ids=match_id_set_from_db(_GROUP_TITLE_DB, bnet_id=bnet_id),
         )
         for item in result.matches:
             if not isinstance(item, dict):
@@ -976,13 +985,52 @@ def _load_detail_from_db(match_id: str, focus_bnet_id: str = "") -> Optional[Dic
 
 
 async def _fetch_details(customer_token, matches, focus_bnet_id=""):
+    decisions = []
+
+    def _record_decision(match, reason, *, db_meta=None, age_sec=0, api_fetch=False, db_load_ok=None):
+        try:
+            match_id = str((match or {}).get("matchId") or "")
+            item = {
+                "match_id": match_id,
+                "reason": str(reason or ""),
+                "api_fetch": bool(api_fetch),
+                "age_sec": int(age_sec or 0),
+                "begin_ts": int((match or {}).get("beginTs") or 0),
+                "is_fight": bool(_is_fight(match or {})),
+            }
+            if db_meta:
+                item.update(
+                    {
+                        "db_frozen": int((db_meta or {}).get("frozen") or 0),
+                        "db_start_time": int((db_meta or {}).get("start_time") or 0),
+                        "db_game_time_sec": int((db_meta or {}).get("game_time_sec") or 0),
+                        "db_last_update": int((db_meta or {}).get("last_update") or 0),
+                    }
+                )
+            else:
+                item["db_frozen"] = None
+            if db_load_ok is not None:
+                item["db_load_ok"] = bool(db_load_ok)
+            decisions.append(item)
+        except Exception:
+            pass
+
     async def fetch_one(match):
         match_id = match.get("matchId")
         if not match_id:
+            _record_decision(match, "missing_match_id")
             return match, None
         is_fight_match = _is_fight(match)
         now_ts = time.time()
         cache_key = (str(customer_token), str(match_id), "fight" if is_fight_match else "normal")
+        db_meta = None
+        match_ts = 0
+        age_sec = 0
+
+        if not is_fight_match:
+            db_meta = _GROUP_TITLE_DB.get_match_meta([str(match_id)]).get(str(match_id))
+            match_ts = (int(match.get("beginTs") or 0) / 1000) or (db_meta or {}).get("start_time", 0)
+            age_sec = now_ts - match_ts if match_ts > 0 else 0
 
         # ── Layer 1: in-memory cache (30-min TTL, unchanged) ──
         cached = _SUMMARY_DETAIL_CACHE.get(cache_key)
@@ -991,10 +1039,13 @@ async def _fetch_details(customer_token, matches, focus_bnet_id=""):
                 _SUMMARY_DETAIL_CACHE.move_to_end(cache_key)
             except Exception:
                 pass
+            _report_cache_hit("memory")
+            _record_decision(match, "memory_hit", db_meta=db_meta, age_sec=age_sec)
             return match, cached.get("data")
 
         # ── Fight matches: always go straight to API + cache ──
         if is_fight_match:
+            _record_decision(match, "fight_api", api_fetch=True)
             payload = await _limited_call(lambda: ds_get_single_fight_match(customer_token, match_id))
             if payload and payload.get("code") == 0:
                 data = payload.get("data") or {}
@@ -1008,40 +1059,44 @@ async def _fetch_details(customer_token, matches, focus_bnet_id=""):
             return match, None
 
         # ── Normal matches: frozen / age-aware DB-first logic ──
-        # Read match_meta to get frozen, last_update, start_time (game start).
-        db_meta = _GROUP_TITLE_DB.get_match_meta([str(match_id)]).get(str(match_id))
-        match_ts = (int(match.get("beginTs") or 0) / 1000) or (db_meta or {}).get("start_time", 0)
-        age_sec = now_ts - match_ts if match_ts > 0 else 0
-
         # Layer 2: frozen flag takes absolute priority.
         if db_meta and db_meta.get("frozen"):
             db_detail = _load_detail_from_db(str(match_id), focus_bnet_id)
             if db_detail is not None:
+                _report_cache_hit("db")
+                _record_decision(match, "frozen_db_hit", db_meta=db_meta, age_sec=age_sec, db_load_ok=True)
                 return match, db_detail
-
-        # Layer 3: age-based decisions.
-        if age_sec > MATCH_DETAIL_AGE_FROZEN_SEC:
-            # Data has settled — trust DB if the write itself happened after
-            # the game had settled (db_last_update - match_ts > threshold).
-            db_last_update = (db_meta or {}).get("last_update", 0)
-            db_detail = _load_detail_from_db(str(match_id), focus_bnet_id)
-            if db_detail is not None and (db_last_update - match_ts) > MATCH_DETAIL_AGE_FROZEN_SEC:
-                return match, db_detail
-            # DB missing or written while data was still fresh → refresh once.
+            _record_decision(match, "frozen_db_reconstruct_failed", db_meta=db_meta, age_sec=age_sec, db_load_ok=False, api_fetch=True)
             return await _fetch_and_cache(match, match_id, customer_token, cache_key, now_ts)
+
+        # Layer 3: unfrozen rows are still usable when the DB has enough data.
+        if db_meta:
+            db_detail = _load_detail_from_db(str(match_id), focus_bnet_id)
+            if db_detail is not None:
+                _report_cache_hit("db")
+                reason = "old_unfrozen_db_hit" if age_sec > MATCH_DETAIL_AGE_FROZEN_SEC else "fresh_db_hit"
+                _record_decision(match, reason, db_meta=db_meta, age_sec=age_sec, db_load_ok=True)
+                return match, db_detail
 
         # age_sec ≤ threshold: data may still be changing.
         if db_meta:
             db_last_update = (db_meta or {}).get("last_update", 0)
             if now_ts - db_last_update <= MATCH_DETAIL_DB_FRESHNESS_SEC:
-                # DB is still fresh enough → trust it, skip API.
-                db_detail = _load_detail_from_db(str(match_id), focus_bnet_id)
-                if db_detail is not None:
-                    return match, db_detail
+                _record_decision(match, "fresh_db_reconstruct_failed", db_meta=db_meta, age_sec=age_sec, db_load_ok=False, api_fetch=True)
+                return await _fetch_and_cache(match, match_id, customer_token, cache_key, now_ts)
         # DB missing / stale → refresh from API.
+        reason = "db_missing_refresh" if not db_meta else "db_reconstruct_failed_refresh"
+        _record_decision(match, reason, db_meta=db_meta, age_sec=age_sec, api_fetch=True)
         return await _fetch_and_cache(match, match_id, customer_token, cache_key, now_ts)
 
-    return await asyncio.gather(*(fetch_one(match) for match in matches))
+    result = await asyncio.gather(*(fetch_one(match) for match in matches))
+    global _LAST_SUMMARY_DETAIL_DECISIONS
+    _LAST_SUMMARY_DETAIL_DECISIONS = list(decisions)
+    return result
+
+
+def get_last_summary_detail_decisions():
+    return [dict(item) for item in _LAST_SUMMARY_DETAIL_DECISIONS]
 
 
 async def _fetch_and_cache(match, match_id, customer_token, cache_key, now_ts):
@@ -1619,6 +1674,115 @@ def _sample_period_quick_matches(matches, max_samples=12):
 
 
 
+def _quick_dist_sample_point(match, avg_score, bucket_counts):
+    bucket = _score_bucket_key(avg_score)
+    if bucket is None:
+        return None
+    return {
+        "match_id": match.get("matchId"),
+        "bucket": bucket,
+        "avg_score": avg_score,
+        "rank_label": _quick_dist_rank_label(avg_score),
+        "count": int(bucket_counts.get(str(bucket), 0)),
+        "begin_ts": _num(match.get("beginTs")),
+        "map_guid": match.get("mapGuid"),
+        "result": _int(match.get("matchRet")),
+    }
+
+
+def _quick_dist_avg_score_from_detail(detail):
+    root = _detail_root(detail)
+    if not root:
+        return 0.0
+    scores = []
+    for key in ("teammateList", "enemyList"):
+        for player in root.get(key, []) or []:
+            if not isinstance(player, dict):
+                continue
+            rank_info = player.get("rankInfo") or {}
+            score = _num(rank_info.get("rankScore"))
+            if score <= 0:
+                last_rank_info = player.get("lastRankInfo") or rank_info.get("lastRankInfo") or {}
+                score = _num(last_rank_info.get("rankScore"))
+            if score > 0:
+                scores.append(score)
+    return sum(scores) / len(scores) if scores else 0.0
+
+
+def _quick_dist_avg_score_from_memory(customer_token, match):
+    match_id = str((match or {}).get("matchId") or "")
+    if not match_id or _is_fight(match):
+        return 0.0
+    cache_key = (str(customer_token), match_id, "normal")
+    cached = _SUMMARY_DETAIL_CACHE.get(cache_key)
+    if not cached or cached.get("expiry", 0) <= time.time():
+        return 0.0
+    try:
+        _SUMMARY_DETAIL_CACHE.move_to_end(cache_key)
+    except Exception:
+        pass
+    avg_score = _quick_dist_avg_score_from_detail(cached.get("data"))
+    if avg_score > 0:
+        _report_cache_hit("memory")
+    return avg_score
+
+
+def _quick_dist_scores_from_db(match_ids):
+    normalized_ids = [str(mid) for mid in (match_ids or []) if str(mid or "")]
+    if not normalized_ids:
+        return {}
+    score_map = {}
+    try:
+        cached_scores = _GROUP_TITLE_DB.get_match_strength(normalized_ids) or {}
+    except Exception:
+        cached_scores = {}
+    for mid, score in cached_scores.items():
+        avg_score = _num(score)
+        if avg_score > 0:
+            score_map[str(mid)] = avg_score
+
+    missing_ids = [mid for mid in normalized_ids if mid not in score_map]
+    if missing_ids:
+        try:
+            conn_db = _GROUP_TITLE_DB._get_connection()
+            if conn_db is not None:
+                try:
+                    placeholders = ",".join(["?"] * len(missing_ids))
+                    cur = conn_db.cursor()
+                    try:
+                        cur.execute(
+                            f"""
+                            SELECT match_id, rank_score FROM hero_match_detail
+                            WHERE match_id IN ({placeholders})
+                            AND rank_score IS NOT NULL AND rank_score > 0
+                            """,
+                            tuple(missing_ids),
+                        )
+                        rows = cur.fetchall() or []
+                    finally:
+                        cur.close()
+                    match_scores = defaultdict(list)
+                    for row in rows:
+                        mid = str(row[0])
+                        score = _rank_bucket_to_score(int(row[1]))
+                        if score is not None:
+                            match_scores[mid].append(score)
+                    for mid, scores in match_scores.items():
+                        if scores:
+                            score_map[mid] = sum(scores) / len(scores)
+                finally:
+                    try:
+                        conn_db.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    if score_map:
+        _report_cache_hit("db", len(score_map))
+    return score_map
+
+
 async def _build_quick_strength_distribution_data(customer_token, matches):
     sampled_matches = _sample_period_quick_matches(matches, max_samples=12)
     latest_ts = max(
@@ -1665,143 +1829,33 @@ async def _build_quick_strength_distribution_data(customer_token, matches):
             "source_match_count": 0,
         }
 
-    results = await asyncio.gather(
-        *(match_rating_recent(match.get("matchId"), customer_token, OW_CONFIG) for match in sampled_matches),
-        return_exceptions=True,
-    )
-
     sample_points = []
     resolved_match_ids = set()
-    # Track matches where API returned no score, for live/DB fallback
-    api_missed_matches = []
-    for match, result in zip(sampled_matches, results):
-        if isinstance(result, Exception) or not isinstance(result, tuple) or len(result) < 4:
-            api_missed_matches.append(match)
-            continue
-        avg_score = _num(result[3])
-        if avg_score <= 0:
-            api_missed_matches.append(match)
-            continue
-        bucket = _score_bucket_key(avg_score)
-        if bucket is None:
+    local_missed_matches = []
+    for match in sampled_matches:
+        avg_score = _quick_dist_avg_score_from_memory(customer_token, match)
+        point = _quick_dist_sample_point(match, avg_score, bucket_counts) if avg_score > 0 else None
+        if point is None:
+            local_missed_matches.append(match)
             continue
         resolved_match_ids.add(str(match.get("matchId")))
-        sample_points.append(
-            {
-                "match_id": match.get("matchId"),
-                "bucket": bucket,
-                "avg_score": avg_score,
-                "rank_label": _quick_dist_rank_label(avg_score),
-                "count": int(bucket_counts.get(str(bucket), 0)),
-                "begin_ts": _num(match.get("beginTs")),
-                "map_guid": match.get("mapGuid"),
-                "result": _int(match.get("matchRet")),
-            }
-        )
+        sample_points.append(point)
 
-    # Tier 2 fallback: match_strength_cache or computed from match_player + player_competitive_rank
-    cache_missed_ids = [str(m.get("matchId")) for m in api_missed_matches if m.get("matchId")]
+    # quick_dist is a secondary visual aid: never call upstream APIs here.
+    # Use only the in-process detail cache and local DB-derived scores.
+    cache_missed_ids = [str(m.get("matchId")) for m in local_missed_matches if m.get("matchId")]
     if cache_missed_ids and len(sample_points) < len(sampled_matches):
-        try:
-            cached_scores = _GROUP_TITLE_DB.get_match_strength(cache_missed_ids)
-        except Exception:
-            cached_scores = {}
-        if cached_scores:
-            still_missed = []
-            for match in api_missed_matches:
-                mid = str(match.get("matchId") or "")
-                if not mid or mid in resolved_match_ids:
-                    still_missed.append(match)
-                    continue
-                avg_score = cached_scores.get(mid)
-                if avg_score is None or avg_score <= 0:
-                    still_missed.append(match)
-                    continue
-                bucket = _score_bucket_key(avg_score)
-                if bucket is None:
-                    still_missed.append(match)
-                    continue
-                resolved_match_ids.add(mid)
-                sample_points.append(
-                    {
-                        "match_id": match.get("matchId"),
-                        "bucket": bucket,
-                        "avg_score": avg_score,
-                        "rank_label": _quick_dist_rank_label(avg_score),
-                        "count": int(bucket_counts.get(str(bucket), 0)),
-                        "begin_ts": _num(match.get("beginTs")),
-                        "map_guid": match.get("mapGuid"),
-                        "result": _int(match.get("matchRet")),
-                    }
-                )
-            api_missed_matches = still_missed
-
-    # Tier 3 fallback: use database rank_bucket data as last resort (DB-only, no extra API calls)
-    db_missed_ids = [str(m.get("matchId")) for m in api_missed_matches if m.get("matchId")]
-    if db_missed_ids and len(sample_points) < len(sampled_matches):
-        try:
-            db_scores = _GROUP_TITLE_DB.get_match_player_rank_scores(db_missed_ids) or []
-        except Exception:
-            db_scores = []
-        if db_scores:
-            match_score_map = {}
-            try:
-                conn_db = _GROUP_TITLE_DB._get_connection()
-                if conn_db is not None:
-                    try:
-                        placeholders = ",".join(["?"] * len(db_missed_ids))
-                        cur = conn_db.cursor()
-                        cur.execute(
-                            f"""
-                            SELECT match_id, rank_score FROM hero_match_detail
-                            WHERE match_id IN ({placeholders})
-                            AND rank_score IS NOT NULL AND rank_score > 0
-                            """,
-                            tuple(db_missed_ids),
-                        )
-                        rows = cur.fetchall() or []
-                        cur.close()
-                        match_scores = defaultdict(list)
-                        for row in rows:
-                            mid = str(row[0])
-                            score = _rank_bucket_to_score(int(row[1]))
-                            if score is not None:
-                                match_scores[mid].append(score)
-                        for mid, scores in match_scores.items():
-                            if scores:
-                                match_score_map[mid] = sum(scores) / len(scores)
-                    finally:
-                        try:
-                            conn_db.close()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-
-            if match_score_map:
-                for match in api_missed_matches:
-                    mid = str(match.get("matchId") or "")
-                    if not mid or mid in resolved_match_ids:
-                        continue
-                    avg_score = match_score_map.get(mid)
-                    if avg_score is None or avg_score <= 0:
-                        continue
-                    bucket = _score_bucket_key(avg_score)
-                    if bucket is None:
-                        continue
-                    resolved_match_ids.add(mid)
-                    sample_points.append(
-                        {
-                            "match_id": match.get("matchId"),
-                            "bucket": bucket,
-                            "avg_score": avg_score,
-                            "rank_label": _quick_dist_rank_label(avg_score),
-                            "count": int(bucket_counts.get(str(bucket), 0)),
-                            "begin_ts": _num(match.get("beginTs")),
-                            "map_guid": match.get("mapGuid"),
-                            "result": _int(match.get("matchRet")),
-                        }
-                    )
+        local_scores = _quick_dist_scores_from_db(cache_missed_ids)
+        for match in local_missed_matches:
+            mid = str(match.get("matchId") or "")
+            if not mid or mid in resolved_match_ids:
+                continue
+            avg_score = _num(local_scores.get(mid))
+            point = _quick_dist_sample_point(match, avg_score, bucket_counts) if avg_score > 0 else None
+            if point is None:
+                continue
+            resolved_match_ids.add(mid)
+            sample_points.append(point)
 
     return {
         "snapshot_date": snapshot.get("date"),

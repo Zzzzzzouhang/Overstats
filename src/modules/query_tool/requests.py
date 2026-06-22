@@ -6,6 +6,17 @@ from typing import Any, Dict
 import httpx
 
 
+def _report_upstream_call(label: str) -> None:
+    try:
+        from overstats.src.server import report_upstream_call
+    except ModuleNotFoundError:
+        try:
+            from src.server import report_upstream_call
+        except ModuleNotFoundError:
+            return
+    report_upstream_call(label)
+
+
 REMOTE_QUERY_TOOL_URL = "https://s.166.net/config/ds_ow/ow_record_query_tool.json"
 REMOTE_HERO_URL = "https://s.166.net/config/ds_ow/ow_hero_config.json"
 REMOTE_MAP_URL = "https://s.166.net/config/ds_ow/ow_map_config.json"
@@ -66,6 +77,8 @@ class QueryToolRequests:
         response = await client.get(url)
         response.raise_for_status()
         try:
-            return response.json()
+            payload = response.json()
         except json.JSONDecodeError as exc:
             raise ValueError(f"{label} did not return valid JSON") from exc
+        _report_upstream_call("query_tool_remote")
+        return payload

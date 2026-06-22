@@ -12,7 +12,6 @@ try:
     from overstats.src.modules.dashen_request_cache import (
         fetch_paginated_match_entries,
         list_page_singleflight,
-        match_id_set_from_db,
         season_key,
     )
     from overstats.src.modules.season_config import (
@@ -26,7 +25,6 @@ except ModuleNotFoundError:
     from src.modules.dashen_request_cache import (  # type: ignore[no-redef]
         fetch_paginated_match_entries,
         list_page_singleflight,
-        match_id_set_from_db,
         season_key,
     )
     from src.modules.season_config import (
@@ -330,7 +328,8 @@ async def _get_history_matchK(
                 else [],
                 begin_ts_getter=_safe_begin_ts,
                 min_begin_ts=min_begin_ts,
-                existing_match_ids=match_id_set_from_db(db, bnet_id=bnet_id),
+                bnet_id=bnet_id,
+                db=db,
             )
             for item in result.matches:
                 entry = dict(item)

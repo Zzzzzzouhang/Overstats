@@ -3,23 +3,29 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Awaitable, Callable
+import contextvars
 import locale
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-from typing import Dict, Iterable, List, Optional, TypeVar
+from typing import Any, Dict, Iterable, List, Optional, TypeVar
 
 try:
     from overstats.config import APIConfig
-    from overstats.src.client.apiclient import dashen_api_client
+    from overstats.src.client.apiclient import dashen_api_client, _upstream_acc_var, _UpstreamAcc
     from overstats.src.db.match_detail_recorder import (
         CountInfoRecorder,
         MatchDetailRecorder,
         MatchListRecorder,
     )
     from overstats.src.db.player_identity import PlayerIdentityRecorder
-    from overstats.src.db.request_metrics import RequestMetricsRecorder, normalize_request_metric_url
+    from overstats.src.db.request_metrics import (
+        RequestMetricsRecorder,
+        EndpointPerfRecorder,
+        normalize_request_metric_url,
+    )
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
@@ -68,14 +74,18 @@ try:
     from overstats.src.http_server import resolve_http_ui_asset
 except ModuleNotFoundError:
     from config import APIConfig
-    from src.client.apiclient import dashen_api_client
+    from src.client.apiclient import dashen_api_client, _upstream_acc_var, _UpstreamAcc
     from src.db.match_detail_recorder import (
         CountInfoRecorder,
         MatchDetailRecorder,
         MatchListRecorder,
     )
     from src.db.player_identity import PlayerIdentityRecorder
-    from src.db.request_metrics import RequestMetricsRecorder, normalize_request_metric_url
+    from src.db.request_metrics import (
+        RequestMetricsRecorder,
+        EndpointPerfRecorder,
+        normalize_request_metric_url,
+    )
     from src.modules.errors import ModuleError
     from src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
@@ -329,10 +339,15 @@ class DashenRequestQueue:
 
         semaphore = self._get_semaphore()
         self._queued_requests += 1
+        _q_t0 = time.monotonic()
         try:
             await semaphore.acquire()
         finally:
             self._queued_requests -= 1
+        _qw = int((time.monotonic() - _q_t0) * 1000)
+        _qw_acc = _queue_wait_acc_var.get()
+        if _qw_acc is not None:
+            _qw_acc.add(_qw)
 
         self._active_requests += 1
         if self._queued_requests > 0:
@@ -1515,6 +1530,17 @@ class OverstatsCoreService:
                 scope=scope,
             )
         )
+        # render_ms comes from worker-reported RENDER_DONE.delta_ms (worker-side render phase only).
+        # Note: summary's upstream_ms already includes worker render round-trip (render_summary is an HTTP call).
+        #   - upstream_ms ~ upstream API calls + worker render round-trip (network + queue + render)
+        #   - render_ms   = worker-side render phase duration (self-reported by worker)
+        #   They do not double-count: upstream_ms includes transport overhead, render_ms is render-only.
+        render_ms = -1
+        for t in result.timings:
+            if t.get("stage") == "RENDER_DONE":
+                render_ms = int(t.get("delta_ms", -1))
+                break
+        self._last_summary_render_ms = render_ms
         return result.image_bytes, result.image_media_type
 
     async def handle_dashen_rank_history(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -1778,6 +1804,46 @@ class OverstatsCoreService:
         return result.image.content
 
 
+class _PerfAccumulator:
+    """Per-request accumulator reused for queue_wait (and future stages)."""
+    __slots__ = ("total_ms",)
+
+    def __init__(self) -> None:
+        self.total_ms = 0
+
+    def add(self, ms: int) -> None:
+        self.total_ms += int(ms or 0)
+
+
+_queue_wait_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = contextvars.ContextVar(
+    "overstats_queue_wait", default=None
+)
+
+_memory_cache_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = contextvars.ContextVar(
+    "overstats_memory_cache_hits", default=None
+)
+_db_read_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = contextvars.ContextVar(
+    "overstats_db_read_hits", default=None
+)
+
+
+def report_db_cache_hit(source: str = "memory", count: int = 1) -> None:
+    """Modules call this to report a cache or DB hit.
+    source='memory' for in-memory cache hits, source='db' for DB read hits.
+    """
+    var = _memory_cache_acc_var if source == "memory" else _db_read_acc_var
+    acc = var.get()
+    if acc is not None:
+        acc.add(count)
+
+
+def report_upstream_call(label: str = "unknown") -> None:
+    """Non-DashenAPIClient modules call this to report an upstream HTTP call."""
+    acc = _upstream_acc_var.get()
+    if acc is not None:
+        acc.add(0, label)
+
+
 class AsyncRunner:
     def __init__(self) -> None:
         self.loop = asyncio.new_event_loop()
@@ -1835,6 +1901,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     request_metrics_recorder = RequestMetricsRecorder() if config.enable_database_write else None
     if request_metrics_recorder is not None:
         async_runner.run(request_metrics_recorder.start())
+    endpoint_perf_recorder = EndpointPerfRecorder() if config.enable_database_write else None
+    if endpoint_perf_recorder is not None:
+        async_runner.run(endpoint_perf_recorder.start())
     match_detail_recorder = MatchDetailRecorder() if config.enable_database_write else None
     if match_detail_recorder is not None:
         async_runner.run(match_detail_recorder.start())
@@ -1871,6 +1940,19 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         def do_GET(self) -> None:
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
+            self._perf_handler_start = time.monotonic()
+            self._perf_service_ms = 0
+            self._perf_upstream_ms = 0
+            self._perf_render_ms = -1
+            self._perf_queue_wait_ms = -1
+            self._perf_upstream_count = 0
+            self._perf_memory_cache_hits = 0
+            self._perf_db_read_hits = 0
+            self._perf_upstream_breakdown = {}
+            if path == "/api/v2/metrics":
+                self._handle_metrics_get()
+                return
+
             if path == "/healthz":
                 self._send_json(
                     HTTPStatus.OK,
@@ -1900,6 +1982,15 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         def do_POST(self) -> None:
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
+            self._perf_handler_start = time.monotonic()
+            self._perf_service_ms = 0
+            self._perf_upstream_ms = 0
+            self._perf_render_ms = -1
+            self._perf_queue_wait_ms = -1
+            self._perf_upstream_count = 0
+            self._perf_memory_cache_hits = 0
+            self._perf_db_read_hits = 0
+            self._perf_upstream_breakdown = {}
             if path == "/api/v2/auto-route":
                 self._handle_auto_route_post()
                 return
@@ -2175,7 +2266,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_player_identity_search(payload))
+                result = async_runner.run(self._capture_perf(service.handle_player_identity_search(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2220,7 +2311,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_blizzard_player_search(payload))
+                result = async_runner.run(self._capture_perf(service.handle_blizzard_player_search(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2265,7 +2356,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_blizzard_profile(payload))
+                result = async_runner.run(self._capture_perf(service.handle_blizzard_profile(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2310,7 +2401,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_blizzard_profile_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_blizzard_profile_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2355,7 +2446,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_auto_route(payload))
+                result = async_runner.run(self._capture_perf(service.handle_auto_route(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2400,7 +2491,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_match(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2446,7 +2537,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_match_replies(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match_replies(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2491,7 +2582,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_sameplay(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2536,7 +2627,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_sameplay_replies(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_replies(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2581,7 +2672,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_sameplay_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2626,7 +2717,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_ow_shop(payload))
+                result = async_runner.run(self._capture_perf(service.handle_ow_shop(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2671,7 +2762,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_result = async_runner.run(service.handle_ow_shop_image(payload))
+                image_result = async_runner.run(self._capture_perf(service.handle_ow_shop_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2720,7 +2811,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_ow_esports(payload))
+                result = async_runner.run(self._capture_perf(service.handle_ow_esports(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2765,7 +2856,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_ow_esports_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_esports_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2810,7 +2901,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_ow_guess_replies(payload))
+                result = async_runner.run(self._capture_perf(service.handle_ow_guess_replies(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2855,7 +2946,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_patch_notes(payload))
+                result = async_runner.run(self._capture_perf(service.handle_patch_notes(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2900,7 +2991,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_patch_notes_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_patch_notes_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2945,7 +3036,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_ow_hero_perk(payload))
+                result = async_runner.run(self._capture_perf(service.handle_ow_hero_perk(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -2990,7 +3081,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_ow_hero_perk_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_perk_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3035,7 +3126,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_ow_hero_wiki(payload))
+                result = async_runner.run(self._capture_perf(service.handle_ow_hero_wiki(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3080,7 +3171,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_ow_hero_wiki_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_wiki_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3125,7 +3216,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_ow_hero_pick_rate(payload))
+                result = async_runner.run(self._capture_perf(service.handle_ow_hero_pick_rate(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3170,7 +3261,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_ow_hero_pick_rate_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_pick_rate_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3215,7 +3306,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_rank_leaderboard(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_rank_leaderboard(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3260,7 +3351,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_rank_leaderboard_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_rank_leaderboard_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3305,7 +3396,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_hero_leaderboard(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_hero_leaderboard(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3350,7 +3441,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_hero_leaderboard_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_hero_leaderboard_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3395,7 +3486,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_profile(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_profile(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3441,7 +3532,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_profile_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_profile_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3486,7 +3577,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_hero_treemap(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_hero_treemap(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3531,7 +3622,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_hero_treemap_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_hero_treemap_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3576,7 +3667,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_rank_history(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_rank_history(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3621,7 +3712,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_rank_history_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_rank_history_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3666,7 +3757,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_quick_strength(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_quick_strength(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3711,7 +3802,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_quick_strength_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_quick_strength_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3756,7 +3847,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_competitive_strength(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_competitive_strength(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3801,7 +3892,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_competitive_strength_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_competitive_strength_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3846,7 +3937,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_summary(payload, scope=scope))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_summary(payload, scope=scope)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3891,7 +3982,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body, content_type = async_runner.run(service.handle_dashen_summary_image(payload, scope=scope))
+                image_body, content_type = async_runner.run(self._capture_perf(service.handle_dashen_summary_image(payload, scope=scope)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3919,6 +4010,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
 
+            self._perf_render_ms = getattr(service, "_last_summary_render_ms", -1)
             self._send_binary(HTTPStatus.OK, image_body, content_type)
 
         def _handle_dashen_match_image_post(self) -> None:
@@ -3936,7 +4028,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_match_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_match_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -3981,7 +4073,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_match_detail(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match_detail(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -4026,7 +4118,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_match_detail_replies(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_match_detail_replies(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -4071,7 +4163,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_match_detail_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_match_detail_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -4116,7 +4208,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_sameplay_detail(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -4161,7 +4253,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                result = async_runner.run(service.handle_dashen_sameplay_detail_replies(payload))
+                result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail_replies(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -4206,7 +4298,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             try:
-                image_body = async_runner.run(service.handle_dashen_sameplay_detail_image(payload))
+                image_body = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail_image(payload)))
             except ModuleError as exc:
                 self._send_json(
                     HTTPStatus(exc.status_code),
@@ -4239,6 +4331,43 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         def log_message(self, format: str, *args: object) -> None:
             return
 
+        async def _capture_perf(self, coro):
+            """Wrap a service coroutine to measure performance.
+
+            Installs per-request contextvar accumulators and measures service_ms:
+              - upstream accumulator: filled by SafeClient._request_with_retry (apiclient.py)
+              - queue_wait accumulator: filled by DashenRequestQueue.run
+              - memory_cache accumulator: filled by report_db_cache_hit(source='memory')
+              - db_read accumulator: filled by report_db_cache_hit(source='db')
+
+            All run in the same async Task as coro, so contextvars isolate them
+            per request even under ThreadingHTTPServer's multi-handler concurrency.
+            """
+            upstream_acc = _UpstreamAcc()
+            queue_wait_acc = _PerfAccumulator()
+            memory_cache_acc = _PerfAccumulator()
+            db_read_acc = _PerfAccumulator()
+            up_token = _upstream_acc_var.set(upstream_acc)
+            qw_token = _queue_wait_acc_var.set(queue_wait_acc)
+            mc_token = _memory_cache_acc_var.set(memory_cache_acc)
+            dr_token = _db_read_acc_var.set(db_read_acc)
+            t0 = time.monotonic()
+            try:
+                result = await coro
+                return result
+            finally:
+                self._perf_service_ms = int((time.monotonic() - t0) * 1000)
+                self._perf_upstream_ms = upstream_acc.total_ms
+                self._perf_upstream_count = upstream_acc.call_count
+                self._perf_queue_wait_ms = queue_wait_acc.total_ms
+                self._perf_memory_cache_hits = memory_cache_acc.total_ms
+                self._perf_db_read_hits = db_read_acc.total_ms
+                self._perf_upstream_breakdown = dict(upstream_acc.call_breakdown)
+                _db_read_acc_var.reset(dr_token)
+                _memory_cache_acc_var.reset(mc_token)
+                _queue_wait_acc_var.reset(qw_token)
+                _upstream_acc_var.reset(up_token)
+
         def _set_metrics_context(self, url: Optional[str]) -> None:
             if not config.enable_database_write:
                 self._request_metrics_url = None
@@ -4260,12 +4389,76 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         def _record_json_metric(self, status: HTTPStatus, payload: Dict[str, object]) -> None:
             success = _is_success_status(status) and payload.get("ok") is True
             self._record_module_metric(status, success=success)
+            self._record_perf(status, success=success)
 
         def _record_binary_metric(self, status: HTTPStatus) -> None:
             self._record_module_metric(status, success=_is_success_status(status))
+            self._record_perf(status, success=_is_success_status(status))
 
         def _record_stream_metric(self, status: HTTPStatus) -> None:
             self._record_module_metric(status, success=_is_success_status(status))
+            self._record_perf(status, success=_is_success_status(status))
+
+        def _record_perf(self, status: HTTPStatus, *, success: bool) -> None:
+            if not config.enable_database_write or endpoint_perf_recorder is None:
+                return
+            metrics_url = getattr(self, "_request_metrics_url", None)
+            if not metrics_url:
+                return
+            total_ms = int((time.monotonic() - self._perf_handler_start) * 1000)
+            async_runner.submit(endpoint_perf_recorder.enqueue(
+                url=metrics_url,
+                http_status=int(status),
+                total_ms=total_ms,
+                service_ms=int(getattr(self, "_perf_service_ms", 0)),
+                upstream_ms=int(getattr(self, "_perf_upstream_ms", 0)),
+                render_ms=int(getattr(self, "_perf_render_ms", -1)),
+                queue_wait_ms=int(getattr(self, "_perf_queue_wait_ms", -1)),
+                upstream_count=int(getattr(self, "_perf_upstream_count", 0)),
+                memory_cache_hits=int(getattr(self, "_perf_memory_cache_hits", 0)),
+                db_read_hits=int(getattr(self, "_perf_db_read_hits", 0)),
+                upstream_breakdown=json.dumps(getattr(self, "_perf_upstream_breakdown", {}), ensure_ascii=False),
+                success=success,
+            ))
+
+        def _handle_metrics_get(self) -> None:
+            # Parse ?minutes= query parameter
+            raw_minutes = 360
+            try:
+                from urllib.parse import parse_qs, urlsplit
+                query = parse_qs(urlsplit(self.path).query)
+                raw_minutes = int(query.get("minutes", ["360"])[0])
+            except Exception:
+                raw_minutes = 360
+
+            summary: List[Dict[str, Any]] = []
+            recent: List[Dict[str, Any]] = []
+            module_stats: List[Dict[str, Any]] = []
+            if endpoint_perf_recorder is not None:
+                try:
+                    summary = endpoint_perf_recorder.read_endpoint_perf_summary(minutes=raw_minutes)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
+                        "ok": False, "error": "perf_summary_failed", "message": str(exc),
+                    })
+                    return
+                try:
+                    recent = endpoint_perf_recorder.read_endpoint_perf(limit=50)
+                except Exception:
+                    recent = []
+            if request_metrics_recorder is not None:
+                try:
+                    module_stats = request_metrics_recorder.read_all_module_stats()
+                except Exception:
+                    module_stats = []
+
+            self._send_json(HTTPStatus.OK, {
+                "ok": True,
+                "window_minutes": raw_minutes,
+                "endpoint_performance": summary,
+                "recent_samples": recent,
+                "request_counts": module_stats,
+            })
 
         def _read_json_body(self) -> Dict[str, object]:
             length_header = self.headers.get("Content-Length")
@@ -4376,6 +4569,8 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             async_runner.run(count_info_recorder.close())
         if request_metrics_recorder is not None:
             async_runner.run(request_metrics_recorder.close())
+        if endpoint_perf_recorder is not None:
+            async_runner.run(endpoint_perf_recorder.close())
         async_runner.close()
         original_server_close()
 

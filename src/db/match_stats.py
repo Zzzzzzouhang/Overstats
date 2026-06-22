@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 import math
 import sqlite3
 import threading
@@ -420,6 +421,8 @@ class IDPoolDB:
             f"ON {MATCH_LIST_PAGE_CACHE_TABLE} (source_kind, customer_token, game_mode, season_key, page)",
             f"CREATE INDEX IF NOT EXISTS idx_{MATCH_PLAYER_TABLE}_bnet "
             f"ON {MATCH_PLAYER_TABLE} (player_bnet_id)",
+            f"CREATE INDEX IF NOT EXISTS idx_{MATCH_META_TABLE}_start "
+            f"ON {MATCH_META_TABLE} (start_time)",
             f"CREATE INDEX IF NOT EXISTS idx_{MATCH_PLAYER_TABLE}_side "
             f"ON {MATCH_PLAYER_TABLE} (match_id, side)",
         )
@@ -1497,18 +1500,10 @@ class IDPoolDB:
         self,
         conn,
         match_id: str,
+        match_meta_row: Optional[Dict[str, Any]],
         match_player_rows: Optional[Sequence[Dict[str, Any]]],
     ) -> int:
-        """Decide whether a match should be marked frozen based on roster stability.
-
-        frozen is sticky and set when the player roster (bnetId set + count) of the
-        incoming write is identical to the roster currently stored in DB. This is
-        the empirical "data has settled" signal used to skip future API refreshes.
-        - No existing row / no incoming players -> 0
-        - Already frozen -> stays 1
-        - Same bnetId set & same count as DB -> 1
-        - Otherwise -> 0
-        """
+        """Decide whether a match detail payload is complete enough to freeze."""
         if not match_id:
             return 0
         try:
@@ -1519,11 +1514,6 @@ class IDPoolDB:
                     (match_id,),
                 )
                 meta_row = cursor.fetchone()
-                cursor.execute(
-                    f"SELECT player_bnet_id FROM {MATCH_PLAYER_TABLE} WHERE match_id = ?",
-                    (match_id,),
-                )
-                old_bnets = {str(row[0] or "") for row in (cursor.fetchall() or [])}
             finally:
                 cursor.close()
         except Exception:
@@ -1533,15 +1523,32 @@ class IDPoolDB:
         if meta_row is not None and int(meta_row[0] or 0) == 1:
             return 1
 
-        new_bnets = {
-            str((row or {}).get("player_bnet_id") or "")
-            for row in (match_player_rows or [])
-            if str((row or {}).get("player_bnet_id") or "").strip()
-        }
-        if not new_bnets or not old_bnets:
+        now_ts = int(time.time())
+        try:
+            start_time = int((match_meta_row or {}).get("start_time") or 0)
+        except (TypeError, ValueError):
+            start_time = 0
+        if start_time > 0 and now_ts - start_time > 4 * 3600:
+            return 1
+
+        player_signal: Dict[str, bool] = {}
+        for row in match_player_rows or []:
+            if not isinstance(row, dict):
+                continue
+            bnet_id = str(row.get("player_bnet_id") or "").strip()
+            if not bnet_id:
+                continue
+            player_signal.setdefault(bnet_id, False)
+            try:
+                kda_total = int(row.get("kill") or 0) + int(row.get("assist") or 0) + int(row.get("death") or 0)
+            except (TypeError, ValueError):
+                kda_total = 0
+            if kda_total != 0 or bool(row.get("_has_kad_signal")):
+                player_signal[bnet_id] = True
+
+        if len(player_signal) < 10:
             return 0
-        # Compare roster fingerprint: same set of bnetIds implies same count.
-        if new_bnets == old_bnets:
+        if sum(1 for has_signal in player_signal.values() if has_signal) >= 10:
             return 1
         return 0
 
@@ -1583,7 +1590,7 @@ class IDPoolDB:
                     # has settled). We compute it by comparing the new roster
                     # (from match_player_rows) against the roster currently in DB.
                     new_frozen = self._compute_match_frozen_flag(
-                        conn, match_id_for_meta, match_player_rows
+                        conn, match_id_for_meta, match_meta_row, match_player_rows
                     )
                     match_meta_row = dict(match_meta_row)
                     match_meta_row["frozen"] = new_frozen
@@ -1935,6 +1942,219 @@ class IDPoolDB:
                 except Exception:
                     pass
 
+    def get_match_list_page_cache(
+        self,
+        *,
+        source_kind: str,
+        customer_token: str,
+        game_mode: str,
+        season_key: str,
+        page: int,
+        max_age_sec: int = 600,
+    ) -> Optional[Dict[str, Any]]:
+        """Read a cached raw queryMatchList page payload when it is still fresh."""
+        normalized_token = str(customer_token or "").strip()
+        normalized_mode = str(game_mode or "").strip()
+        if not normalized_token or not normalized_mode:
+            return None
+        try:
+            normalized_page = int(page)
+        except (TypeError, ValueError):
+            return None
+        if normalized_page <= 0:
+            return None
+        conn = self._get_connection()
+        if conn is None:
+            return None
+        try:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT payload_json, match_ids_json, entry_count, fetched_at, stop_reason
+                    FROM {MATCH_LIST_PAGE_CACHE_TABLE}
+                    WHERE source_kind = ? AND customer_token = ? AND game_mode = ?
+                      AND season_key = ? AND page = ?
+                    """,
+                    (
+                        str(source_kind or "normal").strip() or "normal",
+                        normalized_token,
+                        normalized_mode,
+                        str(season_key or "current").strip() or "current",
+                        normalized_page,
+                    ),
+                )
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+            if not row:
+                return None
+            fetched_at = int(row[3] or 0)
+            if max_age_sec > 0 and fetched_at > 0 and int(time.time()) - fetched_at > int(max_age_sec):
+                return None
+            try:
+                payload = json.loads(str(row[0] or "{}"))
+            except Exception:
+                payload = {}
+            try:
+                match_ids = json.loads(str(row[1] or "[]"))
+            except Exception:
+                match_ids = []
+            return {
+                "payload": payload,
+                "match_ids": match_ids,
+                "entry_count": int(row[2] or 0),
+                "fetched_at": fetched_at,
+                "stop_reason": str(row[4] or ""),
+            }
+        except Exception as exc:
+            self._warn_once(
+                f"match stats sqlite get_match_list_page_cache failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_match_list_page_cache_entries(
+        self,
+        *,
+        source_kind: str,
+        customer_token: str,
+        game_mode: str,
+        season_keys: Sequence[str],
+        max_age_sec: int = 600,
+        max_pages: int = 120,
+    ) -> List[Dict[str, Any]]:
+        """Return cached queryMatchList entries for one user/mode across pages."""
+        normalized_token = str(customer_token or "").strip()
+        normalized_mode = str(game_mode or "").strip()
+        normalized_source = str(source_kind or "normal").strip() or "normal"
+        keys = [str(key or "current").strip() or "current" for key in (season_keys or [])]
+        keys = list(dict.fromkeys(keys))
+        if not normalized_token or not normalized_mode or not keys:
+            return []
+        conn = self._get_connection()
+        if conn is None:
+            return []
+        try:
+            placeholders = ",".join(["?"] * len(keys))
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT payload_json, fetched_at, page, season_key
+                    FROM {MATCH_LIST_PAGE_CACHE_TABLE}
+                    WHERE source_kind = ? AND customer_token = ? AND game_mode = ?
+                      AND season_key IN ({placeholders})
+                    ORDER BY season_key ASC, page ASC
+                    LIMIT ?
+                    """,
+                    (normalized_source, normalized_token, normalized_mode, *keys, int(max_pages)),
+                )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            now_ts = int(time.time())
+            entries: List[Dict[str, Any]] = []
+            for row in rows:
+                fetched_at = int(row[1] or 0)
+                if max_age_sec > 0 and fetched_at > 0 and now_ts - fetched_at > int(max_age_sec):
+                    continue
+                try:
+                    payload = json.loads(str(row[0] or "{}"))
+                except Exception:
+                    payload = {}
+                data = payload.get("data", payload) if isinstance(payload, dict) else {}
+                raw_entries: Any = []
+                if isinstance(data, list):
+                    raw_entries = data
+                elif isinstance(data, dict):
+                    for key in ("matchList", "recentMatchList"):
+                        value = data.get(key)
+                        if isinstance(value, list):
+                            raw_entries = value
+                            break
+                for entry in raw_entries or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    item = dict(entry)
+                    item.setdefault("gameMode", normalized_mode)
+                    item["_dashenSeasonKey"] = str(row[3] or "")
+                    item["_matchListCachePage"] = int(row[2] or 0)
+                    entries.append(item)
+            return entries
+        except Exception as exc:
+            self._warn_once(
+                f"match stats sqlite get_match_list_page_cache_entries failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_match_list_last_fetched_at(
+        self,
+        *,
+        customer_token: str,
+        source_kinds: Optional[Sequence[str]] = None,
+    ) -> int:
+        """Return the most recent cached queryMatchList fetch timestamp for one owner."""
+        normalized_token = str(customer_token or "").strip()
+        if not normalized_token:
+            return 0
+        kinds = [str(kind or "").strip() for kind in (source_kinds or []) if str(kind or "").strip()]
+        conn = self._get_connection()
+        if conn is None:
+            return 0
+        try:
+            if not self._table_exists(conn, MATCH_LIST_PAGE_CACHE_TABLE):
+                return 0
+            cursor = conn.cursor()
+            try:
+                if kinds:
+                    placeholders = ",".join(["?"] * len(kinds))
+                    cursor.execute(
+                        f"""
+                        SELECT MAX(fetched_at)
+                        FROM {MATCH_LIST_PAGE_CACHE_TABLE}
+                        WHERE customer_token = ? AND source_kind IN ({placeholders})
+                        """,
+                        (normalized_token, *kinds),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT MAX(fetched_at)
+                        FROM {MATCH_LIST_PAGE_CACHE_TABLE}
+                        WHERE customer_token = ?
+                        """,
+                        (normalized_token,),
+                    )
+                row = cursor.fetchone()
+            finally:
+                cursor.close()
+            if not row or row[0] in (None, ""):
+                return 0
+            return max(0, int(row[0] or 0))
+        except Exception as exc:
+            self._warn_once(
+                f"match stats sqlite get_match_list_last_fetched_at failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return 0
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def get_all_match_ids(self) -> set[str]:
         """Return a snapshot of all known match ids in match_meta."""
         conn = self._get_connection()
@@ -2266,6 +2486,90 @@ class IDPoolDB:
             return results
         except Exception as exc:
             self._warn_once(f"match stats sqlite get_match_details_by_player failed: {type(exc).__name__}: {exc}")
+            return []
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def get_match_list_entries_by_player(
+        self,
+        player_bnet_id: str,
+        *,
+        since_ts_ms: int = 0,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        """Rebuild match-list-like entries from DB for a specific player."""
+        normalized_bnet = str(player_bnet_id or "").strip()
+        if not normalized_bnet:
+            return []
+        since_sec = int(int(since_ts_ms or 0) / 1000) if int(since_ts_ms or 0) > 0 else 0
+        conn = self._get_connection()
+        if conn is None:
+            return []
+        try:
+            cursor = conn.cursor()
+            try:
+                if since_sec > 0:
+                    cursor.execute(
+                        f"""
+                        SELECT m.match_id, m.match_result, m.focus_player_side, m.match_mode,
+                               m.map_guid, m.start_time, m.match_list_json, p.side
+                        FROM {MATCH_META_TABLE} m
+                        JOIN {MATCH_PLAYER_TABLE} p ON m.match_id = p.match_id
+                        WHERE p.player_bnet_id = ? AND m.start_time >= ?
+                        ORDER BY m.start_time DESC
+                        LIMIT ?
+                        """,
+                        (normalized_bnet, since_sec, int(limit)),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT m.match_id, m.match_result, m.focus_player_side, m.match_mode,
+                               m.map_guid, m.start_time, m.match_list_json, p.side
+                        FROM {MATCH_META_TABLE} m
+                        JOIN {MATCH_PLAYER_TABLE} p ON m.match_id = p.match_id
+                        WHERE p.player_bnet_id = ?
+                        ORDER BY m.start_time DESC
+                        LIMIT ?
+                        """,
+                        (normalized_bnet, int(limit)),
+                    )
+                rows = cursor.fetchall() or []
+            finally:
+                cursor.close()
+            result: List[Dict[str, Any]] = []
+            for row in rows:
+                item: Dict[str, Any] = {}
+                raw_json = row[6]
+                if raw_json:
+                    try:
+                        parsed = json.loads(str(raw_json))
+                    except Exception:
+                        parsed = {}
+                    if isinstance(parsed, dict):
+                        item.update(parsed)
+                meta = {
+                    "match_result": row[1],
+                    "focus_player_side": str(row[2] or "team"),
+                }
+                start_time = int(row[5] or 0)
+                item["matchId"] = str(row[0] or item.get("matchId") or "")
+                item["matchRet"] = self.get_player_result(meta, str(row[7] or "team"))
+                item["gameMode"] = str(item.get("gameMode") or row[3] or "")
+                item["mapGuid"] = str(item.get("mapGuid") or row[4] or "")
+                if start_time > 0:
+                    item["beginTs"] = int(item.get("beginTs") or start_time * 1000)
+                if item.get("matchId") and item.get("beginTs"):
+                    result.append(item)
+            return result
+        except Exception as exc:
+            self._warn_once(
+                f"match stats sqlite get_match_list_entries_by_player failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             return []
         finally:
             try:

@@ -533,7 +533,6 @@ class DashenSameplayModule:
             customer_token=explicit_customer_token,
             bnet_id=explicit_bnet_id,
             include_fight=False,
-            target_count=20,
         )
         resolved_query, resolved_bnet = await self.match_module._resolve_query(query)
         if resolved_bnet is not None:

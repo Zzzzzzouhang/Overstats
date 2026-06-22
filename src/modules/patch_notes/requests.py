@@ -26,6 +26,17 @@ from ..analysis_common import get_analysis_proxy
 from ...constants.chara import iter_hero_alias_pairs
 
 
+def _report_upstream_call(label: str) -> None:
+    try:
+        from overstats.src.server import report_upstream_call
+    except ModuleNotFoundError:
+        try:
+            from src.server import report_upstream_call
+        except ModuleNotFoundError:
+            return
+    report_upstream_call(label)
+
+
 CN_MONTH_URL = "https://ow.blizzard.cn/news/patch-notes/live/{year:04d}/{month:02d}/"
 EN_MONTH_URL = "https://overwatch.blizzard.com/en-us/news/patch-notes/live/{year:04d}/{month:02d}"
 SOURCE_NAMES = {"cn": "国服", "en": "外服"}
@@ -884,6 +895,7 @@ class PatchNotesRequests:
         async with _build_async_client(headers=self.headers, timeout=self.timeout_seconds, proxy_url=self.proxy_for_source(source_key)) as client:
             response = await client.get(url)
             response.raise_for_status()
+            _report_upstream_call("patch_notes_html")
             return response.text
 
     async def scan_patch_source(self, source_key: str, *, now_date: Optional[dt.date] = None) -> Dict[str, Optional[Dict[str, Any]]]:
@@ -1028,6 +1040,7 @@ class PatchNotesRequests:
         content = response.content
         if not content:
             return None
+        _report_upstream_call("patch_notes_image")
 
         fd, temp_path = tempfile.mkstemp(prefix="patch-notes-image.", suffix=suffix, dir=str(asset_dir))
         try:

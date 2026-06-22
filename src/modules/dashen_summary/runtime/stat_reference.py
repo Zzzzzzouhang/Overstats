@@ -4,6 +4,17 @@ from collections import OrderedDict
 from typing import Any, Iterable, Optional, Sequence
 
 
+def _report_memory_cache_hit() -> None:
+    try:
+        from overstats.src.server import report_db_cache_hit
+    except ModuleNotFoundError:
+        try:
+            from src.server import report_db_cache_hit
+        except ModuleNotFoundError:
+            return
+    report_db_cache_hit("memory")
+
+
 HERO_AVG_PERCENT_KEYWORDS = ("率", "效率", "占比")
 HERO_AVG_PERCENT_TEXTS = {"英雄获胜"}
 HERO_AVG_RAW_VALUE_TEXTS = {"英雄获胜", "累计游戏时间", "累积游戏时间"}
@@ -117,6 +128,7 @@ def get_cached_statmap_summary(
             _STATMAP_SUMMARY_CACHE.move_to_end(cache_key)
         except Exception:
             pass
+        _report_memory_cache_hit()
         return cached
 
     result = db.get_statmap_summary(

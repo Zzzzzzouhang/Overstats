@@ -213,6 +213,9 @@ def _build_player_competitive_meta(
     }
 
 
+# Legacy helper — kept for backward compatibility.
+# Prefer _build_player_competitive_meta_from_records() for DB-cache paths
+# so that current_role_scores is correctly filtered by season.
 def _build_player_competitive_meta_from_scores(
     scores_by_role: Dict[str, int],
     *,
@@ -228,6 +231,56 @@ def _build_player_competitive_meta_from_scores(
         "latest_role_scores": dict(normalized_scores),
         "latest_role_seasons": {role: int(live_season) for role in normalized_scores},
         "current_role_scores": dict(normalized_scores),
+    }
+
+
+def _build_player_competitive_meta_from_records(
+    records_by_role: Dict[str, Dict[str, Any]],
+    *,
+    live_season: int,
+) -> Dict[str, Any]:
+    """Build competitive meta from DB records with season awareness.
+
+    Unlike _build_player_competitive_meta_from_scores, this function receives
+    the full record dict (including ``season``) per role, enabling it to
+    correctly separate *current-season* scores from *latest-available* scores
+    — aligning the DB-cache path with the API path semantics.
+
+    Records with ``season = NULL`` are treated as current-season data
+    (lenient strategy for legacy records; natural cache refresh fixes them).
+    """
+    latest_role_scores: Dict[str, int] = {}
+    latest_role_seasons: Dict[str, int] = {}
+    current_role_scores: Dict[str, int] = {}
+
+    for role, record in (records_by_role or {}).items():
+        normalized_role = normalize_role_type(role)
+        if not normalized_role:
+            continue
+        # Backward-compatible: accept both dict records and plain int scores
+        if isinstance(record, dict):
+            score = int(record.get("rank_score") or 0)
+            raw_season = record.get("season")
+            season_int = int(raw_season) if raw_season is not None else None
+        else:
+            score = int(record or 0)
+            season_int = None
+        if score <= 0:
+            continue
+
+        # latest: always populated if score > 0
+        latest_role_scores[normalized_role] = score
+        latest_role_seasons[normalized_role] = season_int if season_int is not None else live_season
+
+        # current: only if season matches live_season, or season is NULL (legacy grace)
+        if season_int is None or season_int == live_season:
+            current_role_scores[normalized_role] = score
+
+    return {
+        "recent_payloads": [],
+        "latest_role_scores": latest_role_scores,
+        "latest_role_seasons": latest_role_seasons,
+        "current_role_scores": current_role_scores,
     }
 
 
@@ -345,13 +398,13 @@ class DashenQuickStrengthEngine:
                     player_rank_records.update(records)
                 cached_roles = player_rank_records.get(normalized_bnet) or {}
                 if cached_roles:
-                    scores_by_role = {
-                        role: int(record.get("rank_score") or 0)
+                    filtered_records = {
+                        role: record
                         for role, record in cached_roles.items()
-                        if int(record.get("rank_score") or 0) > 0
+                        if int((record.get("rank_score") or 0)) > 0
                     }
-                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_scores(
-                        scores_by_role,
+                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_records(
+                        filtered_records,
                         live_season=live_season,
                     )
                     return player_competitive_cache[cache_key]
@@ -365,7 +418,7 @@ class DashenQuickStrengthEngine:
                     )
                     player_rank_markers.update(markers)
                 if normalized_bnet in player_rank_markers:
-                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_scores(
+                    player_competitive_cache[cache_key] = _build_player_competitive_meta_from_records(
                         {},
                         live_season=live_season,
                     )

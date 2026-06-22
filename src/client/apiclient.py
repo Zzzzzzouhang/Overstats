@@ -198,6 +198,54 @@ def _default_client_headers() -> Dict[str, str]:
     }
 
 
+class _UpstreamAcc:
+    """Per-request accumulator for upstream HTTP cost. Shared by gather() sub-tasks via copied context."""
+    __slots__ = ("total_ms", "call_count", "call_breakdown")
+
+    def __init__(self) -> None:
+        self.total_ms = 0
+        self.call_count = 0
+        self.call_breakdown: Dict[str, int] = {}
+
+    def add(self, ms: int, label: str = "") -> None:
+        self.total_ms += int(ms or 0)
+        self.call_count += 1
+        if label:
+            self.call_breakdown[label] = self.call_breakdown.get(label, 0) + 1
+
+
+_upstream_acc_var: contextvars.ContextVar[Optional["_UpstreamAcc"]] = contextvars.ContextVar(
+    "overstats_upstream_acc", default=None
+)
+
+_upstream_call_label_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "overstats_upstream_call_label", default=""
+)
+
+
+def _extract_api_label(url: str) -> str:
+    """Extract label from upstream URL last path segment."""
+    try:
+        path = url.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
+        if path.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            return "cdn_image"
+        return path or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def get_upstream_acc() -> Optional[_UpstreamAcc]:
+    """Read the current request's accumulator (None outside _capture_perf)."""
+    return _upstream_acc_var.get()
+
+
+def reset_upstream_acc() -> _UpstreamAcc:
+    """Install a fresh accumulator in the current context and return it."""
+    acc = _UpstreamAcc()
+    _upstream_acc_var.set(acc)
+    return acc
+
+
 @dataclass(frozen=True)
 class DashenCredential:
     name: str
@@ -709,12 +757,18 @@ class SafeClient:
             try:
                 response = await route.client.request(method, url, **kwargs)
                 cost_ms = int((time.monotonic() - started_at) * 1000)
+                _acc = _upstream_acc_var.get()
+                if _acc is not None:
+                    _acc.add(cost_ms, _upstream_call_label_var.get())
                 self._record_route_success(route)
                 self._log_request_success(request_id, method, url, route, response, cost_ms, attempt, slot_kind, log_context)
                 self._log_slow_success(method, url, route, cost_ms, slot_kind, log_context)
                 return response
             except Exception as exc:
                 cost_ms = int((time.monotonic() - started_at) * 1000)
+                _acc = _upstream_acc_var.get()
+                if _acc is not None:
+                    _acc.add(cost_ms, _upstream_call_label_var.get())
                 last_exc = exc
                 self._record_route_failure(route, exc)
                 will_retry = self._is_retryable(exc) and attempt < attempts and len(self._routes) > 1
@@ -1010,6 +1064,22 @@ class DashenAPIClient:
         auth_dts_override: Optional[int] = None,
         **kwargs: Any,
     ) -> Any:
+        _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
+        try:
+            return await self._request_payload_inner(method, url, use_proxy=use_proxy, credential=credential, auth_dts_override=auth_dts_override, **kwargs)
+        finally:
+            _upstream_call_label_var.reset(_lbl_tok)
+
+    async def _request_payload_inner(
+        self,
+        method: str,
+        url: str,
+        *,
+        use_proxy: bool = False,
+        credential: Optional[DashenCredential] = None,
+        auth_dts_override: Optional[int] = None,
+        **kwargs: Any,
+    ) -> Any:
         client = self.proxy_client if use_proxy else self.netease_client
         request_kwargs = dict(kwargs)
         metric_url = _metric_url_for_request(url, request_kwargs.get("params"))
@@ -1059,15 +1129,19 @@ class DashenAPIClient:
         return payload
 
     async def request_bytes(self, url: str, *, use_proxy: bool = False, **kwargs: Any) -> bytes:
-        client = self.proxy_client if use_proxy else self.netease_client
-        metric_url = _metric_url_for_request(url, kwargs.get("params"))
+        _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
         try:
-            response = await client.get(url, **kwargs)
-        except Exception:
-            await self._record_upstream_metric(metric_url, False)
-            raise
-        await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
-        return response.content
+            client = self.proxy_client if use_proxy else self.netease_client
+            metric_url = _metric_url_for_request(url, kwargs.get("params"))
+            try:
+                response = await client.get(url, **kwargs)
+            except Exception:
+                await self._record_upstream_metric(metric_url, False)
+                raise
+            await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
+            return response.content
+        finally:
+            _upstream_call_label_var.reset(_lbl_tok)
 
     async def search_bnet_account(self, bnet: str) -> Dict[str, Any]:
         credential = self._select_credential()
@@ -1115,19 +1189,22 @@ class DashenAPIClient:
         encoded_player_id = quote(normalized_player_id, safe="%|")
         url = f"{BLIZZARD_HOST}/{normalized_locale}/career/{encoded_player_id}/"
         metric_url = _metric_url_for_request(url)
+        _lbl_tok = _upstream_call_label_var.set("blizzard_career")
         try:
-            response = await self.proxy_client.request(
-                "GET",
-                url,
-                headers={"Accept": "text/html,application/xhtml+xml"},
-                follow_redirects=True,
-            )
-        except Exception:
-            await self._record_upstream_metric(metric_url, False)
-            raise
-
-        await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
-        return response.text, str(response.url), int(response.status_code)
+            try:
+                response = await self.proxy_client.request(
+                    "GET",
+                    url,
+                    headers={"Accept": "text/html,application/xhtml+xml"},
+                    follow_redirects=True,
+                )
+            except Exception:
+                await self._record_upstream_metric(metric_url, False)
+                raise
+            await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
+            return response.text, str(response.url), int(response.status_code)
+        finally:
+            _upstream_call_label_var.reset(_lbl_tok)
 
     async def query_card(self, customer_token: str) -> Dict[str, Any]:
         return await self.request_json(

@@ -49,6 +49,17 @@ from .render import (
 from .requests import DashenMatchDetail, DashenMatchQuery, DashenMatchRequests
 
 
+def _report_memory_cache_hit() -> None:
+    try:
+        from overstats.src.server import report_db_cache_hit
+    except ModuleNotFoundError:
+        try:
+            from src.server import report_db_cache_hit
+        except ModuleNotFoundError:
+            return
+    report_db_cache_hit("memory")
+
+
 PLAYER_TOKEN_CACHE_TTL = 600
 PLAYER_TOKEN_CACHE_MAX = 512
 PLAYER_DETAIL_CACHE_TTL = 1800
@@ -77,6 +88,7 @@ def _cache_get(cache: OrderedDict, key: Any) -> Any:
             cache.move_to_end(key)
         except Exception:
             pass
+        _report_memory_cache_hit()
         return item.get("value")
 
 

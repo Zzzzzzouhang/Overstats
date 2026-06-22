@@ -21,6 +21,7 @@ try:
     )
     from overstats.src.modules.query_tool import read_query_tool
     from overstats.src.modules.dashen_request_cache import current_cache_week
+    from overstats.src.modules.dashen_request_cache import cache_owner_key
 except ModuleNotFoundError:
     from config import is_database_write_enabled
     from src.db.match_stats import (
@@ -34,6 +35,7 @@ except ModuleNotFoundError:
     )
     from src.modules.query_tool import read_query_tool
     from src.modules.dashen_request_cache import current_cache_week
+    from src.modules.dashen_request_cache import cache_owner_key
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,34 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _player_kad_totals(player: Dict[str, Any]) -> tuple[int, int, int, bool]:
+    kill = _safe_int(player.get("kill"))
+    assist = _safe_int(player.get("assist"))
+    death = _safe_int(player.get("death"))
+    has_signal = (kill + assist + death) != 0
+
+    hero_kill = 0
+    hero_assist = 0
+    hero_death = 0
+    hero_has_signal = False
+    for hero in player.get("heroList") or []:
+        if not isinstance(hero, dict):
+            continue
+        current_kill = _safe_int(hero.get("kill"))
+        current_assist = _safe_int(hero.get("assist"))
+        current_death = _safe_int(hero.get("death"))
+        if current_kill + current_assist + current_death != 0:
+            hero_has_signal = True
+        hero_kill += current_kill
+        hero_assist += current_assist
+        hero_death += current_death
+
+    if not has_signal and hero_has_signal:
+        kill, assist, death = hero_kill, hero_assist, hero_death
+        has_signal = True
+    return kill, assist, death, has_signal
 
 
 def _normalize_use_time_rate(value: Any, use_time_sec: Any, game_time_sec: Any) -> float:
@@ -426,6 +456,7 @@ def extract_normal_match_detail_records(
             endorse_ids_json: Optional[str] = (
                 json.dumps(endorse_ids, separators=(",", ":")) if endorse_ids else None
             )
+            kill, assist, death, has_kad_signal = _player_kad_totals(player)
             result.match_player_rows.append(
                 {
                     "match_id": match_id,
@@ -435,9 +466,9 @@ def extract_normal_match_detail_records(
                     "hero_guid": p_hero_guid,
                     "rank_bucket": p_rank_bucket,
                     "role_type": p_role_type,
-                    "kill": _safe_int(player.get("kill")),
-                    "assist": _safe_int(player.get("assist")),
-                    "death": _safe_int(player.get("death")),
+                    "kill": kill,
+                    "assist": assist,
+                    "death": death,
                     "hero_damage": _safe_int(player.get("heroDamage")),
                     "healing": _safe_int(player.get("cure")),
                     "damage_blocked": _safe_int(player.get("resistDamage")),
@@ -449,6 +480,7 @@ def extract_normal_match_detail_records(
                     "healing_taken": _safe_int(player.get("healingTaken")),
                     "endorse_bnet_ids_json": endorse_ids_json,
                     "last_update": now_ts,
+                    "_has_kad_signal": has_kad_signal,
                 }
             )
 
@@ -512,26 +544,23 @@ class MatchDetailRecorder:
                     self._queue.task_done()
 
     def _write_batch(self, batch: Sequence[_MatchDetailEvent]) -> None:
-        merged = ParsedNormalMatchDetailBatch()
         extracted_at = int(time.time())
         for event in batch or []:
-            merged.extend(
-                extract_normal_match_detail_records(
-                    event.payload,
-                    request_url=event.url,
-                    extracted_at=extracted_at,
-                    match_mode=event.game_mode,
-                )
+            parsed = extract_normal_match_detail_records(
+                event.payload,
+                request_url=event.url,
+                extracted_at=extracted_at,
+                match_mode=event.game_mode,
             )
-        self.db.write_match_detail_batch(
-            hero_detail_rows=merged.hero_detail_rows,
-            comp_data_rows=merged.comp_data_rows,
-            perk_pick_rows=merged.perk_pick_rows,
-            comp_summary_keys=merged.comp_summary_keys,
-            perk_summary_keys=merged.perk_summary_keys,
-            match_meta_row=merged.match_meta_row,
-            match_player_rows=merged.match_player_rows,
-        )
+            self.db.write_match_detail_batch(
+                hero_detail_rows=parsed.hero_detail_rows,
+                comp_data_rows=parsed.comp_data_rows,
+                perk_pick_rows=parsed.perk_pick_rows,
+                comp_summary_keys=parsed.comp_summary_keys,
+                perk_summary_keys=parsed.perk_summary_keys,
+                match_meta_row=parsed.match_meta_row,
+                match_player_rows=parsed.match_player_rows,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +690,11 @@ class MatchListRecorder:
         for event in batch or []:
             entries = _extract_match_list_entries(event.payload)
             request_meta = _extract_match_list_request_meta(event.url, event.game_mode)
+            if request_meta.get("customer_token"):
+                request_meta = dict(request_meta)
+                request_meta["customer_token"] = cache_owner_key(
+                    customer_token=str(request_meta.get("customer_token") or "")
+                )
             match_ids = [
                 str(entry.get("matchId") or "").strip()
                 for entry in entries
@@ -735,6 +769,20 @@ def _extract_customer_token_from_url(url: str) -> str:
         return str(values[0] if values else "").strip()
     except Exception:
         return ""
+
+
+def _extract_season_from_url(url: str) -> Optional[int]:
+    """Extract the ``season`` query parameter from the request URL."""
+    try:
+        parsed = urlsplit(str(url or ""))
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        values = qs.get("season") or []
+        raw = str(values[0] if values else "").strip()
+        if raw:
+            return int(raw)
+    except Exception:
+        pass
+    return None
 
 
 def _normalize_role_type(role_type: Any) -> str:
@@ -840,6 +888,8 @@ class CountInfoRecorder:
             if not isinstance(data, dict):
                 continue
             guide_count_data = data.get("guideCountData") or []
+            # Extract season from URL query params (e.g. ...?season=22)
+            event_season = _extract_season_from_url(event.url)
             # Resolve token -> bnet_id: prefer data.bnetId from payload,
             # then fall back to DB-based resolution.
             player_bnet_id = str(data.get("bnetId") or "").strip()
@@ -863,7 +913,7 @@ class CountInfoRecorder:
                         "player_bnet_id": player_bnet_id,
                         "role_type": role_type,
                         "rank_score": rank_score,
-                        "season": None,
+                        "season": event_season,
                         "source_match_id": "",
                     }
                 )

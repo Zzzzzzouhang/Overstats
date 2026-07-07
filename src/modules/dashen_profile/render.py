@@ -17,6 +17,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
+try:
+    from overstats.src.modules.render_base import finalize_rendered_image
+except ModuleNotFoundError:
+    from src.modules.render_base import finalize_rendered_image
+
 from .engine import HeroBillboardEntry, HeroUsageRow, ProfileRenderContext, RolePanelEntry
 
 
@@ -131,9 +136,7 @@ def render_profile_summary(context: ProfileRenderContext) -> RenderedImage:
     )
     _draw_recent_match_timeline(image, config, context.recent_matches, fonts)
 
-    output = BytesIO()
-    image.save(output, format="PNG", optimize=True)
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(image, gc_collect=True))
 
 
 def _draw_name_block(

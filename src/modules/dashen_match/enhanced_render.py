@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 from io import BytesIO
+
+try:
+    from overstats.src.modules.render_base import finalize_rendered_image
+except ModuleNotFoundError:
+    from src.modules.render_base import finalize_rendered_image
 import math
 import re
 from typing import Any, Dict, List, Optional, Sequence
@@ -73,9 +78,7 @@ HIGHLIGHT_COLORS = {
 
 
 def _pil_to_rendered(image: Any) -> RenderedImage:
-    output = BytesIO()
-    image.convert("RGB").save(output, format="PNG", optimize=True)
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(image))
 
 
 def _open_rendered(rendered: RenderedImage) -> Any:

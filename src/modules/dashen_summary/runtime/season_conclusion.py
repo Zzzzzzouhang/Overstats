@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
+try:
+    from overstats.src.modules.render_base import finalize_rendered_image
+except ModuleNotFoundError:
+    from src.modules.render_base import finalize_rendered_image
+
 from ....constants.backgrounds import build_random_map_background
 
 from .dashen import (
@@ -118,26 +123,13 @@ OW_CONFIG = load_ow_config()
 
 
 def _summary_png_b64(image):
-    out = BytesIO()
-    try:
-        image.convert("RGB").save(
-            out,
-            format="JPEG",
-            quality=SUMMARY_IMAGE_JPEG_QUALITY,
-            optimize=False,
-            progressive=False,
-            subsampling=1,
-        )
-    except OSError:
-        image.convert("RGB").save(
-            out,
-            format="JPEG",
-            quality=max(65, SUMMARY_IMAGE_JPEG_QUALITY - 6),
-            optimize=False,
-            progressive=False,
-            subsampling=1,
-        )
-    return "base64://" + base64.b64encode(out.getvalue()).decode("utf-8")
+    data = finalize_rendered_image(
+        image,
+        format="JPEG",
+        jpeg_quality=SUMMARY_IMAGE_JPEG_QUALITY,
+        gc_collect=True,
+    )
+    return "base64://" + base64.b64encode(data).decode("utf-8")
 
 
 def _base64_payload_kb(image_b64):

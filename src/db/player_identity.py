@@ -28,6 +28,11 @@ _BATTLETAG_KEYS = (
 _BATTLENAME_KEYS = ("battlename", "battleName", "battle_name")
 _BATTLENUM_KEYS = ("battlenum", "battleNum", "battle_num")
 
+# Bounded background-write queue to avoid unbounded memory growth if SQLite
+# writes stall (disk IO, lock contention, full disk). Best-effort telemetry is
+# simply dropped when the queue is full.
+RECORDER_QUEUE_MAXSIZE = 512
+
 
 @dataclass(frozen=True)
 class _IdentityEvent:
@@ -162,10 +167,11 @@ async def record_identity_payload(payload: Any, *, db: Optional[IDPoolDB] = None
 class PlayerIdentityRecorder:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db = IDPoolDB(db_path)
-        self._queue: asyncio.Queue[Optional[_IdentityEvent]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[_IdentityEvent]] = asyncio.Queue(maxsize=RECORDER_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._started = False
         self._closed = False
+        self._dropped = 0
 
     async def start(self) -> None:
         if self._started or not is_database_write_enabled():
@@ -179,7 +185,15 @@ class PlayerIdentityRecorder:
             return
         if not self._started:
             await self.start()
-        await self._queue.put(_IdentityEvent(payload))
+        try:
+            self._queue.put_nowait(_IdentityEvent(payload))
+        except asyncio.QueueFull:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 10000 == 0:
+                print(
+                    f"[overstats] player-identity queue full, dropped {self._dropped} events "
+                    f"(maxsize={RECORDER_QUEUE_MAXSIZE})"
+                )
 
     async def close(self) -> None:
         if not self._started or self._closed:

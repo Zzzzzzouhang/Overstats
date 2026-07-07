@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -142,17 +143,25 @@ def iter_font_candidates(
     return _dedupe(candidates)
 
 
-def load_font(
+@lru_cache(maxsize=128)
+def _cached_resolve_font(
     size: int,
-    *,
-    name: str | os.PathLike[str] | None = None,
-    fallback: str | os.PathLike[str] | None = None,
-    prefer_cjk: bool = False,
-    bold: bool = False,
-    extra: Sequence[str | os.PathLike[str]] = (),
+    name_key: str,
+    fallback_key: str,
+    prefer_cjk: bool,
+    bold: bool,
+    extra_keys: tuple,
 ) -> Any:
+    """Resolve and parse a font once per unique (args) combination.
+
+    Font objects are immutable/read-only in PIL, so caching is safe. The cache
+    key fully determines the resolved candidate file, so the result is stable.
+    """
     from PIL import ImageFont
 
+    name = name_key or None
+    fallback = fallback_key or None
+    extra = [key for key in extra_keys if key]
     for candidate in iter_font_candidates(
         name=name,
         fallback=fallback,
@@ -165,3 +174,23 @@ def load_font(
         except Exception:
             continue
     return ImageFont.load_default()
+
+
+def load_font(
+    size: int,
+    *,
+    name: str | os.PathLike[str] | None = None,
+    fallback: str | os.PathLike[str] | None = None,
+    prefer_cjk: bool = False,
+    bold: bool = False,
+    extra: Sequence[str | os.PathLike[str]] = (),
+) -> Any:
+    extra_keys = tuple(_normalize_key(e) for e in extra)
+    return _cached_resolve_font(
+        int(size),
+        _normalize_key(name),
+        _normalize_key(fallback),
+        bool(prefer_cjk),
+        bool(bold),
+        extra_keys,
+    )

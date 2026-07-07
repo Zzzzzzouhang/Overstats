@@ -18,6 +18,11 @@ except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
     from src.modules.query_tool import get_cached_asset_path
 
+try:
+    from overstats.src.modules.render_base import finalize_rendered_image
+except ModuleNotFoundError:
+    from src.modules.render_base import finalize_rendered_image
+
 
 CARD_FILL = (18, 24, 34, 206)
 CARD_INNER_FILL = (25, 33, 46, 232)
@@ -142,10 +147,8 @@ def render_hero_wiki_overview(
         canvas.alpha_composite(section_image, dest=(padding, current_y))
         current_y += section_image.height + section_gap
 
-    output = BytesIO()
     canvas = canvas.resize((base_width, int(total_height / scale)), Image.LANCZOS)
-    canvas.save(output, format="PNG")
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(canvas, keep_alpha=True))
 
 
 def render_hero_wiki_error(title: str, message: str) -> RenderedImage:
@@ -184,10 +187,8 @@ def render_hero_wiki_error(title: str, message: str) -> RenderedImage:
     body_lines = _wrap_text(draw, str(message or "暂时无法生成英雄资料图"), fonts["body"], box[2] - box[0] - 48 * scale, max_lines=6)
     _draw_multiline(draw, box[0] + 24 * scale, box[1] + 96 * scale, body_lines, fonts["body"], TEXT_SUB, line_gap=8 * scale)
 
-    output = BytesIO()
     canvas = canvas.resize((base_width, base_height), Image.LANCZOS)
-    canvas.save(output, format="PNG")
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(canvas, keep_alpha=True))
 
 
 def _draw_header(

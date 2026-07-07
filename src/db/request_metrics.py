@@ -26,6 +26,11 @@ ENDPOINT_PERF_DEFAULT_MINUTES = 360          # default aggregation window 6 hour
 ENDPOINT_PERF_MAX_MINUTES = 60 * 24 * 30     # single query upper limit 30 days
 ENDPOINT_PERF_PERCENTILES = (0.5, 0.95, 0.99)
 
+# Bounded background-write queue to avoid unbounded memory growth if SQLite
+# writes stall (disk IO, lock contention, full disk). Best-effort telemetry is
+# simply dropped when the queue is full.
+RECORDER_QUEUE_MAXSIZE = 512
+
 
 @dataclass(frozen=True)
 class _MetricEvent:
@@ -101,10 +106,11 @@ def _normalize_metric_row(
 class RequestMetricsRecorder:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = Path(db_path or REQUEST_METRICS_DB_PATH)
-        self._queue: asyncio.Queue[Optional[_MetricEvent]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[_MetricEvent]] = asyncio.Queue(maxsize=RECORDER_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._started = False
         self._closed = False
+        self._dropped = 0
 
     async def start(self) -> None:
         if self._started or not is_database_write_enabled():
@@ -125,7 +131,15 @@ class RequestMetricsRecorder:
             return
         if not self._started:
             await self.start()
-        await self._queue.put(_MetricEvent(normalized_url, normalized_source, bool(success)))
+        try:
+            self._queue.put_nowait(_MetricEvent(normalized_url, normalized_source, bool(success)))
+        except asyncio.QueueFull:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 10000 == 0:
+                print(
+                    f"[overstats] request-metrics queue full, dropped {self._dropped} events "
+                    f"(maxsize={RECORDER_QUEUE_MAXSIZE})"
+                )
 
     async def close(self) -> None:
         if not self._started or self._closed:
@@ -350,10 +364,11 @@ class EndpointPerfRecorder:
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db_path = Path(db_path or REQUEST_METRICS_DB_PATH)
-        self._queue: asyncio.Queue[Optional[_PerfEvent]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[_PerfEvent]] = asyncio.Queue(maxsize=RECORDER_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._started = False
         self._closed = False
+        self._dropped = 0
 
     async def start(self) -> None:
         if self._started or not is_database_write_enabled():
@@ -386,21 +401,29 @@ class EndpointPerfRecorder:
             return
         if not self._started:
             await self.start()
-        await self._queue.put(_PerfEvent(
-            url=normalized_url,
-            http_status=int(http_status),
-            total_ms=max(0, int(total_ms)),
-            service_ms=max(0, int(service_ms)),
-            upstream_ms=max(0, int(upstream_ms)),
-            render_ms=int(render_ms),
-            queue_wait_ms=int(queue_wait_ms),
-            success=bool(success),
-            recorded_at=datetime.now(timezone.utc).isoformat(),
-            upstream_count=int(upstream_count),
-            memory_cache_hits=int(memory_cache_hits),
-            db_read_hits=int(db_read_hits),
-            upstream_breakdown=str(upstream_breakdown),
-        ))
+        try:
+            self._queue.put_nowait(_PerfEvent(
+                url=normalized_url,
+                http_status=int(http_status),
+                total_ms=max(0, int(total_ms)),
+                service_ms=max(0, int(service_ms)),
+                upstream_ms=max(0, int(upstream_ms)),
+                render_ms=int(render_ms),
+                queue_wait_ms=int(queue_wait_ms),
+                success=bool(success),
+                recorded_at=datetime.now(timezone.utc).isoformat(),
+                upstream_count=int(upstream_count),
+                memory_cache_hits=int(memory_cache_hits),
+                db_read_hits=int(db_read_hits),
+                upstream_breakdown=str(upstream_breakdown),
+            ))
+        except asyncio.QueueFull:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 10000 == 0:
+                print(
+                    f"[overstats] endpoint-perf queue full, dropped {self._dropped} events "
+                    f"(maxsize={RECORDER_QUEUE_MAXSIZE})"
+                )
 
     async def close(self) -> None:
         if not self._started or self._closed:

@@ -487,13 +487,20 @@ def extract_normal_match_detail_records(
     return result
 
 
+# Bounded background-write queues to avoid unbounded memory growth if SQLite
+# writes stall (disk IO, lock contention, full disk). Best-effort telemetry is
+# simply dropped when a queue is full.
+RECORDER_QUEUE_MAXSIZE = 512
+
+
 class MatchDetailRecorder:
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db = IDPoolDB(db_path)
-        self._queue: asyncio.Queue[Optional[_MatchDetailEvent]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[_MatchDetailEvent]] = asyncio.Queue(maxsize=RECORDER_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._started = False
         self._closed = False
+        self._dropped = 0
 
     async def start(self) -> None:
         if self._started or not is_database_write_enabled():
@@ -507,9 +514,17 @@ class MatchDetailRecorder:
             return
         if not self._started:
             await self.start()
-        await self._queue.put(
-            _MatchDetailEvent(str(url or ""), dict(payload or {}), game_mode=game_mode)
-        )
+        try:
+            self._queue.put_nowait(
+                _MatchDetailEvent(str(url or ""), dict(payload or {}), game_mode=game_mode)
+            )
+        except asyncio.QueueFull:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 10000 == 0:
+                print(
+                    f"[overstats] match-detail queue full, dropped {self._dropped} events "
+                    f"(maxsize={RECORDER_QUEUE_MAXSIZE})"
+                )
 
     async def close(self) -> None:
         if not self._started or self._closed:
@@ -626,10 +641,11 @@ class MatchListRecorder:
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db = IDPoolDB(db_path)
-        self._queue: asyncio.Queue[Optional[_MatchListEvent]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[_MatchListEvent]] = asyncio.Queue(maxsize=RECORDER_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._started = False
         self._closed = False
+        self._dropped = 0
 
     async def start(self) -> None:
         if self._started or not is_database_write_enabled():
@@ -647,9 +663,17 @@ class MatchListRecorder:
             return
         if not self._started:
             await self.start()
-        await self._queue.put(
-            _MatchListEvent(str(url or ""), dict(payload or {}), game_mode=game_mode)
-        )
+        try:
+            self._queue.put_nowait(
+                _MatchListEvent(str(url or ""), dict(payload or {}), game_mode=game_mode)
+            )
+        except asyncio.QueueFull:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 10000 == 0:
+                print(
+                    f"[overstats] match-list queue full, dropped {self._dropped} events "
+                    f"(maxsize={RECORDER_QUEUE_MAXSIZE})"
+                )
 
     async def close(self) -> None:
         if not self._started or self._closed:
@@ -815,10 +839,11 @@ class CountInfoRecorder:
 
     def __init__(self, db_path: Optional[Path] = None) -> None:
         self.db = IDPoolDB(db_path)
-        self._queue: asyncio.Queue[Optional[_CountInfoEvent]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[_CountInfoEvent]] = asyncio.Queue(maxsize=RECORDER_QUEUE_MAXSIZE)
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._started = False
         self._closed = False
+        self._dropped = 0
 
     async def start(self) -> None:
         if self._started or not is_database_write_enabled():
@@ -841,9 +866,17 @@ class CountInfoRecorder:
         if not self._started:
             await self.start()
         token = customer_token or _extract_customer_token_from_url(url)
-        await self._queue.put(
-            _CountInfoEvent(str(url or ""), dict(payload or {}), customer_token=token)
-        )
+        try:
+            self._queue.put_nowait(
+                _CountInfoEvent(str(url or ""), dict(payload or {}), customer_token=token)
+            )
+        except asyncio.QueueFull:
+            self._dropped += 1
+            if self._dropped == 1 or self._dropped % 10000 == 0:
+                print(
+                    f"[overstats] count-info queue full, dropped {self._dropped} events "
+                    f"(maxsize={RECORDER_QUEUE_MAXSIZE})"
+                )
 
     async def close(self) -> None:
         if not self._started or self._closed:

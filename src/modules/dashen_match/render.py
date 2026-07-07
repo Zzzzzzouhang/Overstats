@@ -19,6 +19,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
+try:
+    from overstats.src.modules.render_base import finalize_rendered_image
+except ModuleNotFoundError:
+    from src.modules.render_base import finalize_rendered_image
+
 
 RESOURCE_DIR = resolve_resource_dir()
 ASSET_MANIFEST_PATH = RESOURCE_DIR / "query_tool_assets" / "assets_manifest.json"
@@ -108,9 +113,7 @@ def render_match_list(
             font=font_sm,
         )
 
-    output = BytesIO()
-    img.convert("RGB").save(output, format="PNG", optimize=True)
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
 
 
 def render_match_detail(
@@ -235,9 +238,7 @@ def _render_scoreboard_match_detail(
         query_bnet_id=query_bnet_id,
     )
 
-    output = BytesIO()
-    img.convert("RGB").save(output, format="PNG", optimize=True)
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
 
 
 def _extract_match_detail_data(payload: Any) -> Dict[str, Any]:
@@ -503,9 +504,7 @@ def _render_fight_match_detail(
             row_y += row_h
         y += round_h + round_gap
 
-    output = BytesIO()
-    img.convert("RGB").save(output, format="PNG", optimize=True)
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
 
 
 def _draw_match_row(draw: Any, img: Any, config: Dict[str, Any], match: Dict[str, Any], index: int, y: int, font: Any, font_sm: Any) -> None:

@@ -601,6 +601,15 @@ async def render_summary_payload(query: Any) -> Dict[str, Any]:
             customer_token,
             bnet_id,
         )
+        # ponytail: the weather chart needs a 45-day lookback, but the summary
+        # incremental fetch stops at ~8 days.  Expand min_begin_ts so
+        # _get_summary_match_lists_with_fight covers the weather window.
+        # fetch_paginated_match_entries reads from DB page cache first, so the
+        # extra pages add zero API calls when already cached from the initial
+        # full fetch.
+        weather_min_ts = _summary_recent_fetch_min_ts(SUMMARY_WEATHER_FETCH_LOOKBACK_DAYS)
+        if match_list_min_begin_ts is not None and match_list_min_begin_ts > weather_min_ts:
+            match_list_min_begin_ts = weather_min_ts
         timer.mark("MATCH_LIST_REFRESH_DECISION", match_list_refresh_extra)
         all_raw_matches = await _get_summary_match_lists_with_fight(
             runtime,

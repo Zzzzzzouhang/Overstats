@@ -27,6 +27,9 @@ res/query_tool_assets/
 src/modules/dashen_summary/runtime/cache/
 ow_guess_assets/
 
+# Docker host data directory
+/data/
+
 # Test artifacts
 test_*.json
 test_*.md
@@ -43,3 +46,4 @@ src/db/match_stats.sqlite3.old
 CUsersDocumorialAppDataLocalTempseason_diff.txt
 /openspec
 src/db/request_metrics.sqlite3-journal
+/doceker_test

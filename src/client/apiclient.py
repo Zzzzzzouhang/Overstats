@@ -87,6 +87,7 @@ DASHEN_API_ROOT = "https://datamsapi.ds.163.com/v1/a19ld5tool"
 DASHEN_CUSTOMER_API_BASE = f"{DASHEN_API_ROOT}/customer"
 DASHEN_BILLBOARD_API_BASE = f"{DASHEN_API_ROOT}/billboard"
 DATAMSAPI_HOST = httpx.URL(DASHEN_API_ROOT).host or "datamsapi.ds.163.com"
+APPAPI_HOST = "appapi.cc.163.com"
 
 SEARCH_BNET_ACCOUNT_URL = "https://datamsapi.ds.163.com/v1/a19ld5tool/searchBnetAccount"
 SEARCH_BNET_ACCOUNT_TIMEOUT = httpx.Timeout(6.0, connect=2.5, read=4.0, write=4.0, pool=2.0)
@@ -537,6 +538,8 @@ def _domain_limit_for_url(url: str) -> tuple[Optional[str], Optional[int]]:
         return None, None
     if host == DATAMSAPI_HOST:
         return host, DATAMSAPI_MAX_CONCURRENT_REQUESTS
+    if host == APPAPI_HOST:
+        return host, APPAPI_MAX_CONCURRENT_REQUESTS
     return host, None
 
 
@@ -589,14 +592,19 @@ class SafeClient:
     async def _acquire_slot(self) -> Tuple[asyncio.Semaphore, str]:
         base_sem = get_global_semaphore()
         burst_sem = get_global_burst_semaphore()
-        while True:
-            if getattr(base_sem, "_value", 0) > 0:
-                await base_sem.acquire()
-                return base_sem, "base"
-            if self._should_allow_burst() and getattr(burst_sem, "_value", 0) > 0:
-                await burst_sem.acquire()
+        # Fast-path: if burst is warranted, try burst semaphore first with a
+        # short timeout so we never spin or block indefinitely on it.
+        if self._should_allow_burst():
+            try:
+                await asyncio.wait_for(burst_sem.acquire(), timeout=0.05)
                 return burst_sem, "burst"
-            await asyncio.sleep(0.02)
+            except asyncio.TimeoutError:
+                pass
+        # Standard path: properly block on the base semaphore via asyncio.
+        # No polling, no _value introspection — the event loop wakes us
+        # when a slot becomes available.
+        await base_sem.acquire()
+        return base_sem, "base"
 
     def _mark_request_start(self) -> int:
         SafeClient._request_seq += 1

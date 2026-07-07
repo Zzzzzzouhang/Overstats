@@ -70,11 +70,11 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "战绩工具正在进行新赛季适配,请耐心等待！",
+  "noticeMessage": "搜索接口暂时维护中！",
   "pcNoticeMessage": {
-    "sport": "欢迎您使用网易DD战绩工具！",
-    "leisure": "欢迎您使用网易DD战绩工具！",
-    "fight": "欢迎您使用网易DD战绩工具！"
+    "sport": "搜索接口暂时维护中！",
+    "leisure": "搜索接口暂时维护中！",
+    "fight": "搜索接口暂时维护中！！"
   },
   "coreCountTips": "<span>重装：赛季场均抵挡伤害量</span><br/>输出：赛季场均伤害<br/>治疗：赛季场均治疗量",
   "fightCoreCountTips": "<span>重装：赛季场均资金</span><br/>输出：赛季场均资金<br/>治疗：赛季场均资金",

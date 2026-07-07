@@ -79,19 +79,28 @@ _SEASON_SUMMARY_URL_SEMAPHORES = {}
 _SEASON_SUMMARY_COMMAND_BUSY = False
 _SUMMARY_IMAGE_CACHE = OrderedDict()
 _SUMMARY_IMAGE_CACHE_BYTES_BY_URL = {}
+_SUMMARY_IMAGE_CACHE_TS = {}
 _SUMMARY_COVER_CACHE = OrderedDict()
 _SUMMARY_COVER_CACHE_BYTES_BY_KEY = {}
-_SUMMARY_FONT_CACHE = {}
-_SUMMARY_MASK_CACHE = {}
+_SUMMARY_FONT_CACHE = OrderedDict()
+_SUMMARY_MASK_CACHE = OrderedDict()
 _SUMMARY_STATMAP_REFERENCE_CACHE = OrderedDict()
 _SUMMARY_DETAIL_CACHE = OrderedDict()
 _LAST_SUMMARY_DETAIL_DECISIONS = []
 SUMMARY_PRELOAD_IMAGES_ENABLED = os.getenv("OVERSTATS_PRELOAD_IMAGES", "1").strip().lower() not in {"0", "false", "no", "off"}
-SUMMARY_PRELOAD_IMAGE_BUDGET_MB = max(64, _read_env_int("OVERSTATS_SUMMARY_PRELOAD_IMAGE_MB", 128))
+# Preloaded hero/map icon images. Default budget lowered to 32MB for
+# low-memory hosts; floor is 32MB so it cannot be trimmed further via env.
+SUMMARY_PRELOAD_IMAGE_BUDGET_MB = max(32, _read_env_int("OVERSTATS_SUMMARY_PRELOAD_IMAGE_MB", 32))
 SUMMARY_PRELOAD_IMAGE_BUDGET_BYTES = SUMMARY_PRELOAD_IMAGE_BUDGET_MB * 1024 * 1024
 SUMMARY_IMAGE_CACHE_MAX_BYTES = SUMMARY_PRELOAD_IMAGE_BUDGET_BYTES
-SUMMARY_COVER_CACHE_BUDGET_MB = max(32, _read_env_int("OVERSTATS_SUMMARY_COVER_CACHE_MB", 256))
+# Preloaded images are only useful during an active render session. Expire
+# them after this idle window so the budget can be reclaimed during quiet
+# periods instead of lingering at the cap indefinitely.
+SUMMARY_IMAGE_CACHE_TTL_SEC = max(300, _read_env_int("OVERSTATS_SUMMARY_IMAGE_TTL_SEC", 1800))
+SUMMARY_COVER_CACHE_BUDGET_MB = max(32, _read_env_int("OVERSTATS_SUMMARY_COVER_CACHE_MB", 32))
 SUMMARY_COVER_CACHE_MAX_BYTES = SUMMARY_COVER_CACHE_BUDGET_MB * 1024 * 1024
+SUMMARY_FONT_CACHE_MAX = max(16, _read_env_int("OVERSTATS_SUMMARY_FONT_CACHE_MAX", 256))
+SUMMARY_MASK_CACHE_MAX = max(64, _read_env_int("OVERSTATS_SUMMARY_MASK_CACHE_MAX", 512))
 SUMMARY_STATMAP_REFERENCE_CACHE_MAX = max(128, _read_env_int("OVERSTATS_SUMMARY_STATMAP_REF_CACHE_MAX", 2048))
 SUMMARY_DETAIL_CACHE_TTL = max(60, _read_env_int("OVERSTATS_SUMMARY_DETAIL_CACHE_TTL", 1800))
 SUMMARY_DETAIL_CACHE_MAX = max(128, _read_env_int("OVERSTATS_SUMMARY_DETAIL_CACHE_MAX", 2048))
@@ -492,6 +501,14 @@ def _get_cached_summary_image_copy(url):
     cached = _SUMMARY_IMAGE_CACHE.get(url)
     if cached is None:
         return None
+    ts = _SUMMARY_IMAGE_CACHE_TS.get(url, 0)
+    if ts and (time.monotonic() - ts) > SUMMARY_IMAGE_CACHE_TTL_SEC:
+        # Expired: drop and report a miss so the caller can re-fetch.
+        with _SUMMARY_PRELOAD_LOCK:
+            _SUMMARY_IMAGE_CACHE.pop(url, None)
+            _SUMMARY_IMAGE_CACHE_TS.pop(url, None)
+            _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(url, 0))
+        return None
     try:
         _SUMMARY_IMAGE_CACHE.move_to_end(url)
     except Exception:
@@ -500,7 +517,17 @@ def _get_cached_summary_image_copy(url):
 
 
 def _has_cached_summary_image(url):
-    return str(url or "").strip() in _SUMMARY_IMAGE_CACHE
+    cached = _SUMMARY_IMAGE_CACHE.get(url)
+    if cached is None:
+        return False
+    ts = _SUMMARY_IMAGE_CACHE_TS.get(url, 0)
+    if ts and (time.monotonic() - ts) > SUMMARY_IMAGE_CACHE_TTL_SEC:
+        with _SUMMARY_PRELOAD_LOCK:
+            _SUMMARY_IMAGE_CACHE.pop(url, None)
+            _SUMMARY_IMAGE_CACHE_TS.pop(url, None)
+            _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(url, 0))
+        return False
+    return True
 
 
 def _put_summary_image_cache(url, image):
@@ -517,14 +544,15 @@ def _put_summary_image_cache(url, image):
             _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(url, 0))
         _SUMMARY_IMAGE_CACHE[url] = image.copy()
         _SUMMARY_IMAGE_CACHE_BYTES_BY_URL[url] = estimated_bytes
+        _SUMMARY_IMAGE_CACHE_TS[url] = time.monotonic()
         _SUMMARY_PRELOAD_IMAGE_BYTES += estimated_bytes
 
-        while (
-            _SUMMARY_PRELOAD_IMAGE_BYTES > SUMMARY_IMAGE_CACHE_MAX_BYTES
-            and len(_SUMMARY_IMAGE_CACHE) > 1
-        ):
+        while _SUMMARY_PRELOAD_IMAGE_BYTES > SUMMARY_IMAGE_CACHE_MAX_BYTES:
+            if not _SUMMARY_IMAGE_CACHE:
+                break
             old_url, _ = _SUMMARY_IMAGE_CACHE.popitem(last=False)
             _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(old_url, 0))
+            _SUMMARY_IMAGE_CACHE_TS.pop(old_url, None)
     return True
 
 
@@ -1873,6 +1901,10 @@ def _load_font(size, bold=False):
     cache_key = (int(size), bool(bold))
     cached = _SUMMARY_FONT_CACHE.get(cache_key)
     if cached is not None:
+        try:
+            _SUMMARY_FONT_CACHE.move_to_end(cache_key)
+        except Exception:
+            pass
         return cached
 
     adjusted_size = int(size)
@@ -1891,6 +1923,8 @@ def _load_font(size, bold=False):
         bold=bold,
     )
     _SUMMARY_FONT_CACHE[cache_key] = font
+    while len(_SUMMARY_FONT_CACHE) > SUMMARY_FONT_CACHE_MAX:
+        _SUMMARY_FONT_CACHE.popitem(last=False)
     return font
 
 
@@ -2424,10 +2458,17 @@ def _cover_fit(image, size):
 def _rounded_mask(size, radius=8):
     cache_key = (int(size[0]), int(size[1]), int(radius))
     mask = _SUMMARY_MASK_CACHE.get(cache_key)
-    if mask is None:
-        mask = Image.new("L", size, 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
-        _SUMMARY_MASK_CACHE[cache_key] = mask
+    if mask is not None:
+        try:
+            _SUMMARY_MASK_CACHE.move_to_end(cache_key)
+        except Exception:
+            pass
+        return mask
+    mask = Image.new("L", size, 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
+    _SUMMARY_MASK_CACHE[cache_key] = mask
+    while len(_SUMMARY_MASK_CACHE) > SUMMARY_MASK_CACHE_MAX:
+        _SUMMARY_MASK_CACHE.popitem(last=False)
     return mask
 
 

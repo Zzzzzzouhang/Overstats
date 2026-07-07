@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# 注意：config/config.py 会被烤进镜像以支持一键构建（含 token 等敏感信息）。
+# 请勿将构建出的镜像推送到公共仓库，否则会泄露凭据。
+# 若需分发镜像，改回只读挂载方案（见 git 历史）。
+
+# IDE / 工具
+.vscode/
+.idea/
+.qoder/
+.vibe/
+.codebuddy/
+
+# 测试产物
+test/
+
+# 运行时缓存（运行时由 entrypoint 链接到 /data 持久化卷，不烤进镜像）
+res/cache_img/
+res/query_tool_assets/
+ow_guess_assets/
+src/modules/dashen_summary/runtime/cache/
+cache/
+
+# 数据库（运行时挂载）
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3.old
+*.db
+
+# Git
+.git/
+.gitattributes
+.gitignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 文档 / 杂项
+openspec/
+*.md
+
+# Docker 元数据（仅保留 entrypoint.sh 与 Dockerfile 进入构建上下文）
+doceker_test/*
+!doceker_test/entrypoint.sh
+!doceker_test/Dockerfile

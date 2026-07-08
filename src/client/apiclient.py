@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import contextvars
 from dataclasses import dataclass
 import hashlib
+import json
 import os
 from pathlib import Path
 import random
@@ -262,11 +263,44 @@ class DashenCredential:
     server: int
 
 
+# Permanent account bans (HTTP 403) are persisted so they survive restarts.
+_DISABLED_CREDENTIALS_PATH = Path(__file__).resolve().parents[2] / "res" / "disabled_accounts.json"
+
+
+class DashenNoAvailableCredential(RuntimeError):
+    """Raised when no dashen credential is currently usable (all disabled/cooling)."""
+
+
+def _load_disabled_accounts(path: Optional[Path]) -> Dict[str, str]:
+    if not path or not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[overstats] failed to load disabled accounts from {path}: {exc}")
+    return {}
+
+
+def _save_disabled_accounts(path: Optional[Path], disabled: Dict[str, str]) -> None:
+    if not path:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(disabled, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[overstats] failed to persist disabled accounts to {path}: {exc}")
+
+
 class DashenCredentialPool:
     def __init__(
         self,
         credentials: Sequence[DashenCredential],
         cooldown_seconds: float = DASHEN_ACCOUNT_FAILURE_COOLDOWN_SECONDS,
+        disabled_file: Optional[Path] = None,
     ) -> None:
         normalized = tuple(credentials)
         if not normalized:
@@ -274,6 +308,10 @@ class DashenCredentialPool:
         self._credentials = normalized
         self._cooldown_seconds = max(1.0, float(cooldown_seconds or 1))
         self._cooldowns: Dict[str, float] = {credential.name: 0.0 for credential in normalized}
+        # Permanent bans (HTTP 403) persist across restarts so a banned account
+        # is never selected again, even after the process is restarted.
+        self._disabled_file = disabled_file
+        self._disabled: Dict[str, str] = _load_disabled_accounts(disabled_file)
         self._next_index = 0
         self._lock = threading.Lock()
         self._by_token = {credential.token: credential for credential in normalized}
@@ -290,14 +328,36 @@ class DashenCredentialPool:
             )
             for account in client_config.accounts
         ]
-        return cls(credentials, cooldown_seconds=client_config.account_failure_cooldown_seconds)
+        return cls(
+            credentials,
+            cooldown_seconds=client_config.account_failure_cooldown_seconds,
+            disabled_file=_DISABLED_CREDENTIALS_PATH,
+        )
 
     @property
     def credentials(self) -> Tuple[DashenCredential, ...]:
         return self._credentials
 
+    def is_disabled(self, name: str) -> bool:
+        with self._lock:
+            return name in self._disabled
+
+    def is_available(self, name: str, *, now: Optional[float] = None) -> bool:
+        """True if the credential is neither permanently disabled nor cooling."""
+        now = time.monotonic() if now is None else float(now)
+        with self._lock:
+            return name not in self._disabled and self._cooldowns.get(name, 0.0) <= now
+
+    @property
+    def disabled_credentials(self) -> List[DashenCredential]:
+        with self._lock:
+            return [c for c in self._credentials if c.name in self._disabled]
+
     def get_by_token(self, token: str) -> Optional[DashenCredential]:
-        return self._by_token.get(str(token or "").strip())
+        credential = self._by_token.get(str(token or "").strip())
+        if credential is None:
+            return None
+        return None if self.is_disabled(credential.name) else credential
 
     def next_credential(self, *, now: Optional[float] = None) -> DashenCredential:
         now = time.monotonic() if now is None else float(now)
@@ -307,17 +367,22 @@ class DashenCredentialPool:
             for offset in range(total):
                 index = (start_index + offset) % total
                 credential = self._credentials[index]
+                if credential.name in self._disabled:
+                    continue
                 if self._cooldowns.get(credential.name, 0.0) <= now:
                     self._next_index = (index + 1) % total
                     return credential
 
-            earliest_index = min(
-                range(total),
-                key=lambda idx: (self._cooldowns.get(self._credentials[idx].name, 0.0), idx),
-            )
-            credential = self._credentials[earliest_index]
-            self._next_index = (earliest_index + 1) % total
-            return credential
+        # Nothing usable: every credential is either permanently disabled or
+        # still cooling. Refuse to retry a banned/cooling account and give up.
+        disabled_count = sum(1 for c in self._credentials if c.name in self._disabled)
+        print(
+            "[overstats] WARNING: no usable dashen credential "
+            f"(disabled={disabled_count}/{total}, all cooling); giving up"
+        )
+        raise DashenNoAvailableCredential(
+            "all dashen credentials are disabled or cooling; refusing to select any"
+        )
 
     def mark_success(self, credential: DashenCredential, *, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -331,16 +396,29 @@ class DashenCredentialPool:
         *,
         reason: str,
         now: Optional[float] = None,
+        permanent: bool = False,
     ) -> None:
         now = time.monotonic() if now is None else float(now)
-        cooldown_until = now + self._cooldown_seconds
+        disabled_snapshot: Optional[Dict[str, str]] = None
         with self._lock:
-            self._cooldowns[credential.name] = cooldown_until
-        print(
-            "[overstats] dashen credential cooled down "
-            f"account={credential.name} role_id={credential.role_id} "
-            f"cooldown_seconds={int(self._cooldown_seconds)} reason={reason}"
-        )
+            if permanent:
+                self._disabled[credential.name] = reason
+                disabled_snapshot = dict(self._disabled)
+            self._cooldowns[credential.name] = now + self._cooldown_seconds
+        if permanent:
+            print(
+                "[overstats] dashen credential DISABLED PERMANENTLY "
+                f"account={credential.name} role_id={credential.role_id} "
+                f"reason={reason}"
+            )
+            if disabled_snapshot is not None:
+                _save_disabled_accounts(self._disabled_file, disabled_snapshot)
+        else:
+            print(
+                "[overstats] dashen credential cooled down "
+                f"account={credential.name} role_id={credential.role_id} "
+                f"cooldown_seconds={int(self._cooldown_seconds)} reason={reason}"
+            )
 
 
 def _authenticated_headers(
@@ -933,6 +1011,7 @@ class DashenAPIClient:
             self.credential_pool = DashenCredentialPool(
                 [manual_credential],
                 cooldown_seconds=self.client_config.account_failure_cooldown_seconds,
+                disabled_file=_DISABLED_CREDENTIALS_PATH,
             )
         else:
             self.credential_pool = DashenCredentialPool.from_config(self.client_config)
@@ -940,7 +1019,9 @@ class DashenAPIClient:
     def _select_credential(self, preferred_token: Optional[str] = None) -> DashenCredential:
         if preferred_token:
             matched = self.credential_pool.get_by_token(preferred_token)
-            if matched is not None:
+            # Skip a preferred credential that is disabled or still cooling, so a
+            # failed account is never retried during its cooldown window.
+            if matched is not None and self.credential_pool.is_available(matched.name):
                 return matched
         return self.credential_pool.next_credential()
 
@@ -1120,10 +1201,18 @@ class DashenAPIClient:
             raise
 
         if credential is not None:
-            if response.status_code in {401, 403}:
+            if response.status_code == 403:
+                # HTTP 403 -> the account/token is forbidden; disable it permanently
+                # so it is never selected again for subsequent requests.
                 self.credential_pool.mark_failure(
                     credential,
-                    reason=f"http_{response.status_code}",
+                    reason="http_403",
+                    permanent=True,
+                )
+            elif response.status_code == 401:
+                self.credential_pool.mark_failure(
+                    credential,
+                    reason="http_401",
                 )
             else:
                 self.credential_pool.mark_success(credential)

@@ -710,6 +710,80 @@ History JSON response shape:
 
 The `/image` endpoint returns `image/png` in the same visual family as quick strength and competitive strength. `quick` uses the blue theme, while `competitive` uses the bright red theme.
 
+## Dashen Shiqu (是区吗) API
+
+对玩家最近预设/6v6 对局与队友数据进行毒舌判定（脱口秀风格）。判定由独立的 LLM 端点生成（配置见 `config/shiqu_config.py`，仅读环境变量 `OVERSTATS_SHIQU_LLM_*`，不依赖 `config.py`），结果经 PIL 渲染成判定书。
+
+Endpoints:
+
+- `POST /api/v2/dashen-shiqu`
+- `POST /api/v2/dashen-shiqu/image`
+
+Request body:
+
+```json
+{
+  "bnet_id": "Player#12345",
+  "match_count": 12
+}
+```
+
+You may provide `customer_token` instead of `bnet_id`. `match_count` is clamped to `2-25` (default `12`); it controls how many recent preset/6v6 matches are fetched for the verdict.
+
+Required config (environment variables):
+
+- `OVERSTATS_SHIQU_LLM_BASE_URL`
+- `OVERSTATS_SHIQU_LLM_API_KEY`
+- `OVERSTATS_SHIQU_LLM_MODEL`
+
+JSON (`/api/v2/dashen-shiqu`) response shape:
+
+```json
+{
+  "ok": true,
+  "target_id": "Player#12345",
+  "score": 71,
+  "verdict": "恭喜，你不是区！",
+  "summary": "……脱口秀式点评……",
+  "match_comments": [
+    {
+      "index": 0,
+      "result": 1,
+      "hero": "安娜",
+      "comment": "……本局点评……"
+    }
+  ],
+  "overall_comment": "……总体点评……",
+  "teammate_comments": [
+    {
+      "name": "MateA",
+      "games": 8,
+      "score": 64,
+      "verdict": "不幸，你可能是区？",
+      "comment": "……队友点评……"
+    }
+  ]
+}
+```
+
+`/api/v2/dashen-shiqu/image` returns `image/png` — the full verdict book rendered with Pillow (dark theme, gold title, score/verdict colored by tier, win/loss shaded, teammates in cool grey).
+
+Behavior notes:
+
+- Match fetching strictly reuses the overstats `dashen_match` module (`query_match_list` / `query_match_detail` + `DashenRequestQueue` account rotation), so upstream concurrency stays under project control.
+- Only preset / 6v6 matches are used; 角斗领域 (fight) is not supported and returns `insufficient_matches` if none qualify.
+- The LLM call is bounded by an internal semaphore on the AsyncRunner loop; on JSON parse failures it retries up to 3 times with a 40s backoff.
+- The verifier result is written to `shiqu_llm.sqlite3` via `ShiquLLMRecorder` (same async-queue pattern as other recorders), best-effort and non-blocking.
+
+Common errors:
+
+| 错误码 | 场景 | 解决方式 |
+|--------|------|----------|
+| `missing_target` | 缺少 `bnet_id` / `customer_token` | 提供至少一项 |
+| `shiqu_llm_not_configured` | 未设置 `OVERSTATS_SHIQU_LLM_*` 环境变量 | 配置独立的 shiqu LLM 端点 |
+| `insufficient_matches` | 预设/6v6 对局不足 2 场 | 确保该玩家有近期竞技/快速预设对局 |
+| `shiqu_llm_failed` | LLM 调用异常或返回非合法 JSON | 检查 LLM 端点可用性后重试 |
+
 ## 通用约定
 
 - 除图片接口外，返回 `application/json; charset=utf-8`

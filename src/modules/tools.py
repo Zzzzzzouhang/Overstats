@@ -155,3 +155,15 @@ register_module(
     "Private local SQLite lookup from Battle.net numeric ID to candidate BattleTags.",
     public=False,
 )
+
+register_module(
+    "dashen_shiqu",
+    "overstats.src.modules.dashen_shiqu",
+    "是区吗判定书生成：抓取最近预设/6v6 对局，调用独立 LLM 复盘点评，并渲染 PIL 判定书图片。",
+)
+
+register_module(
+    "dashen_court",
+    "overstats.src.modules.dashen_court",
+    "电竞法庭判决书生成：基于单局详情，调用独立 LLM 输出毒舌判决书，并渲染 PIL 图片。",
+)

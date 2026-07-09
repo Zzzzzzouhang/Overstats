@@ -1,4 +1,13 @@
 {
+  "antiCrawlerConfig": {
+    "enabled": true,
+    "searchEnabled": true,
+    "minEndorsementLevel": 2,
+    "minGameTimeMinutes": 1800,
+    "recentDays": 5,
+    "minRecentMatches": 1,
+    "whitelist": []
+  },
   "whiteList": [
     "yd.bafe4ef249214ccb8@163.com",
     "17328633212",
@@ -70,11 +79,11 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "搜索接口暂时维护中！",
+  "noticeMessage": "",
   "pcNoticeMessage": {
-    "sport": "搜索接口暂时维护中！",
-    "leisure": "搜索接口暂时维护中！",
-    "fight": "搜索接口暂时维护中！！"
+    "sport": "",
+    "leisure": "",
+    "fight": ""
   },
   "coreCountTips": "<span>重装：赛季场均抵挡伤害量</span><br/>输出：赛季场均伤害<br/>治疗：赛季场均治疗量",
   "fightCoreCountTips": "<span>重装：赛季场均资金</span><br/>输出：赛季场均资金<br/>治疗：赛季场均资金",

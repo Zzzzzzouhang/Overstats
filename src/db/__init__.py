@@ -24,6 +24,12 @@ from .ow_hero_leaderboard import (
     OWHeroLeaderboardDB,
     OW_HERO_LEADERBOARD_DB_PATH,
 )
+from .shiqu_llm import (
+    SHIQU_LLM_DB_PATH,
+    ShiquLLMDB,
+    ShiquLLMRecorder,
+    shiqu_llm_recorder,
+)
 
 __all__ = [
     "HERO_LEADERBOARD_CN_TABLE",
@@ -46,5 +52,9 @@ __all__ = [
     "REQUEST_SOURCE_UPSTREAM",
     "RequestMetricsRecorder",
     "search_identity_by_bnet_id",
+    "SHIQU_LLM_DB_PATH",
+    "ShiquLLMDB",
+    "ShiquLLMRecorder",
+    "shiqu_llm_recorder",
     "split_battletag",
 ]

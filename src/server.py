@@ -26,6 +26,7 @@ try:
         EndpointPerfRecorder,
         normalize_request_metric_url,
     )
+    from overstats.src.db.shiqu_llm import shiqu_llm_recorder
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
@@ -46,6 +47,15 @@ try:
     from overstats.src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
         dashen_competitive_strength_module,
+    )
+    from overstats.src.modules.dashen_shiqu import ShiquQuery, shiqu_module
+    from overstats.src.modules.dashen_court import CourtQuery, court_module
+    from overstats.src.db.court_llm import court_llm_recorder
+    from overstats.src.db.shiqu_llm import shiqu_llm_recorder
+    from overstats.src.modules.llm_call_status import (
+        court_llm_status,
+        shiqu_llm_status,
+        start_llm_status_reporter,
     )
     from overstats.src.modules.dashen_rank_leaderboard import (
         DashenRankLeaderboardQuery,
@@ -86,6 +96,7 @@ except ModuleNotFoundError:
         EndpointPerfRecorder,
         normalize_request_metric_url,
     )
+    from src.db.shiqu_llm import shiqu_llm_recorder
     from src.modules.errors import ModuleError
     from src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
@@ -106,6 +117,15 @@ except ModuleNotFoundError:
     from src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
         dashen_competitive_strength_module,
+    )
+    from src.modules.dashen_shiqu import ShiquQuery, shiqu_module
+    from src.modules.dashen_court import CourtQuery, court_module
+    from src.db.court_llm import court_llm_recorder
+    from src.db.shiqu_llm import shiqu_llm_recorder
+    from src.modules.llm_call_status import (
+        court_llm_status,
+        shiqu_llm_status,
+        start_llm_status_reporter,
     )
     from src.modules.dashen_rank_leaderboard import (
         DashenRankLeaderboardQuery,
@@ -701,6 +721,10 @@ class OverstatsCoreService:
             "/api/v2/dashen-rank-history": lambda: self.handle_dashen_rank_history(selection.payload),
             "/api/v2/dashen-quick-strength": lambda: self.handle_dashen_quick_strength(selection.payload),
             "/api/v2/dashen-competitive-strength": lambda: self.handle_dashen_competitive_strength(selection.payload),
+            "/api/v2/dashen-shiqu": lambda: self.handle_shiqu(selection.payload),
+            "/api/v2/dashen-shiqu/image": lambda: self.handle_shiqu_image(selection.payload),
+            "/api/v2/dashen-court": lambda: self.handle_court(selection.payload),
+            "/api/v2/dashen-court/image": lambda: self.handle_court_image(selection.payload),
             "/api/v2/dashen-hero-treemap": lambda: self.handle_dashen_hero_treemap(selection.payload),
             "/api/v2/ow-hero-perk": lambda: self.handle_ow_hero_perk(selection.payload),
             "/api/v2/ow_hero_wiki": lambda: self.handle_ow_hero_wiki(selection.payload),
@@ -1803,6 +1827,148 @@ class OverstatsCoreService:
             )
         return result.image.content
 
+    async def handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "shiqu",
+            lambda: self._handle_shiqu(payload),
+        )
+
+    async def _handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_count = _coerce_optional_int(payload, "match_count") or 12
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+        result = await shiqu_module.analyze(
+            ShiquQuery(
+                bnet_id=bnet_id,
+                customer_token=customer_token,
+                match_count=match_count,
+                use_db=use_db,
+            ),
+        )
+        result["ok"] = True
+        return result
+
+    async def handle_shiqu_image(self, payload: Dict[str, object]) -> bytes:
+        return await self.dashen_request_queue.run(
+            "shiqu_image",
+            lambda: self._handle_shiqu_image(payload),
+        )
+
+    async def _handle_shiqu_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        match_count = _coerce_optional_int(payload, "match_count") or 12
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345"}',
+            )
+        result = await shiqu_module.analyze(
+            ShiquQuery(
+                bnet_id=bnet_id,
+                customer_token=customer_token,
+                match_count=match_count,
+                use_db=use_db,
+            ),
+        )
+        try:
+            from overstats.src.modules.dashen_shiqu.render import render_shiqu_image
+        except ModuleNotFoundError:
+            from src.modules.dashen_shiqu.render import render_shiqu_image
+        generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime()
+        )
+        rendered = await asyncio.to_thread(render_shiqu_image, result, generated_at)
+        if not rendered or not rendered.content:
+            raise ModuleError(
+                error="render_failed",
+                message="是区吗判定书图片生成失败。",
+                status_code=500,
+            )
+        return rendered.content
+
+    async def handle_court(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "court",
+            lambda: self._handle_court(payload),
+        )
+
+    async def _handle_court(self, payload: Dict[str, object]) -> Dict[str, object]:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        index = _coerce_optional_int(payload, "index", "idx") or 0
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+        result = await court_module.analyze(
+            CourtQuery(
+                bnet_id=bnet_id,
+                customer_token=customer_token,
+                index=index,
+                use_db=use_db,
+            ),
+        )
+        result["ok"] = True
+        return result
+
+    async def handle_court_image(self, payload: Dict[str, object]) -> bytes:
+        return await self.dashen_request_queue.run(
+            "court_image",
+            lambda: self._handle_court_image(payload),
+        )
+
+    async def _handle_court_image(self, payload: Dict[str, object]) -> bytes:
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        index = _coerce_optional_int(payload, "index", "idx") or 0
+        use_db = _coerce_bool(payload.get("use_db"), False)
+        if not bnet_id and not customer_token:
+            raise ModuleError(
+                error="missing_target",
+                message="Missing query target: bnet_id or customer_token is required.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","index":0}',
+            )
+        result = await court_module.analyze(
+            CourtQuery(
+                bnet_id=bnet_id,
+                customer_token=customer_token,
+                index=index,
+                use_db=use_db,
+            ),
+        )
+        try:
+            from overstats.src.modules.dashen_court.render import render_court_image
+        except ModuleNotFoundError:
+            from src.modules.dashen_court.render import render_court_image
+        generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime()
+        )
+        rendered = await asyncio.to_thread(render_court_image, result, generated_at)
+        if not rendered or not rendered.content:
+            raise ModuleError(
+                error="render_failed",
+                message="电竞法庭判决书图片生成失败。",
+                status_code=500,
+            )
+        return rendered.content
+
 
 class _PerfAccumulator:
     """Per-request accumulator reused for queue_wait (and future stages)."""
@@ -1916,6 +2082,19 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     count_info_recorder = CountInfoRecorder() if config.enable_database_write else None
     if count_info_recorder is not None:
         async_runner.run(count_info_recorder.start())
+    if config.enable_database_write:  # shiqu_llm_recorder.start() 在开关关闭时自动 no-op
+        async_runner.run(shiqu_llm_recorder.start())
+        async_runner.run(court_llm_recorder.start())
+    # LLM 调用状态定时打印（每 10 秒）：独立于开关，始终在事件循环上运行。
+    # 注意：该协程为 while True 死循环，必须用 submit（即发即弃），不能用 run（会阻塞主线程）。
+    async_runner.submit(
+        start_llm_status_reporter(
+            shiqu_llm_status,
+            court_llm_status,
+            shiqu_llm_recorder,
+            court_llm_recorder,
+        )
+    )
     ow_hero_leaderboard_sync_service = OWHeroLeaderboardSyncService()
     async_runner.run(ow_hero_leaderboard_sync_service.start())
     previous_match_detail_recorder = dashen_api_client.match_detail_recorder
@@ -2142,6 +2321,23 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             if path == "/api/v2/dashen-competitive-strength":
                 self._handle_dashen_competitive_strength_post()
                 return
+
+            if path == "/api/v2/dashen-shiqu/image":
+                self._handle_shiqu_image_post()
+                return
+
+            if path == "/api/v2/dashen-shiqu":
+                self._handle_shiqu_post()
+                return
+
+            if path == "/api/v2/dashen-court/image":
+                self._handle_court_image_post()
+                return
+
+            if path == "/api/v2/dashen-court":
+                self._handle_court_post()
+                return
+
 
             if path == "/api/v2/dashen-match/detail/replies":
                 self._handle_dashen_match_detail_replies_post()
@@ -3832,6 +4028,186 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
             self._send_binary(HTTPStatus.OK, image_body, "image/png")
 
+        def _handle_shiqu_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_shiqu(payload)))
+            except ModuleError as exc:
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_shiqu_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_shiqu_image(payload)))
+            except ModuleError as exc:
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_court_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(self._capture_perf(service.handle_court(payload)))
+            except ModuleError as exc:
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_court_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(self._capture_perf(service.handle_court_image(payload)))
+            except ModuleError as exc:
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
         def _handle_dashen_competitive_strength_post(self) -> None:
             try:
                 payload = self._read_json_body()
@@ -4571,8 +4947,11 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             async_runner.run(request_metrics_recorder.close())
         if endpoint_perf_recorder is not None:
             async_runner.run(endpoint_perf_recorder.close())
-        async_runner.close()
-        original_server_close()
+        if config.enable_database_write:  # 排空队列后再关闭（开关关闭时 close() 自动 no-op）
+            async_runner.run(shiqu_llm_recorder.close())
+            async_runner.run(court_llm_recorder.close())
+        async_runner.close()  # 始终关闭服务事件循环，与数据库写入开关无关
+        original_server_close()  # 始终关闭监听 socket，与数据库写入开关无关
 
     server.server_close = server_close
     server.ow_hero_leaderboard_sync_service = ow_hero_leaderboard_sync_service

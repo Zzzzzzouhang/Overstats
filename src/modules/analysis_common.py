@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import asyncio
 import httpx
+
+# 跨模块共享的 LLM 并发信号量：shiqu 与 court 共用这 2 个槽位，
+# 使对外部 ANALYSIS 端点的同时调用总数受单一上限约束（默认 2）。
+LLM_SEMAPHORE = asyncio.Semaphore(2)
 
 try:
     from overstats.config import config as app_config

@@ -23,7 +23,9 @@ Thumbs.db
 
 # Runtime caches
 res/cache_img/
+res/NotoColorEmoji.ttf
 res/query_tool_assets/
+res/disabled_accounts.json
 src/modules/dashen_summary/runtime/cache/
 ow_guess_assets/
 
@@ -48,3 +50,4 @@ CUsersDocumorialAppDataLocalTempseason_diff.txt
 src/db/request_metrics.sqlite3-journal
 /doceker_test
 /.codebuddy
+/.workbuddy

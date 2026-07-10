@@ -127,7 +127,7 @@ _COURT_SYSTEM_PROMPT = """[ROLE] 角色与语气设定
 1. 守望先锋段位名称：青铜、白银、黄金、白金、钻石、大师、宗师、英杰。
 2. 比喻参考库：
 状态不稳定类：情绪不稳定的数据电池、心电图、数据过山车、随机数生成器、情绪盲盒、接触不良的数据电池、人形骰子、薛定谔的C位、信号不好的路由器、间歇性战神体验卡。
-无效贡献类：空气掩护、用身体打伤害、给对面尽孝、行走的充电宝、战术性自杀、蹭地图经验涨KD、团队ATM机、敌方能量加速器、移动复活点。
+无效贡献类：空气掩护、用身体打伤害、行走的充电宝、战术性自杀、蹭地图经验涨KD、团队ATM机、敌方能量加速器、移动复活点。
 高光统治类：战神下凡、把对面点位焊死、职业选手体验生活、人形外挂、把对面当兵线补、输出端装了GPS。
 拉胯下限类：会飞的咸鱼、空中活靶子、开雾逛该的观光客、落地成盒、纯度极高的咸鱼、键盘撒米鸡啄选手、人机练习赛VIP。
 数据结果背离类：华丽数据证明无用、KDA骗子、用队友的命换评分、胜利是队友扛着走的。
@@ -165,37 +165,115 @@ _COURT_SYSTEM_PROMPT = """[ROLE] 角色与语气设定
 5. 分析三路对位差距：数据已按坦克→输出→辅助排序。对位规则：坦克位一对一比较；输出位整体比较（我方输出组 vs 对方输出组，不要拆分编号）；辅助位整体比较（我方辅助组 vs 对方辅助组，不要拆分编号）。
 
 [OUTPUT FORMAT] 输出格式与字段规范
-1. 必须严格使用中文，只输出纯文本（不要 markdown 代码块）。
-2. 判决必须基于数据事实，好的表现必须肯定赞赏，差的表现应毒舌调侃。
-3. 不要被「虚高数据」欺骗（例如：坦克刷伤害却无击杀；辅助刷治疗却无关键救援）。需要结合击杀参与率等指标综合判断。
-4. 严格遵循下方输出格式，填空并写入分析内容：
+1. 必须严格使用中文。最终只输出一个合法的 JSON 对象，禁止输出 markdown 代码块、注释或任何 JSON 之外的文字。
+2. JSON 对象必须严格遵循下方 JSON Schema，包含完整字段（不输出 ⚖️/📋/🗺️ 等 emoji，渲染时会自动添加）：
+   - case_no（字符串）：对局序号，如 "1"
+   - location（字符串）：地图名
+   - mvp（对象）：含 player（玩家名）和 reason（MVP 理由，约 50~80 字，数据驱动、生动有趣）
+   - defendant（对象）：含 player（被告名，即最差表现者）和 charges（原罪清单，约 50~80 字，毒舌调侃、条条诛心）
+   - focus_verdict（对象）：含 player（焦点玩家名）、score（评分 S/A/B/C/D）、reason（判决理由，约 50~80 字）
+   - team_verdicts（数组）：全队每人一条，含 player（玩家名）和 verdict（一句话判决，约 20~40 字），焦点玩家排第一位
+   - lane_analysis（对象）：含 tank（坦克位一对一对比分析）、dps（输出位整体对比）、healer（辅助位整体对比），各约 30~50 字
+3. 所有判决严格基于原始数据，禁止编造数据。好的表现必须肯定赞赏，差的表现应毒舌调侃。评分 S 最好，D 最差。
 
-⚖️ **电竞法庭判决书**
-
-📋 **案件编号**：第 {index_hint} 局
-🗺️ **案发地点**：（地图名）
-
-🏆 **MVP（最佳表现者）**：（姓名）——（理由）
-
-👎 **最差表现者（被告）**：（姓名）
-**原罪清单**：
-- ...
-
-⚡ **焦点玩家判决**：（姓名）—— 评分：X
-（详细理由）
-
-📊 **全队审判**：
-- {target_player}：...
-- （队友名）：...
-- ...
-
-⚔️ **三路对位分析**：（输出位和辅助位均整体对比，无需拆编号一对一）
-- 坦克位：我方（英雄名）vs 对方（英雄名）—— 对比分析
-- 输出位：我方（英雄1 + 英雄2）vs 对方（英雄1 + 英雄2）—— 整体对比输出火力与击杀效率
-- 辅助位：我方（英雄1 + 英雄2）vs 对方（英雄1 + 英雄2）—— 整体对比治疗量与生存/功能性
+JSON Schema 定义：
+{court_json_schema}
 
 [INPUT DATA] 输入数据
 """
+
+
+# ── 多字段结构化 JSON Schema（与 shiqu 一致：response_format=json_schema）──
+# 渲染端将结构化字段组装为带 ⚖️/📋/🗺️ 标记的完整判决书正文；
+# 旧版单字段 {"verdict":"..."} 格式兼容（渲染端自动识别）。
+_COURT_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "case_no", "location", "mvp", "defendant",
+        "focus_verdict", "team_verdicts", "lane_analysis",
+    ],
+    "properties": {
+        "case_no": {"type": "string", "description": "对局序号，如 1"},
+        "location": {"type": "string", "description": "地图名"},
+        "mvp": {
+            "type": "object", "additionalProperties": False,
+            "required": ["player", "reason"],
+            "properties": {
+                "player": {"type": "string"},
+                "reason": {"type": "string"},
+            },
+        },
+        "defendant": {
+            "type": "object", "additionalProperties": False,
+            "required": ["player", "charges"],
+            "properties": {
+                "player": {"type": "string"},
+                "charges": {"type": "string"},
+            },
+        },
+        "focus_verdict": {
+            "type": "object", "additionalProperties": False,
+            "required": ["player", "score", "reason"],
+            "properties": {
+                "player": {"type": "string"},
+                "score": {"type": "string", "description": "S/A/B/C/D"},
+                "reason": {"type": "string"},
+            },
+        },
+        "team_verdicts": {
+            "type": "array",
+            "description": "全队审判列表（焦点玩家排第一位）",
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["player", "verdict"],
+                "properties": {
+                    "player": {"type": "string"},
+                    "verdict": {"type": "string"},
+                },
+            },
+        },
+        "lane_analysis": {
+            "type": "object", "additionalProperties": False,
+            "required": ["tank", "dps", "healer"],
+            "properties": {
+                "tank": {"type": "string"},
+                "dps": {"type": "string"},
+                "healer": {"type": "string"},
+            },
+        },
+    },
+}
+
+
+def _is_valid_court_json(text: str) -> bool:
+    """校验 LLM 返回是否为合法 court JSON（含全部必需字段）。"""
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return False
+    if not isinstance(obj, dict):
+        return False
+    required = ["case_no", "location", "mvp", "defendant", "focus_verdict", "team_verdicts", "lane_analysis"]
+    if not all(k in obj for k in required):
+        return False
+    # 校验嵌套字段
+    for key, sub_fields in [("mvp", ["player", "reason"]),
+                             ("defendant", ["player", "charges"]),
+                             ("focus_verdict", ["player", "score", "reason"])]:
+        sub = obj.get(key)
+        if not isinstance(sub, dict) or not all(f in sub for f in sub_fields):
+            return False
+    lanes = obj.get("lane_analysis")
+    if not isinstance(lanes, dict) or not all(f in lanes for f in ["tank", "dps", "healer"]):
+        return False
+    tvs = obj.get("team_verdicts")
+    if not isinstance(tvs, list) or len(tvs) < 1:
+        return False
+    for tv in tvs:
+        if not isinstance(tv, dict) or "player" not in tv or "verdict" not in tv:
+            return False
+    return True
 
 
 # ── Prompt 构建 ──
@@ -433,7 +511,9 @@ def _build_court_prompt(raw_data: Dict[str, Any], target_id: str, db: Optional[I
         lines.append(json.dumps(detail, ensure_ascii=False, indent=2))
 
     match_text = "\n".join(lines)
-    return _COURT_SYSTEM_PROMPT + match_text
+    return _COURT_SYSTEM_PROMPT.replace(
+        "{court_json_schema}", json.dumps(_COURT_JSON_SCHEMA, ensure_ascii=False, indent=2)
+    ) + match_text
 
 
 # ── LLM 调用（与 shiqu 共用配置，输出纯文本）──
@@ -451,6 +531,10 @@ async def _call_llm(prompt: str) -> Optional[str]:
         "model": cfg.model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": cfg.stream,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "court_verdict", "strict": True, "schema": _COURT_JSON_SCHEMA},
+        },
     }
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
     from ..analysis_common import build_async_client, get_analysis_proxy, LLM_SEMAPHORE
@@ -643,15 +727,16 @@ class CourtModule:
             for attempt in range(1, max_attempts + 1):
                 call_count += 1
                 last_text = await _call_llm(prompt) or ""
-                if last_text:
+                # 强制 JSON 输出：校验 verdict 字段，非法则重试（最终失败在 finally 落库并报错）
+                if last_text and _is_valid_court_json(last_text):
                     result = last_text
                     break
-                logger.warning(f"[court] LLM 尝试 {attempt}/{max_attempts} 失败，准备重试")
+                logger.warning(f"[court] LLM 尝试 {attempt}/{max_attempts} 返回非合法 JSON，准备重试")
             success = bool(result)
             if not result:
                 raise ModuleError(
                     error="court_llm_failed",
-                    message="AI 判决书生成失败：大模型调用异常 / 返回内容为空。",
+                    message="AI 判决书生成失败：大模型调用异常 / 返回内容不是合法 JSON。",
                     status_code=502,
                 )
         finally:
@@ -659,23 +744,24 @@ class CourtModule:
             court_llm_status.mark_call_done(
                 success, "" if success else "LLM 返回为空或调用异常"
             )
-
-        # ── 落库（异步、best-effort，不阻塞主流程）──
-        # 只存提示词 / 原始返回 / 调用诊断 + 渲染元数据；判决书由 raw_response 解析。
-        try:
-            await court_llm_recorder.enqueue(
-                target_id=full_id,
-                raw_response=result,
-                match_index=index,
-                map_name=map_name,
-                game_mode=game_mode,
-                prompt=prompt,
-                ok=success,
-                duration_ms=duration_ms,
-                call_count=call_count,
-            )
-        except Exception as exc:
-            logger.warning(f"[court] 落库失败（忽略）: {exc}")
+            # ── 落库（异步、best-effort，不阻塞主流程）──
+            # 必须放在 finally 内：无论成功还是 raise 失败都落库，否则失败调用既不记录
+            # 错误也不记录 prompt，无法排查。只存提示词 / 原始返回 / 调用诊断 + 渲染元数据；
+            # 判决书由 raw_response 解析（失败时 raw_response 为 ""）。
+            try:
+                await court_llm_recorder.enqueue(
+                    target_id=full_id,
+                    raw_response=result,
+                    match_index=index,
+                    map_name=map_name,
+                    game_mode=game_mode,
+                    prompt=prompt,
+                    ok=success,
+                    duration_ms=duration_ms,
+                    call_count=call_count,
+                )
+            except Exception as exc:
+                logger.warning(f"[court] 落库失败（忽略）: {exc}")
 
         return {
             "target_id": full_id,

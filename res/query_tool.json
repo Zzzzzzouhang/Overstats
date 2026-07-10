@@ -2,9 +2,9 @@
   "antiCrawlerConfig": {
     "enabled": true,
     "searchEnabled": true,
-    "minEndorsementLevel": 2,
+    "minEndorsementLevel": 1,
     "minGameTimeMinutes": 1800,
-    "recentDays": 5,
+    "recentDays": 10,
     "minRecentMatches": 1,
     "whitelist": []
   },
@@ -79,7 +79,7 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "",
+  "noticeMessage": "部分角色绑定数据存在异常，请耐心等待修复",
   "pcNoticeMessage": {
     "sport": "",
     "leisure": "",

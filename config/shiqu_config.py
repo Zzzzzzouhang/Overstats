@@ -19,15 +19,15 @@ class ShiquLLMConfig:
     #   "https://api.openai.com/v1"
     #   "https://api.deepseek.com"
     #   "http://127.0.0.1:8000/v1"
-    base_url: ""
+    base_url: str = ""
 
     # LLM 服务 API Key（对应 Authorization: Bearer <api_key>）。
     # 示例："sk-xxxxxxxxxxxxxxxxxxxxxxxx"
-    api_key: "replace-with-your-analysis-api-key"
+    api_key: str = ""
 
     # 模型名（具体取值取决于所用服务）。
     # 示例："gpt-4o-mini" / "deepseek-chat" / "qwen2.5-72b-instruct" "deepseek-v4-flash"
-    model: ""
+    model: str = ""
 
     # 是否使用 SSE 流式响应；关闭时走普通 JSON 一次性返回。默认 True。
     stream: bool = True
@@ -48,11 +48,28 @@ class ShiquLLMConfig:
         return f"{base}/chat/completions"
 
 
+# dataclass 字段名 -> 对应的环境变量名
+_ENV_TO_FIELD = {
+    "SHIQU_LLM_BASE_URL": "base_url",
+    "SHIQU_LLM_API_KEY": "api_key",
+    "SHIQU_LLM_MODEL": "model",
+    "SHIQU_LLM_STREAM": "stream",
+    "SHIQU_LLM_TIMEOUT": "timeout_seconds",
+    "SHIQU_LLM_RETRY": "retry",
+}
+
+
 def _get(name: str, default: str = "") -> str:
-    """仅从环境变量 OVERSTATS_{name} 读取，不回退到 config.py。"""
+    """优先读环境变量 OVERSTATS_{name}；为空时回退到 ShiquLLMConfig 的字段默认值。"""
     env_value = os.getenv(f"OVERSTATS_{name}")
     if env_value:
         return env_value.strip()
+    field = _ENV_TO_FIELD.get(name)
+    if field:
+        try:
+            return str(getattr(ShiquLLMConfig, field, default) or "").strip()
+        except Exception:
+            return str(default or "").strip()
     return str(default or "").strip()
 
 

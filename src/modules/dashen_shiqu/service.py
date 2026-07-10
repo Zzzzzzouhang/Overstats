@@ -947,20 +947,21 @@ class ShiquModule:
             shiqu_llm_status.mark_call_done(
                 success, "" if success else "LLM 返回为空或 JSON 解析失败"
             )
-
-        # ── 阶段四：LLM 调用遥测落库（异步、best-effort，不阻塞主流程）──
-        # 只存提示词 / 原始返回 / 调用诊断；score/verdict/summary 等渲染时由 raw_response 解析。
-        try:
-            await shiqu_llm_recorder.enqueue(
-                target_id=full_id,
-                prompt=prompt,
-                raw_response=last_text,
-                ok=success,
-                duration_ms=duration_ms,
-                call_count=call_count,
-            )
-        except Exception as exc:
-            logger.warning(f"[shiqu] LLM 调用记录落库失败（已忽略）: {exc}")
+            # ── 阶段四：LLM 调用遥测落库（异步、best-effort，不阻塞主流程）──
+            # 必须放在 finally 内：无论成功还是 raise 失败都落库，否则失败调用既不记录
+            # 错误也不记录 prompt，无法排查。只存提示词 / 原始返回 / 调用诊断；
+            # score/verdict/summary 等渲染时由 raw_response 解析（失败时 raw_response 可能为空字符串）。
+            try:
+                await shiqu_llm_recorder.enqueue(
+                    target_id=full_id,
+                    prompt=prompt,
+                    raw_response=last_text,
+                    ok=success,
+                    duration_ms=duration_ms,
+                    call_count=call_count,
+                )
+            except Exception as exc:
+                logger.warning(f"[shiqu] LLM 调用记录落库失败（已忽略）: {exc}")
 
         return result
 

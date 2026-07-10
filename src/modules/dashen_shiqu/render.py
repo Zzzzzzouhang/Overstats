@@ -306,35 +306,7 @@ def _ensure_noto_color_emoji() -> Optional[Path]:
 
 @lru_cache(maxsize=16)
 def _emoji_font(size: int) -> Optional[ImageFont.ImageFont]:
-    """解析 emoji 字体（Windows 的 Segoe UI Emoji / 其它平台的 Noto Color Emoji 等）。
-
-    非 Windows 平台若没有系统 emoji 字体，会自动下载 Noto Color Emoji 到 res/。
-    找不到时返回 None，emoji 退化为 base 字体（可能显示为豆腐块）。
-    """
-    noto = _ensure_noto_color_emoji()
-    candidates = [
-        Path("C:/Windows/Fonts/seguiemj.ttf"),
-        Path("C:/Windows/Fonts/seguiemj_0.ttf"),
-        resolve_resource_dir() / "NotoColorEmoji.ttf",
-        Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
-        Path("/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf"),
-        Path("/System/Library/Fonts/Apple Color Emoji.ttf"),
-    ]
-    if noto is not None:
-        # 已确保可用的 Noto 字体优先（真彩色）
-        candidates.insert(0, noto)
-    # 兜底：单色矢量 emoji 字体（任意尺寸可缩放，Pillow 一定能渲染，
-    # 避免 NotoColorEmoji 位图字体在任意尺寸下触发“invalid pixel size”退化成豆腐块）。
-    mono = _ensure_noto_emoji_mono()
-    if mono is not None:
-        candidates.append(mono)
-    for c in candidates:
-        if not c.exists():
-            continue
-        try:
-            return ImageFont.truetype(str(c), size)
-        except Exception:
-            continue
+    """始终返回 None — emoji 渲染已完全禁用（Linux 服务器上字体下载/检测会导致卡死）。"""
     return None
 
 
@@ -402,21 +374,14 @@ def _is_regular_latin_font(path: Path) -> bool:
 def _half_width_font(size: int) -> Optional[ImageFont.ImageFont]:
     """半宽数字字体（用于渲染数字与小数点，避免 CJK 字体把 123.45 画成全宽）。
 
-    优先用系统常规（Regular、非斜体）拉丁字体；明确排除 res/en.ttf —— 它实为
-    Helvetica Bold Oblique，会让数字变粗斜。找不到常规拉丁字体时回退 None（用 base 字体）。
+    仅使用项目自带的 en2.ttf；不存在时返回 None（用 base 字体渲染）。
     """
-    candidates = [
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
-        Path("C:/Windows/Fonts/arial.ttf"),
-        Path("/usr/share/fonts/opentype/liberation/LiberationSans-Regular.ttf"),
-    ]
-    for c in candidates:
-        if c.exists() and _is_regular_latin_font(c):
-            try:
-                return ImageFont.truetype(str(c), size)
-            except Exception:
-                continue
+    num_font = resolve_resource_dir() / "en2.ttf"
+    if num_font.exists():
+        try:
+            return ImageFont.truetype(str(num_font), size)
+        except Exception:
+            pass
     return None
 
 

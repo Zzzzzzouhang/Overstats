@@ -83,7 +83,7 @@ class CourtLLMDB:
             self._warn_once(f"court llm sqlite db not found: {self.db_path}")
             return None
         try:
-            return sqlite3.connect(str(self.db_path))
+            return sqlite3.connect(str(self.db_path), timeout=10)
         except Exception as exc:
             self._warn_once(f"court llm sqlite connection failed: {type(exc).__name__}: {exc}")
             return None
@@ -91,7 +91,9 @@ class CourtLLMDB:
     def _get_write_connection(self) -> Optional[sqlite3.Connection]:
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            return sqlite3.connect(str(self.db_path), timeout=30)
+            conn = sqlite3.connect(str(self.db_path), timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            return conn
         except Exception as exc:
             self._warn_once(f"court llm sqlite write connection failed: {type(exc).__name__}: {exc}")
             return None

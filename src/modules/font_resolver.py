@@ -39,9 +39,7 @@ _WINDOWS_CJK_BOLD = (
     Path("C:/Windows/Fonts/simhei.ttf"),
     Path("C:/Windows/Fonts/msyh.ttc"),
 )
-_WINDOWS_LATIN_FALLBACKS = (
-    Path("C:/Windows/Fonts/arial.ttf"),
-)
+_WINDOWS_LATIN_FALLBACKS: tuple = ()
 
 
 def resolve_resource_dir() -> Path:
@@ -83,17 +81,8 @@ def _is_cjk_font_request(font_path: str | os.PathLike[str] | None) -> bool:
 
 def get_cjk_font_candidates(*, bold: bool = False) -> list[Path]:
     resource_dir = resolve_resource_dir()
-    env_name = "OVERSTATS_CJK_BOLD_FONT" if bold else "OVERSTATS_CJK_FONT"
     bundled_font = resource_dir / "simhei.ttf"
-    linux_fonts = _LINUX_CJK_BOLD if bold else _LINUX_CJK_REGULAR
-    windows_fonts = _WINDOWS_CJK_BOLD if bold else _WINDOWS_CJK_REGULAR
-    candidates: list[str | os.PathLike[str]] = [bundled_font]
-    font_env = os.getenv(env_name)
-    if font_env:
-        candidates.append(font_env)
-    candidates.extend(linux_fonts)
-    candidates.extend(windows_fonts)
-    return _dedupe(candidates)
+    return [bundled_font]
 
 
 def get_cjk_font_path(*, bold: bool = False) -> str | None:

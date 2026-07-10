@@ -1857,6 +1857,9 @@ class OverstatsCoreService:
         return result
 
     async def handle_shiqu_image(self, payload: Dict[str, object]) -> bytes:
+        # use_db=true 模式：不占用 dashen 并发槽位，直接 DB 读取 + 渲染
+        if _coerce_bool(payload.get("use_db"), False):
+            return await self._handle_shiqu_image(payload)
         return await self.dashen_request_queue.run(
             "shiqu_image",
             lambda: self._handle_shiqu_image(payload),
@@ -1928,6 +1931,9 @@ class OverstatsCoreService:
         return result
 
     async def handle_court_image(self, payload: Dict[str, object]) -> bytes:
+        # use_db=true 模式：不占用 dashen 并发槽位，直接 DB 读取 + 渲染
+        if _coerce_bool(payload.get("use_db"), False):
+            return await self._handle_court_image(payload)
         return await self.dashen_request_queue.run(
             "court_image",
             lambda: self._handle_court_image(payload),

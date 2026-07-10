@@ -88,7 +88,7 @@ class ShiquLLMDB:
             self._warn_once(f"shiqu llm sqlite db not found: {self.db_path}")
             return None
         try:
-            connection = sqlite3.connect(str(self.db_path))
+            connection = sqlite3.connect(str(self.db_path), timeout=10)
             return connection
         except Exception as exc:
             self._warn_once(f"shiqu llm sqlite connection failed: {type(exc).__name__}: {exc}")
@@ -98,6 +98,7 @@ class ShiquLLMDB:
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(str(self.db_path), timeout=30)
+            connection.execute("PRAGMA journal_mode=WAL")
             return connection
         except Exception as exc:
             self._warn_once(f"shiqu llm sqlite write connection failed: {type(exc).__name__}: {exc}")

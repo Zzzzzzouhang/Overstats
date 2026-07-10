@@ -372,16 +372,7 @@ def _is_regular_latin_font(path: Path) -> bool:
 
 
 def _half_width_font(size: int) -> Optional[ImageFont.ImageFont]:
-    """半宽数字字体（用于渲染数字与小数点，避免 CJK 字体把 123.45 画成全宽）。
-
-    仅使用项目自带的 en2.ttf；不存在时返回 None（用 base 字体渲染）。
-    """
-    num_font = resolve_resource_dir() / "en2.ttf"
-    if num_font.exists():
-        try:
-            return ImageFont.truetype(str(num_font), size)
-        except Exception:
-            pass
+    """始终返回 None — 数字跟随 base 字体（simhei.ttf），不再使用独立半宽字体。"""
     return None
 
 

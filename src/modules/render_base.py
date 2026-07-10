@@ -1,12 +1,37 @@
 from __future__ import annotations
 
 import gc
+import io
+import os
 from io import BytesIO
+from pathlib import Path
+from typing import Union
 
 try:
     from PIL import Image
 except ModuleNotFoundError:  # pragma: no cover - PIL is a hard dependency
     from PIL import Image  # type: ignore
+
+ImageSource = Union[str, "os.PathLike[str]", bytes, bytearray]
+
+
+def load_image_rgba(source: ImageSource) -> "Image.Image":
+    """Open an image and return an independent RGBA copy with the source released.
+
+    Prefer this over ``Image.open(src).convert("RGBA")``: the latter discards the
+    file-backed ``Image`` and only closes its OS file handle when the object is
+    garbage collected, which under concurrency leaks file descriptors. Here the
+    source is opened via ``with`` and the result is an explicit ``.copy()`` that no
+    longer references the source, so handles are released promptly.
+
+    Accepts a filesystem path or raw bytes (wrapped in ``BytesIO``).
+    """
+    if isinstance(source, (bytes, bytearray)):
+        opener: "Image.Image" = Image.open(io.BytesIO(source))
+    else:
+        opener = Image.open(str(Path(source)))
+    with opener:
+        return opener.convert("RGBA").copy()
 
 
 def finalize_rendered_image(

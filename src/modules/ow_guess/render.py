@@ -6,6 +6,11 @@ from pathlib import Path
 import random
 from typing import Any, Mapping
 
+try:
+    from overstats.src.modules.render_base import load_image_rgba
+except ModuleNotFoundError:
+    from src.modules.render_base import load_image_rgba
+
 
 @dataclass(frozen=True)
 class RenderedImage:
@@ -91,7 +96,7 @@ def _render_icon_card(image: Any) -> Any:
 def _render_hero_silhouette(image: Any, background_path: Path) -> Any:
     from PIL import Image
 
-    background = Image.open(background_path).convert("RGBA")
+    background = load_image_rgba(background_path)
     icon = image.convert("RGBA").resize((200, 200), Image.LANCZOS)
     silhouette = Image.new("RGBA", icon.size, (0, 0, 0, 0))
     alpha = icon.getchannel("A")

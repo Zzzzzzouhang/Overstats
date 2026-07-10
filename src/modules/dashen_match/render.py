@@ -20,9 +20,9 @@ except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
 try:
-    from overstats.src.modules.render_base import finalize_rendered_image
+    from overstats.src.modules.render_base import finalize_rendered_image, load_image_rgba
 except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image
+    from src.modules.render_base import finalize_rendered_image, load_image_rgba
 
 
 RESOURCE_DIR = resolve_resource_dir()
@@ -163,7 +163,7 @@ def _render_scoreboard_match_detail(
 
     template_path = RESOURCE_DIR / "score_board.png"
     if template_path.exists():
-        img = Image.open(template_path).convert("RGBA")
+        img = load_image_rgba(template_path)
     else:
         img = Image.new("RGBA", (1825, 994), (24, 26, 34, 255))
         ImageDraw.Draw(img).rectangle((1125, 0, 1825, 994), fill=(32, 35, 45, 255))
@@ -533,7 +533,7 @@ def _draw_detail_map_background(img: Any, map_info: Dict[str, Any], width: int, 
     try:
         from PIL import Image
 
-        icon = Image.open(local_path).convert("RGBA")
+        icon = load_image_rgba(local_path)
         bg = _crop_center_to_size(icon, (width, height))
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 125))
         img.paste(bg, (0, 0))
@@ -931,7 +931,7 @@ def _build_rank_badge_image(rank_info: Dict[str, Any], *, width: int, height: in
     if asset_path is None or not asset_path.exists():
         return None
     try:
-        icon = Image.open(asset_path).convert("RGBA")
+        icon = load_image_rgba(asset_path)
     except Exception:
         return None
 
@@ -987,7 +987,7 @@ def _draw_map_background(img: Any, map_info: Dict[str, Any], y: int) -> None:
     try:
         from PIL import Image
 
-        icon = Image.open(local_path).convert("RGBA")
+        icon = load_image_rgba(local_path)
         bg = _crop_center_to_size(icon, (660, 50))
         mask = _left_fade_mask((660, 50))
         img.paste(bg, (20, y), mask)
@@ -1005,7 +1005,7 @@ def _paste_map_image(img: Any, map_info: Dict[str, Any], pos: tuple[int, int], s
     try:
         from PIL import Image
 
-        icon = Image.open(path).convert("RGBA")
+        icon = load_image_rgba(path)
         bg = _crop_center_to_size(icon, size)
         img.paste(bg, pos)
     except Exception:
@@ -1027,7 +1027,7 @@ def _paste_icon_from_url(
     try:
         from PIL import Image
 
-        icon = _resize_image(Image.open(path).convert("RGBA"), size)
+        icon = _resize_image(load_image_rgba(path), size)
         img.paste(icon, pos, icon)
         return True
     except Exception:
@@ -1167,7 +1167,7 @@ def _paste_perk_icon(img: Any, url: Any, pos: tuple[int, int], icon_width: int) 
     try:
         from PIL import Image
 
-        icon = Image.open(path).convert("RGBA")
+        icon = load_image_rgba(path)
         if icon.width <= 0 or icon.height <= 0:
             return False
         icon_height = max(1, int(icon.height * icon_width / icon.width))
@@ -1202,7 +1202,7 @@ def _draw_perks(draw: Any, img: Any, config: Dict[str, Any], perks: Sequence[Dic
             try:
                 from PIL import Image
 
-                bg = _resize_image(Image.open(bg_path).convert("RGBA"), (size, size))
+                bg = _resize_image(load_image_rgba(bg_path), (size, size))
                 img.paste(bg, (x, py), bg)
             except Exception:
                 draw.rectangle((x, py, x + size, py + size), outline=(255, 190, 60))

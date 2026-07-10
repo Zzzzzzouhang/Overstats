@@ -19,9 +19,9 @@ except ModuleNotFoundError:
     from src.modules.query_tool import get_cached_asset_path
 
 try:
-    from overstats.src.modules.render_base import finalize_rendered_image
+    from overstats.src.modules.render_base import finalize_rendered_image, load_image_rgba
 except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image
+    from src.modules.render_base import finalize_rendered_image, load_image_rgba
 
 
 CARD_FILL = (18, 24, 34, 206)
@@ -1127,7 +1127,7 @@ def _open_cached_or_remote_rgba(url: Any, *, categories: Sequence[str]) -> Any |
     if not cached_bytes:
         return None
     try:
-        return Image.open(BytesIO(cached_bytes)).convert("RGBA")
+        return load_image_rgba(cached_bytes)
     except Exception:
         return None
 

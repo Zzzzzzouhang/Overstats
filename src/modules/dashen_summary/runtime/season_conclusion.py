@@ -16,9 +16,9 @@ from typing import Any, Dict, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 try:
-    from overstats.src.modules.render_base import finalize_rendered_image
+    from overstats.src.modules.render_base import finalize_rendered_image, load_image_rgba
 except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image
+    from src.modules.render_base import finalize_rendered_image, load_image_rgba
 
 from ....constants.backgrounds import build_random_map_background
 
@@ -2367,7 +2367,7 @@ def _make_background(size):
     bg_path = os.path.join(MODULE_DIR, "bg.png")
     if os.path.exists(bg_path):
         try:
-            raw = Image.open(bg_path).convert("RGBA")
+            raw = load_image_rgba(bg_path)
             bg = _make_blurred_summary_background(raw, size, blur_radius=24)
         except Exception:
             pass
@@ -2423,7 +2423,7 @@ async def _load_summary_image(url):
                 image = None
         if image is None:
             raw = await _limited_call(lambda: get_icon(url))
-            image = Image.open(BytesIO(raw)).convert("RGBA")
+            image = load_image_rgba(raw)
             if local_candidates:
                 try:
                     image.save(local_candidates[0])

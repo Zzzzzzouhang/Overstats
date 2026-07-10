@@ -20,6 +20,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
+try:
+    from overstats.src.modules.render_base import load_image_rgba
+except ModuleNotFoundError:
+    from src.modules.render_base import load_image_rgba
+
 from .requests import fight_payload_has_content, payload_data, sport_payload_has_content
 
 
@@ -256,7 +261,7 @@ def _paste_rank_bar(
     if asset.exists():
         from PIL import Image
 
-        rank_image = Image.open(asset).convert("RGBA").resize((115, 37), Image.LANCZOS)
+        rank_image = load_image_rgba(asset).resize((115, 37), Image.LANCZOS)
         rect.paste(rank_image, (x, y), rank_image)
     draw.text((x + 75, y + 5), str(tier), font=fonts["font_num"], fill=(0, 0, 0, 255))
 
@@ -431,13 +436,11 @@ def _load_background(width: int, height: int, *, rows: int) -> Any:
 
 
 def _load_remote_asset_image(url: str, *, category: str) -> Any:
-    from PIL import Image
-
     asset_path = _find_cached_asset_path(url, category=category)
     if asset_path is None or not asset_path.exists():
         return None
     try:
-        return Image.open(asset_path).convert("RGBA")
+        return load_image_rgba(asset_path)
     except Exception:
         return None
 
@@ -518,12 +521,10 @@ def _safe_float(value: Any) -> float:
 
 
 def _load_local_rgba(path: Path) -> Any:
-    from PIL import Image
-
     if not path.exists():
         return None
     try:
-        return Image.open(path).convert("RGBA")
+        return load_image_rgba(path)
     except Exception:
         return None
 

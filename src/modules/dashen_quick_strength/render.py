@@ -20,6 +20,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
 
+try:
+    from overstats.src.modules.render_base import load_image_rgba
+except ModuleNotFoundError:
+    from src.modules.render_base import load_image_rgba
+
 
 def _resolve_resource_dir() -> Path:
     here = Path(__file__).resolve()
@@ -820,7 +825,7 @@ def _load_map_backdrop(
     if not local_path or not Path(local_path).exists():
         return None
     try:
-        image = Image.open(local_path).convert("RGBA")
+        image = load_image_rgba(local_path)
     except Exception:
         return None
 
@@ -1261,7 +1266,7 @@ def _open_avatar(
     if not avatar_bytes:
         return None
     try:
-        avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
+        avatar = load_image_rgba(avatar_bytes)
     except Exception:
         return None
     avatar = ImageOps.fit(avatar, (size, size), method=Image.LANCZOS)

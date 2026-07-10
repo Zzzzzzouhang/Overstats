@@ -15,6 +15,11 @@ except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
     from src.modules.query_tool import get_cached_asset_path
 
+try:
+    from overstats.src.modules.render_base import load_image_rgba
+except ModuleNotFoundError:
+    from src.modules.render_base import load_image_rgba
+
 
 def _resolve_resource_dir() -> Path:
     here = Path(__file__).resolve()
@@ -466,19 +471,17 @@ def _open_cached_asset(url: Any, categories: Sequence[str]) -> Any | None:
         if path is None or not path.exists():
             continue
         try:
-            return Image.open(path).convert("RGBA")
+            return load_image_rgba(path)
         except Exception:
             continue
     return None
 
 
 def _open_local_rgba(path: Path) -> Any | None:
-    from PIL import Image
-
     if not path.exists():
         return None
     try:
-        return Image.open(path).convert("RGBA")
+        return load_image_rgba(path)
     except Exception:
         return None
 

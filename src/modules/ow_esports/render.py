@@ -12,6 +12,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
 
+try:
+    from overstats.src.modules.render_base import load_image_rgba
+except ModuleNotFoundError:
+    from src.modules.render_base import load_image_rgba
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 RES_DIR = PROJECT_ROOT / "res"
@@ -340,7 +345,7 @@ def _prepare_logo_image(raw: bytes, size: tuple[int, int], label: str) -> Any:
 
     if raw:
         try:
-            image = Image.open(BytesIO(raw)).convert("RGBA")
+            image = load_image_rgba(raw)
             image.thumbnail((size[0] - 18, size[1] - 18), _resampling_lanczos())
             canvas = Image.new("RGBA", size, (0, 0, 0, 0))
             x = (size[0] - image.width) // 2

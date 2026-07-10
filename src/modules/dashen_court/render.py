@@ -33,7 +33,8 @@ try:
     from overstats.src.modules.dashen_shiqu.render import (
         _normalize_llm_text,
         _is_emoji,
-        _emoji_font,
+        _emoji_enabled,
+        _composite_emoji,
         _glyph_width,
         _char_font,
         _half_width_font,
@@ -47,7 +48,8 @@ except ModuleNotFoundError:  # pragma: no cover
     from src.modules.dashen_shiqu.render import (
         _normalize_llm_text,
         _is_emoji,
-        _emoji_font,
+        _emoji_enabled,
+        _composite_emoji,
         _glyph_width,
         _char_font,
         _half_width_font,
@@ -164,20 +166,20 @@ def render_court_image(
         elif kind == "title":
             segs, font = payload
             y += 12
-            lines = _wrap_segments(segs, _meas, font, max_w, emoji_font=_emoji_font(font.size))
+            lines = _wrap_segments(segs, _meas, font, max_w, emoji_on=_emoji_enabled())
             layout.append((kind, (segs, font, lines), y))
             y += len(lines) * int(font.size * 1.6) + 16
         elif kind == "para":
             segs, font = payload
             y += 6
-            lines = _wrap_segments(segs, _meas, font, max_w, emoji_font=_emoji_font(font.size))
+            lines = _wrap_segments(segs, _meas, font, max_w, emoji_on=_emoji_enabled())
             layout.append((kind, (segs, font, lines), y))
             y += len(lines) * int(font.size * 1.55) + 6
         elif kind == "list":
             segs, font, indent = payload
             y += 6
             avail = max_w - indent
-            lines = _wrap_segments(segs, _meas, font, avail, emoji_font=_emoji_font(font.size))
+            lines = _wrap_segments(segs, _meas, font, avail, emoji_on=_emoji_enabled())
             layout.append((kind, (segs, font, indent, lines), y))
             y += len(lines) * int(font.size * 1.55) + 6
         elif kind == "footer":
@@ -191,29 +193,33 @@ def render_court_image(
     # ── 第二遍：绘制 ──
     img = Image.new("RGB", (width, y), BG)
     draw = ImageDraw.Draw(img)
+    ef = _emoji_enabled()
     footer_sep_drawn = False
 
     for kind, payload, top_y in layout:
         if kind == "title":
             segs, font, lines = payload
             half = _half_width_font(font.size)
-            ef = _emoji_font(font.size)
             line_h = int(font.size * 1.6)
             for i, (chars, _full) in enumerate(lines):
                 lw = sum(_glyph_width(draw, c[0], font, ef, half) for c in chars)
                 x = max(pad_x, (width - lw) // 2)
                 cx = x
                 for ch, color, fn in chars:
+                    if _is_emoji(ch) and ef and fn is None:
+                        _composite_emoji(img, ch, cx, top_y + i * line_h, font.size)
+                        cx += _glyph_width(draw, ch, font, ef, half)
+                        continue
                     draw.text((cx, top_y + i * line_h), ch, font=fn, fill=color)
                     cx += _glyph_width(draw, ch, font, ef, half)
         elif kind == "para":
             segs, font, lines = payload
-            _draw_segments(draw, lines, pad_x, top_y, font, int(font.size * 1.55), max_w)
+            _draw_segments(draw, img, lines, pad_x, top_y, font, int(font.size * 1.55), max_w, ef)
         elif kind == "list":
             segs, font, indent, lines = payload
             # 项目符号（•）对齐首行
             draw.text((pad_x, top_y), "•", font=font, fill=BOLD_GOLD)
-            _draw_segments(draw, lines, pad_x + indent, top_y, font, int(font.size * 1.55), max_w - indent)
+            _draw_segments(draw, img, lines, pad_x + indent, top_y, font, int(font.size * 1.55), max_w - indent, ef)
         elif kind == "footer":
             text, font = payload
             # 页脚块整体只画一条顶部分隔线
@@ -318,14 +324,14 @@ def _render_court_error(message: str) -> RenderedImage:
     f_body = load_font(20, prefer_cjk=True)
     meas = ImageDraw.Draw(Image.new("RGB", (10, 10)))
     lines = _wrap_segments([(message, BODY_COLOR)], meas, f_body, max_w,
-                           emoji_font=_emoji_font(f_body.size))
+                           emoji_on=_emoji_enabled())
     title_h = int(f_title.size * 1.6)
     h = 24 + title_h + 16 + len(lines) * int(f_body.size * 1.55) + 24
     img = Image.new("RGB", (width, h), BG)
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, width, 6], fill=ERROR_COLOR)
     d.text((pad_x, 24), "⚠ 电竞法庭判决书生成失败", font=f_title, fill=ERROR_COLOR)
-    _draw_segments(d, lines, pad_x, 24 + title_h + 16, f_body, int(f_body.size * 1.55), max_w)
+    _draw_segments(d, img, lines, pad_x, 24 + title_h + 16, f_body, int(f_body.size * 1.55), max_w, _emoji_enabled())
     return RenderedImage(content=finalize_rendered_image(img), media_type="image/png")
 
 

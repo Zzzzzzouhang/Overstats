@@ -25,6 +25,8 @@ except ModuleNotFoundError:  # pragma: no cover
     from src.modules.render_base import finalize_rendered_image
 
 
+
+
 # ── 视觉常量（与原始 HTML 模板一致）──
 BG = (18, 22, 30)
 TITLE_COLOR = (240, 180, 124)        # #f0b47c
@@ -187,171 +189,112 @@ def _truncate_teammate_id(name: str) -> str:
 
 
 def _normalize_llm_text(text: str) -> str:
-    """LLM 文本归一化：半角标点 + 中文数字间隔（逐字对齐原 _format_text）。"""
+    """LLM 文本归一化：半角标点 + 中文数字间隔（逐字对齐原 _format_text）。
+
+    emoji 保留原字符，交由 _composite_emoji 离线合成图像，不再转写为 :shortcode: 文本。
+    """
     return _add_num_spacing(_to_half_width_punct(text))
 
 
-def _glyph_width(draw, ch: str, font, emoji_font=None, half_font=None) -> float:
-    """单字符绘制宽度。空格收敛为半宽（_HALF_SPACE_RATIO），其余按字体实际度量。"""
+def _glyph_width(draw, ch: str, font, emoji_on: bool = False, half_font=None) -> float:
+    """单字符绘制宽度。
+
+    - 空格收敛为半宽（_HALF_SPACE_RATIO）；
+    - emoji 预留正方形宽度（由 _composite_emoji 合成），无 emoji 字体时占 0（跳过）；
+    - 其余按字体实际度量。
+    """
     if ch == " ":
         return max(2, int(font.size * _HALF_SPACE_RATIO))
-    f = _char_font(ch, font, emoji_font, half_font)
+    if _is_emoji(ch):
+        return font.size if emoji_on else 0
+    f = _char_font(ch, font, half_font)
     return draw.textlength(ch, font=f)
 
 
-_EMOJI_COMMON_SIZES = (16, 32, 64, 128)
-
-
-def _is_emoji_font_usable(path: Path) -> bool:
-    """验证该文件能否被 Pillow 加载为 TrueType 字体（支持任意常用尺寸即为可用）。
-
-    - COLRv1 矢量版：任意尺寸都成功 → 返回 True。
-    - CBDT 位图旧版：只在特定嵌入尺寸下成功 → 遍历 _EMOJI_COMMON_SIZES，
-      任何一个通过就视为可用（至少有某个尺寸能用，淘汰比没有好）。
-    """
-    try:
-        from PIL import ImageFont
-
-        for s in _EMOJI_COMMON_SIZES:
-            try:
-                ImageFont.truetype(str(path), s)
-                return True
-            except Exception:
-                continue
-        return False
-    except Exception:
-        return False
-
-
-_CHINESE_GITHUB_MIRRORS = (
-    "https://mirror.ghproxy.com/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf",
-    "https://ghproxy.net/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf",
-)
-
-_EMOJI_DOWNLOAD_URLS = (
-    "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoColorEmoji.ttf",
-    "https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf",
-) + _CHINESE_GITHUB_MIRRORS
+# ── emoji 渲染（离线，无联网）──
+# 策略：用打包/系统 emoji 字体把单个 emoji 渲染成 RGBA 图像，再缩放到目标字号
+# 合成到主图。这样 emoji 是「真实字形」而非豆腐块或 :shortcode: 文本；即便本机
+# Pillow/freetype 不合成 COLR/CBDT 颜色层（退化为单色轮廓），也始终可辨识，且渲染
+# 时绝不访问网络。要升级为真彩色，只需把 _emoji_image 的源换成彩色 PNG（如 twemoji）。
+#
+# 注：多数 emoji 字体（NotoColorEmoji.ttf）是位图字体，仅在特定嵌入尺寸可加载，
+# 故统一在 _EMOJI_SRC_SIZE 渲染后缩放合成。
+_EMOJI_SRC_SIZE = 109  # NotoColorEmoji.ttf 唯一可加载的嵌入尺寸
 
 
 @lru_cache(maxsize=1)
-def _ensure_noto_color_emoji() -> Optional[Path]:
-    """确保本机有可缩放（COLRv1 矢量）的 Noto Color Emoji 字体，用于真彩色渲染。
-
-    - Windows 直接返回 None（使用系统 Segoe UI Emoji，本身可缩放）。
-    - 本地缓存 / 系统字体若已存在：先检测是否为可缩放的 COLRv1；**不是也不删**，
-      保留旧字体作为降级方案，同时尝试下载 COLRv1 版替换。
-    - 下载源：jsDelivr → GitHub raw → 国内 GitHub 镜像（mirror.ghproxy.com / ghproxy.net）。
-    全部失败则返回旧字体路径（如果有）或 None。
+def _emoji_font_path() -> Optional[Path]:
+    """离线解析 emoji 字体路径（绝不下载）。优先级：
+    1. res/NotoColorEmoji.ttf（打包资源）
+    2. Windows：系统 Segoe UI Emoji
+    3. Linux：系统 NotoColorEmoji.ttf 常见路径
+    4. res/NotoEmoji-Regular.ttf（单色矢量兜底）
+    全部缺失返回 None（调用方跳过 emoji，避免豆腐块）。
     """
-    if sys.platform.startswith("win"):
-        return None
-
     local = resolve_resource_dir() / "NotoColorEmoji.ttf"
-    local_usable = local.exists() and _is_emoji_font_usable(local)
-
-    # 已经是可缩放的 COLRv1 → 直接返回
-    if local_usable:
-        try:
-            ImageFont.truetype(str(local), 64)
-            return local
-        except Exception:
-            pass  # 不是矢量版，尝试下载替换
-
-    # 常见系统已安装路径
-    system_paths = (
+    if local.exists() and local.stat().st_size > 100_000:
+        return local
+    if sys.platform.startswith("win"):
+        p = Path(r"C:\Windows\Fonts\seguiemj.ttf")
+        if p.exists():
+            return p
+    for p in (
         Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
         Path("/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf"),
         Path("/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf"),
-    )
-    for p in system_paths:
-        if p.exists() and _is_emoji_font_usable(p):
-            return p
-
-    # 尝试下载 COLRv1 版（成功则替换旧文件）
-    downloaded = None
-    try:
-        import httpx
-
-        with httpx.Client(timeout=120.0, follow_redirects=True) as client:
-            for url in _EMOJI_DOWNLOAD_URLS:
-                try:
-                    resp = client.get(url)
-                    resp.raise_for_status()
-                    tmp = local.with_name(local.name + ".tmp")
-                    tmp.write_bytes(resp.content)
-                    if tmp.stat().st_size > 100_000 and _is_emoji_font_usable(tmp):
-                        # 确认可缩放（COLRv1）
-                        try:
-                            ImageFont.truetype(str(tmp), 64)
-                        except Exception:
-                            tmp.unlink()
-                            continue
-                        tmp.rename(local)
-                        downloaded = local
-                        break
-                    tmp.unlink()
-                except Exception:
-                    continue
-    except Exception:
-        pass
-
-    if downloaded:
-        return downloaded
-    # 全部下载失败 → 降级：返回旧的位图版本（至少有点东西）
-    if local_usable:
-        return local
-    return None
-
-
-@lru_cache(maxsize=16)
-def _emoji_font(size: int) -> Optional[ImageFont.ImageFont]:
-    """始终返回 None — emoji 渲染已完全禁用（Linux 服务器上字体下载/检测会导致卡死）。"""
-    return None
-
-
-@lru_cache(maxsize=1)
-def _ensure_noto_emoji_mono() -> Optional[Path]:
-    """确保本机有单色矢量 emoji 字体（Noto Emoji），作为彩色 emoji 不可用时的兜底。
-
-    NotoColorEmoji.ttf 是位图彩色字体，仅支持固定像素尺寸；render 传入 38/64/34 等
-    任意尺寸时 freetype 抛 ``invalid pixel size``，导致 emoji 退化成豆腐块。Noto Emoji
-    是 outline 矢量字体，任意尺寸可缩放，Pillow 稳定渲染。优先复用已缓存/系统字体，
-    否则从 CDN 下载到 res/NotoEmoji-Regular.ttf（仅首次，best-effort）。
-    """
-    local = resolve_resource_dir() / "NotoEmoji-Regular.ttf"
-    if local.exists() and local.stat().st_size > 50_000:
-        return local
-    system_paths = (
-        Path("/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf"),
-        Path("/usr/share/fonts/opentype/noto/NotoEmoji-Regular.ttf"),
-        Path("/usr/share/fonts/noto-emoji/NotoEmoji-Regular.ttf"),
-    )
-    for p in system_paths:
+    ):
         if p.exists():
             return p
-    urls = (
-        "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoEmoji-Regular.ttf",
-        "https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoEmoji-Regular.ttf",
-        "https://mirror.ghproxy.com/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoEmoji-Regular.ttf",
-        "https://ghproxy.net/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoEmoji-Regular.ttf",
-    )
-    try:
-        import httpx
+    mono = resolve_resource_dir() / "NotoEmoji-Regular.ttf"
+    if mono.exists() and mono.stat().st_size > 50_000:
+        return mono
+    return None
 
-        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-            for url in urls:
-                try:
-                    resp = client.get(url)
-                    resp.raise_for_status()
-                    local.write_bytes(resp.content)
-                    if local.stat().st_size > 50_000:
-                        return local
-                except Exception:
-                    continue
+
+@lru_cache(maxsize=8)
+def _emoji_src_font() -> Optional[ImageFont.ImageFont]:
+    """加载 emoji 源字体（固定 _EMOJI_SRC_SIZE）。无可用字体返回 None。"""
+    path = _emoji_font_path()
+    if path is None:
+        return None
+    try:
+        return ImageFont.truetype(str(path), _EMOJI_SRC_SIZE)
     except Exception:
         return None
-    return None
+
+
+def _emoji_enabled() -> bool:
+    """是否有可用的离线 emoji 字体（决定 emoji 是合成图像还是跳过）。"""
+    return _emoji_src_font() is not None
+
+
+@lru_cache(maxsize=512)
+def _emoji_image(ch: str) -> Optional["Image.Image"]:
+    """把单个 emoji 渲染为 RGBA 图像（_EMOJI_SRC_SIZE），供按需缩放合成。
+
+    返回 None 表示无字体或该字符无法渲染（调用方跳过，避免豆腐块）。
+    """
+    f = _emoji_src_font()
+    if f is None or not _is_emoji(ch):
+        return None
+    canvas = _EMOJI_SRC_SIZE * 2
+    img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+    ImageDraw.Draw(img).text((_EMOJI_SRC_SIZE // 2, _EMOJI_SRC_SIZE // 2), ch, font=f)
+    bbox = img.getbbox()
+    if bbox is None:
+        return None
+    return img.crop(bbox)
+
+
+def _composite_emoji(img: "Image.Image", ch: str, x: int, y: int, size: int) -> None:
+    """把 emoji 合成到 img 的 (x, y) 左上角，目标尺寸 size×size。无字体则跳过。"""
+    em = _emoji_image(ch)
+    if em is None:
+        return
+    em = em.resize((size, size), Image.LANCZOS)
+    img.paste(em, (int(x), int(y)), em)
+
+
 
 
 @lru_cache(maxsize=16)
@@ -379,11 +322,8 @@ def _half_width_font(size: int) -> Optional[ImageFont.ImageFont]:
 def _char_font(
     ch: str,
     base_font: ImageFont.ImageFont,
-    emoji_font,
     half_font=None,
 ) -> ImageFont.ImageFont:
-    if emoji_font and _is_emoji(ch):
-        return emoji_font
     if half_font and _NUMERIC_RE.match(ch):
         return half_font
     return base_font
@@ -391,21 +331,26 @@ def _char_font(
 
 def _draw_text_emoji(
     draw: ImageDraw.ImageDraw,
+    img: "Image.Image",
     cx: int,
     y: int,
     text: str,
     base_font: ImageFont.ImageFont,
     fill: Tuple[int, int, int],
-    emoji_font,
+    emoji_on: bool,
     half_font=None,
 ) -> int:
-    """按字符绘制单行文本（水平居中），emoji 用 emoji 字体，数字/小数点用半宽字体；返回结束 x。"""
-    widths = [_glyph_width(draw, ch, base_font, emoji_font, half_font) for ch in text]
+    """按字符绘制单行文本（水平居中）：emoji 合成图像，数字/小数点用半宽字体；返回结束 x。"""
+    widths = [_glyph_width(draw, ch, base_font, emoji_on, half_font) for ch in text]
     x = cx - sum(widths) / 2
     for ch, w in zip(text, widths):
-        f = _char_font(ch, base_font, emoji_font, half_font)
-        dy = int(base_font.size * 0.06) if (emoji_font and _is_emoji(ch)) else 0
-        draw.text((x, y - dy), ch, font=f, fill=fill)
+        if _is_emoji(ch):
+            if emoji_on:
+                _composite_emoji(img, ch, x, y - int(base_font.size * 0.06), base_font.size)
+            x += w
+            continue
+        f = _char_font(ch, base_font, half_font)
+        draw.text((x, y), ch, font=f, fill=fill)
         x += w
     return x
 
@@ -427,13 +372,13 @@ def _wrap_segments(
     draw: ImageDraw.ImageDraw,
     font: ImageFont.ImageFont,
     max_width: int,
-    emoji_font=None,
+    emoji_on: bool = False,
     half_font=None,
-) -> List[List[Tuple[str, Tuple[int, int, int], ImageFont.ImageFont]]]:
+) -> List[List[Tuple[str, Tuple[int, int, int], Optional[ImageFont.ImageFont]]]]:
     """把一个由 (文本, 颜色) 组成的序列按字符贪婪换行。
 
-    emoji 字符使用 emoji_font 测量宽度；数字/小数点用 half_font；每个字符携带自身字体，
-    供 _draw_segments 使用。
+    emoji 字符预留正方形宽度、并标记为「图像合成」（font=None）；数字/小数点用 half_font；
+    每个字符携带自身字体（emoji 为 None），供 _draw_segments 合成/绘制使用。
 
     行首禁则：溢出时若即将换行的字符是标点/符号，不把它「提到上一行结尾」（避免从下行
     提字上来的观感），而是把它的**前一个字连同该符号一起推到下一行开头**，符号既不在行首，
@@ -444,8 +389,11 @@ def _wrap_segments(
     cur_w = 0
     for text, color in segments:
         for ch in text:
-            f = _char_font(ch, font, emoji_font, half_font)
-            cw = _glyph_width(draw, ch, font, emoji_font, half_font)
+            if _is_emoji(ch):
+                f = None if emoji_on else font
+            else:
+                f = _char_font(ch, font, half_font)
+            cw = _glyph_width(draw, ch, font, emoji_on, half_font)
             if cur_w + cw > max_width and cur:
                 last_ch = cur[-1][0]
                 # 不拆英文/数字单词：若溢出点处于拉丁串内部（前字与当前字都是拉丁/数字），
@@ -455,14 +403,14 @@ def _wrap_segments(
                     while cur and _is_latindigit(cur[-1][0]):
                         run.insert(0, cur.pop())
                     if cur:
-                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_font, half_font) for c, _, _ in cur)
+                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_on, half_font) for c, _, _ in cur)
                         lines.append((cur, True))
                         cur = run + [(ch, color, f)]
-                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_font, half_font) for c, _, _ in cur)
+                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_on, half_font) for c, _, _ in cur)
                         continue
                     # 整行就是一个超长拉丁串，无法整体下移：放回并退回普通断行（必要时才拆词）
                     cur = run
-                    cur_w = sum(_glyph_width(draw, c[0], font, emoji_font, half_font) for c, _, _ in cur)
+                    cur_w = sum(_glyph_width(draw, c[0], font, emoji_on, half_font) for c, _, _ in cur)
                 # 行首禁则：把禁则符号 + 前驱一起推到下一行开头（不向上提字）。
                 # 若前驱是拉丁字符，把整个拉丁串一起推下，避免拆开英文单词（如 KD 被拆）。
                 if _is_line_start_forbidden(ch) and len(cur) > 1:
@@ -470,13 +418,13 @@ def _wrap_segments(
                         run = []
                         while cur and _is_latindigit(cur[-1][0]):
                             run.insert(0, cur.pop())
-                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_font, half_font) for c, _, _ in cur)
+                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_on, half_font) for c, _, _ in cur)
                         lines.append((cur, True))
                         cur = run + [(ch, color, f)]
-                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_font, half_font) for c, _, _ in cur)
+                        cur_w = sum(_glyph_width(draw, c[0], font, emoji_on, half_font) for c, _, _ in cur)
                         continue
                     last_ch2, last_color, last_f = cur.pop()
-                    last_w = _glyph_width(draw, last_ch2, font, emoji_font, half_font)
+                    last_w = _glyph_width(draw, last_ch2, font, emoji_on, half_font)
                     cur_w -= last_w
                     lines.append((cur, True))
                     cur = [(last_ch2, last_color, last_f), (ch, color, f)]
@@ -498,12 +446,12 @@ def _wrap_segments(
     # 上一行，消除行尾大空白。例如「…盲盒，西拉、源氏、死」+「神、斩仇…」→
     # 把「神、」回填成「…死神、」，避免「死」后留白、且「神、」上提符合观感。
     # 回填只在「并入后不超宽」时发生，且不跨段。
-    lines = _backfill_lines(lines, draw, font, max_width, emoji_font, half_font)
+    lines = _backfill_lines(lines, draw, font, max_width, emoji_on, half_font)
     return lines
 
 
-def _line_width(chars, draw, font, emoji_font, half_font) -> int:
-    return sum(_glyph_width(draw, c[0], font, emoji_font, half_font) for c in chars)
+def _line_width(chars, draw, font, emoji_on, half_font) -> int:
+    return sum(_glyph_width(draw, c[0], font, emoji_on, half_font) for c in chars)
 
 
 def _backfill_lines(
@@ -511,7 +459,7 @@ def _backfill_lines(
     draw: ImageDraw.ImageDraw,
     font: ImageFont.ImageFont,
     max_width: int,
-    emoji_font=None,
+    emoji_on: bool = False,
     half_font=None,
 ):
     """从后向前逐行回填：把下一行开头的字符尽量搬到上一行结尾，消除上一行因
@@ -541,16 +489,16 @@ def _backfill_lines(
         # 贪心逐字上提。允许略微超出一个字宽容差：绘制端会对「完整行」做两端对齐
         # （slack<0 时负向收紧），所以上一行多提一个字不会超出图片，反而能消除行尾大留白。
         while nxt_chars:
-            w = _glyph_width(draw, nxt_chars[0][0], font, emoji_font, half_font)
-            if _line_width(cur_chars, draw, font, emoji_font, half_font) + w > max_width + font.size:
+            w = _glyph_width(draw, nxt_chars[0][0], font, emoji_on, half_font)
+            if _line_width(cur_chars, draw, font, emoji_on, half_font) + w > max_width + font.size:
                 break
             cur_chars.append(nxt_chars.pop(0))
             # 若提完后下一行新首字符是「行首禁则符号」，必须把它也一并带走
             # （禁则符号单独悬在下一行行首比当前行略微超出更糟）。放宽两个字宽容差，
             # 允许上一行末尾多带禁则符号（如「神、」整体连回上一行）。
             if nxt_chars and _is_line_start_forbidden(nxt_chars[0][0]):
-                w2 = _glyph_width(draw, nxt_chars[0][0], font, emoji_font, half_font)
-                if _line_width(cur_chars, draw, font, emoji_font, half_font) + w2 <= max_width + 2 * font.size:
+                w2 = _glyph_width(draw, nxt_chars[0][0], font, emoji_on, half_font)
+                if _line_width(cur_chars, draw, font, emoji_on, half_font) + w2 <= max_width + 2 * font.size:
                     cur_chars.append(nxt_chars.pop(0))
         out[i][0] = cur_chars
         out[i][1] = True
@@ -570,21 +518,27 @@ def _backfill_lines(
 
 def _draw_segments(
     draw: ImageDraw.ImageDraw,
-    lines: List[Tuple[List[Tuple[str, Tuple[int, int, int], ImageFont.ImageFont]], bool]],
+    img: "Image.Image",
+    lines: List[Tuple[List[Tuple[str, Tuple[int, int, int], Optional[ImageFont.ImageFont]]], bool]],
     x: int,
     y: int,
     font: ImageFont.ImageFont,
     line_h: int,
     max_width: int,
+    emoji_on: bool = False,
 ) -> int:
     cy = y
     for chars, is_full in lines:
         n = len(chars)
-        # 各字符基础宽度（用每字符各自的字体度量，与绘制一致）
-        base_w = [
-            (int(font.size * _HALF_SPACE_RATIO) if ch == " " else draw.textlength(ch, font=fnt))
-            for ch, _, fnt in chars
-        ]
+        # 各字符基础宽度（与 _glyph_width 一致：emoji 预留正方形 / 无字体时占 0）
+        base_w = []
+        for ch, _, fnt in chars:
+            if ch == " ":
+                base_w.append(int(font.size * _HALF_SPACE_RATIO))
+            elif _is_emoji(ch):
+                base_w.append(font.size if emoji_on else 0)
+            else:
+                base_w.append(draw.textlength(ch, font=fnt))
         # 全宽标点负字距（向左收紧），需计入行宽，否则行尾到不了右边缘
         kerns = [0] * n
         for i in range(1, n):
@@ -616,6 +570,12 @@ def _draw_segments(
             dy = int(font.size * 0.06) if _is_emoji(ch) else 0
             if kerns[i]:
                 cx -= kerns[i]
+            if _is_emoji(ch):
+                # emoji：有字体则合成图像；无字体（离线缺失）则跳过，避免豆腐块
+                if emoji_on and f is None:
+                    _composite_emoji(img, ch, cx, cy - dy, font.size)
+                cx += base_w[i] + (gap_extra if i in expand_pos else 0.0)
+                continue
             draw.text((cx, cy - dy), ch, font=f, fill=color)
             adv = base_w[i] + (gap_extra if i in expand_pos else 0.0)
             cx += adv
@@ -627,14 +587,14 @@ def _measure_segments_width(
     draw: ImageDraw.ImageDraw,
     segments: Sequence[Tuple[str, Tuple[int, int, int]]],
     font: ImageFont.ImageFont,
-    emoji_font=None,
+    emoji_on: bool = False,
     half_font=None,
 ) -> float:
     """按逐字符字体度量一串 segments 的总宽度（与实际绘制一致）。"""
     total = 0.0
     for text, _ in segments:
         for ch in text:
-            total += _glyph_width(draw, ch, font, emoji_font, half_font)
+            total += _glyph_width(draw, ch, font, emoji_on, half_font)
     return total
 
 
@@ -650,7 +610,7 @@ def _fit_font_for_segments(
     while size > min_size:
         f = load_font(size, prefer_cjk=True)
         w = _measure_segments_width(
-            draw, segments, f, _emoji_font(size), _half_width_font(size)
+            draw, segments, f, _emoji_enabled(), _half_width_font(size)
         )
         if w <= max_width:
             return f
@@ -801,7 +761,7 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
             y += gap
             lines = _wrap_segments(
                 segs, draw, font, max_w,
-                emoji_font=_emoji_font(font.size),
+                emoji_on=_emoji_enabled(),
                 half_font=_half_width_font(font.size),
             )
             layout.append((kind, (segs, font, lines), y))
@@ -814,8 +774,8 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
     for kind, payload, top_y in layout:
         if kind == "title":
             _draw_text_emoji(
-                draw, width // 2, top_y, payload, f_title, TITLE_COLOR,
-                _emoji_font(f_title.size), _half_width_font(f_title.size),
+                draw, img, width // 2, top_y, payload, f_title, TITLE_COLOR,
+                _emoji_enabled(), _half_width_font(f_title.size),
             )
             # 标题下方加一条 markdown「---」风格水平分隔线：满宽（0~width）、1px、上下留白
             line_y = top_y + int(f_title.size * 1.6)
@@ -827,8 +787,8 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
             label, color = payload
             vlabel = f"{_verdict_emoji(label)} {_to_half_width_punct(label)}".strip()
             _draw_text_emoji(
-                draw, width // 2, top_y, vlabel, f_verdict, color,
-                _emoji_font(f_verdict.size), _half_width_font(f_verdict.size),
+                draw, img, width // 2, top_y, vlabel, f_verdict, color,
+                _emoji_enabled(), _half_width_font(f_verdict.size),
             )
         elif kind == "small":
             draw.text((width // 2, top_y), payload, font=f_small, fill=MUTED_COLOR, anchor="ma")
@@ -838,6 +798,6 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
             draw.text((pad_x, top_y), payload, font=f_h3, fill=H3_COLOR)
         elif kind == "seg":
             segs, font, lines = payload
-            _draw_segments(draw, lines, pad_x, top_y, font, int(font.size * 1.5), max_w)
+            _draw_segments(draw, img, lines, pad_x, top_y, font, int(font.size * 1.5), max_w, _emoji_enabled())
 
     return RenderedImage(content=finalize_rendered_image(img), media_type="image/png")

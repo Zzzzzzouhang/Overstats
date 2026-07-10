@@ -23,7 +23,6 @@ Thumbs.db
 
 # Runtime caches
 res/cache_img/
-res/NotoColorEmoji.ttf
 res/query_tool_assets/
 res/disabled_accounts.json
 src/modules/dashen_summary/runtime/cache/

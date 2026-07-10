@@ -4885,8 +4885,11 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
-            self.wfile.flush()
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             self._record_json_metric(status, payload)
 
         def _send_binary(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
@@ -4894,8 +4897,12 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
-            self.wfile.flush()
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                # 客户端提前断开连接（超时/取消），非服务端错误，静默忽略
+                pass
             self._record_binary_metric(status)
 
         def _send_stream(
@@ -4909,11 +4916,14 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
 
-            for item in events:
-                self._write_chunk((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+            try:
+                for item in events:
+                    self._write_chunk((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
 
-            self.wfile.write(b"0\r\n\r\n")
-            self.wfile.flush()
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             self._record_stream_metric(status)
 
         def _write_chunk(self, data: bytes) -> None:

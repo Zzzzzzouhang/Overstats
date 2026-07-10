@@ -199,20 +199,39 @@ def _glyph_width(draw, ch: str, font, emoji_font=None, half_font=None) -> float:
     return draw.textlength(ch, font=f)
 
 
-def _is_scalable_emoji_font(path: Path) -> bool:
-    """验证该彩色 emoji 字体是否「可缩放」（COLRv1 矢量）。
+_EMOJI_COMMON_SIZES = (16, 32, 64, 128)
 
-    旧版 NotoColorEmoji.ttf 是位图字体（CBDT），仅支持固定像素尺寸，
-    任意尺寸加载会抛 ``invalid pixel size``，导致 emoji 退化成豆腐块。
-    COLRv1 矢量版可任意尺寸加载，故用它作为「可用」判据。
+
+def _is_emoji_font_usable(path: Path) -> bool:
+    """验证该文件能否被 Pillow 加载为 TrueType 字体（支持任意常用尺寸即为可用）。
+
+    - COLRv1 矢量版：任意尺寸都成功 → 返回 True。
+    - CBDT 位图旧版：只在特定嵌入尺寸下成功 → 遍历 _EMOJI_COMMON_SIZES，
+      任何一个通过就视为可用（至少有某个尺寸能用，淘汰比没有好）。
     """
     try:
         from PIL import ImageFont
 
-        ImageFont.truetype(str(path), 64)
-        return True
+        for s in _EMOJI_COMMON_SIZES:
+            try:
+                ImageFont.truetype(str(path), s)
+                return True
+            except Exception:
+                continue
+        return False
     except Exception:
         return False
+
+
+_CHINESE_GITHUB_MIRRORS = (
+    "https://mirror.ghproxy.com/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf",
+    "https://ghproxy.net/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf",
+)
+
+_EMOJI_DOWNLOAD_URLS = (
+    "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoColorEmoji.ttf",
+    "https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf",
+) + _CHINESE_GITHUB_MIRRORS
 
 
 @lru_cache(maxsize=1)
@@ -220,59 +239,68 @@ def _ensure_noto_color_emoji() -> Optional[Path]:
     """确保本机有可缩放（COLRv1 矢量）的 Noto Color Emoji 字体，用于真彩色渲染。
 
     - Windows 直接返回 None（使用系统 Segoe UI Emoji，本身可缩放）。
-    - 本地缓存 / 系统字体若已存在但为「位图旧版」（任意尺寸加载抛 invalid pixel size），
-      则删除并重新下载 @main 的 COLRv1 可缩放版本，避免 emoji 退化成豆腐块。
-    - 否则从 CDN（jsDelivr 优先，GitHub 兜底）下载到 res/NotoColorEmoji.ttf。
-    失败返回 None，调用方退化为单色/豆腐块。
+    - 本地缓存 / 系统字体若已存在：先检测是否为可缩放的 COLRv1；**不是也不删**，
+      保留旧字体作为降级方案，同时尝试下载 COLRv1 版替换。
+    - 下载源：jsDelivr → GitHub raw → 国内 GitHub 镜像（mirror.ghproxy.com / ghproxy.net）。
+    全部失败则返回旧字体路径（如果有）或 None。
     """
     if sys.platform.startswith("win"):
         return None
 
     local = resolve_resource_dir() / "NotoColorEmoji.ttf"
-    if local.exists():
-        # 已是可缩放版本则直接复用；否则是位图旧版，删掉重下 COLRv1。
-        if _is_scalable_emoji_font(local):
-            return local
-        try:
-            local.unlink()
-        except Exception:
-            pass
+    local_usable = local.exists() and _is_emoji_font_usable(local)
 
-    # 常见系统已安装路径（同样验证可缩放）
+    # 已经是可缩放的 COLRv1 → 直接返回
+    if local_usable:
+        try:
+            ImageFont.truetype(str(local), 64)
+            return local
+        except Exception:
+            pass  # 不是矢量版，尝试下载替换
+
+    # 常见系统已安装路径
     system_paths = (
         Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"),
         Path("/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf"),
         Path("/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf"),
     )
     for p in system_paths:
-        if p.exists() and _is_scalable_emoji_font(p):
+        if p.exists() and _is_emoji_font_usable(p):
             return p
 
-    # 下载 @main 的 COLRv1 可缩放版本到 res/ 缓存（仅首次）
-    urls = (
-        "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoColorEmoji.ttf",
-        "https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf",
-    )
+    # 尝试下载 COLRv1 版（成功则替换旧文件）
+    downloaded = None
     try:
         import httpx
 
         with httpx.Client(timeout=120.0, follow_redirects=True) as client:
-            for url in urls:
+            for url in _EMOJI_DOWNLOAD_URLS:
                 try:
                     resp = client.get(url)
                     resp.raise_for_status()
-                    local.write_bytes(resp.content)
-                    # 校验：下载后必须可缩放（COLRv1），否则丢弃回退
-                    if local.stat().st_size > 100_000 and _is_scalable_emoji_font(local):
-                        return local
-                    try:
-                        local.unlink()
-                    except Exception:
-                        pass
+                    tmp = local.with_name(local.name + ".tmp")
+                    tmp.write_bytes(resp.content)
+                    if tmp.stat().st_size > 100_000 and _is_emoji_font_usable(tmp):
+                        # 确认可缩放（COLRv1）
+                        try:
+                            ImageFont.truetype(str(tmp), 64)
+                        except Exception:
+                            tmp.unlink()
+                            continue
+                        tmp.rename(local)
+                        downloaded = local
+                        break
+                    tmp.unlink()
                 except Exception:
                     continue
     except Exception:
-        return None
+        pass
+
+    if downloaded:
+        return downloaded
+    # 全部下载失败 → 降级：返回旧的位图版本（至少有点东西）
+    if local_usable:
+        return local
     return None
 
 
@@ -333,6 +361,8 @@ def _ensure_noto_emoji_mono() -> Optional[Path]:
     urls = (
         "https://cdn.jsdelivr.net/gh/googlefonts/noto-emoji@main/fonts/NotoEmoji-Regular.ttf",
         "https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoEmoji-Regular.ttf",
+        "https://mirror.ghproxy.com/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoEmoji-Regular.ttf",
+        "https://ghproxy.net/https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoEmoji-Regular.ttf",
     )
     try:
         import httpx

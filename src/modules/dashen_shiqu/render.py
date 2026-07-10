@@ -212,14 +212,15 @@ def _glyph_width(draw, ch: str, font, emoji_on: bool = False, half_font=None) ->
 
 
 # ── emoji 渲染（离线，无联网）──
-# 策略：用打包/系统 emoji 字体把单个 emoji 渲染成 RGBA 图像，再缩放到目标字号
-# 合成到主图。这样 emoji 是「真实字形」而非豆腐块或 :shortcode: 文本；即便本机
-# Pillow/freetype 不合成 COLR/CBDT 颜色层（退化为单色轮廓），也始终可辨识，且渲染
-# 时绝不访问网络。要升级为真彩色，只需把 _emoji_image 的源换成彩色 PNG（如 twemoji）。
+# 策略：用打包/系统 emoji 彩色字体（NotoColorEmoji.ttf，CBDT 位图 / COLRv1 矢量）
+# 通过 draw.text(..., embedded_color=True) 原生渲染真彩色 emoji 图像，再缩放合成到
+# 主图。Pillow ≥ 9 配合 FreeType 原生支持彩色字体，无需任何额外资源即可跨平台
+# 出真彩色。若环境极老、字体无颜色层，则回退到白色剪影兜底（避免豆腐块/不可见）。
 #
-# 注：多数 emoji 字体（NotoColorEmoji.ttf）是位图字体，仅在特定嵌入尺寸可加载，
-# 故统一在 _EMOJI_SRC_SIZE 渲染后缩放合成。
+# 注：NotoColorEmoji.ttf 这类 CBDT 位图字体仅在特定嵌入尺寸可加载，故统一在
+# _EMOJI_SRC_SIZE 渲染后缩放合成。embedded_color=True 是关键开关，否则只会画单色轮廓。
 _EMOJI_SRC_SIZE = 109  # NotoColorEmoji.ttf 唯一可加载的嵌入尺寸
+_EMOJI_FG = (255, 255, 255, 255)  # 回退前景色（白色剪影，仅老环境兜底用）
 
 
 @lru_cache(maxsize=1)
@@ -264,26 +265,46 @@ def _emoji_src_font() -> Optional[ImageFont.ImageFont]:
 
 
 def _emoji_enabled() -> bool:
-    """是否有可用的离线 emoji 字体（决定 emoji 是合成图像还是跳过）。"""
+    """是否有可用的离线 emoji 源（彩色字体）。决定 emoji 是否合成图像。"""
     return _emoji_src_font() is not None
 
 
 @lru_cache(maxsize=512)
 def _emoji_image(ch: str) -> Optional["Image.Image"]:
-    """把单个 emoji 渲染为 RGBA 图像（_EMOJI_SRC_SIZE），供按需缩放合成。
+    """把单个 emoji 渲染为 RGBA 图像，供按需缩放合成。
 
-    返回 None 表示无字体或该字符无法渲染（调用方跳过，避免豆腐块）。
+    用打包/系统彩色 emoji 字体 + embedded_color=True 渲染真彩色（离线、跨平台一致）。
+    仅当字体无颜色层（极老环境）时，回退白色剪影；都不可用返回 None（调用方跳过）。
     """
+    # 1) 字体真彩色渲染（主路径）
     f = _emoji_src_font()
-    if f is None or not _is_emoji(ch):
-        return None
-    canvas = _EMOJI_SRC_SIZE * 2
-    img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
-    ImageDraw.Draw(img).text((_EMOJI_SRC_SIZE // 2, _EMOJI_SRC_SIZE // 2), ch, font=f)
-    bbox = img.getbbox()
-    if bbox is None:
-        return None
-    return img.crop(bbox)
+    if f is not None and _is_emoji(ch):
+        canvas = _EMOJI_SRC_SIZE * 2
+        img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+        try:
+            ImageDraw.Draw(img).text(
+                (_EMOJI_SRC_SIZE // 2, _EMOJI_SRC_SIZE // 2), ch, font=f,
+                embedded_color=True,
+            )
+        except TypeError:
+            # 老版本 Pillow 不支持 embedded_color 参数：走下方白剪影回退
+            pass
+        else:
+            bbox = img.getbbox()
+            if bbox is not None:
+                return img.crop(bbox)
+        # 2) 字体白色剪影兜底（仅极老环境、无颜色层时用）
+        img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
+        ImageDraw.Draw(img).text((_EMOJI_SRC_SIZE // 2, _EMOJI_SRC_SIZE // 2), ch, font=f)
+        bbox = img.getbbox()
+        if bbox is None:
+            return None
+        img = img.crop(bbox)
+        alpha = img.getchannel("A")
+        solid = Image.new("RGBA", img.size, _EMOJI_FG)
+        solid.putalpha(alpha)
+        return solid
+    return None
 
 
 def _composite_emoji(img: "Image.Image", ch: str, x: int, y: int, size: int) -> None:

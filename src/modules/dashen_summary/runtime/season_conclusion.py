@@ -490,6 +490,7 @@ def _estimate_summary_image_bytes(image):
 
 
 def _get_cached_summary_image_copy(url):
+    global _SUMMARY_PRELOAD_IMAGE_BYTES
     cached = _SUMMARY_IMAGE_CACHE.get(url)
     if cached is None:
         return None
@@ -509,6 +510,7 @@ def _get_cached_summary_image_copy(url):
 
 
 def _has_cached_summary_image(url):
+    global _SUMMARY_PRELOAD_IMAGE_BYTES
     cached = _SUMMARY_IMAGE_CACHE.get(url)
     if cached is None:
         return False

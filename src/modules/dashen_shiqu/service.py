@@ -390,7 +390,7 @@ def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) 
     STAT_KEYS = [("kill", "消灭"), ("assist", "助攻"), ("death", "阵亡"), ("finalHit", "最后一击"),
                  ("heroDamage", "伤害"), ("damageTaken", "承伤"), ("cure", "治疗"),
                  ("healingTaken", "受疗"), ("resistDamage", "格挡")]
-    # 消灭参与率 = (原始消灭 + 原始助攻) / 敌方原始总死亡数（均用本局原始数据，
+    # 消灭参与率 = (原始消灭 + 原始助攻/2) / 敌方原始总死亡数（均用本局原始数据，
     # 不做 10 分钟归一化）。
     KILL_GUID = "603482350067646495"
     ASSIST_GUID = "603482350067648392"
@@ -539,22 +539,30 @@ def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) 
     def _fmt_player_block(p, segments, pos, game_sec, include_detail, enemy_total_deaths=0):
         name = str(p.get("name", "?"))
         display = f"*{name}" if name == target_id else name
-        player_total_kills = 0.0
+        total_kill = 0.0
+        total_assist = 0.0
         for seg in segments:
             entry = seg.get("entry")
             if entry:
-                # 原始消灭 + 原始助攻：直接取 statMap 中的原始值，不做 10 分钟归一化
+                # 原始消灭 + 原始助攻/2：直接取 statMap 中的原始值，不做 10 分钟归一化
                 sm = entry.get("statMap", {}) or {}
-                for g in (KILL_GUID, ASSIST_GUID):
+                for g, bucket in ((KILL_GUID, "kill"), (ASSIST_GUID, "assist")):
                     raw = sm.get(g)
                     if raw is not None:
                         try:
-                            player_total_kills += float(raw)
+                            val = float(raw)
                         except (TypeError, ValueError):
-                            pass
+                            continue
+                        if bucket == "kill":
+                            total_kill += val
+                        else:
+                            total_assist += val
             else:
-                player_total_kills += int(p.get("kill", 0) or 0) + int(p.get("assist", 0) or 0)
-        kp_rate = player_total_kills / enemy_total_deaths if enemy_total_deaths > 0 else 0
+                total_kill += int(p.get("kill", 0) or 0)
+                total_assist += int(p.get("assist", 0) or 0)
+        # 消灭参与率 = (消灭 + 助攻/2) / 敌方原始总死亡数
+        kp_num = total_kill + total_assist / 2.0
+        kp_rate = kp_num / enemy_total_deaths if enemy_total_deaths > 0 else 0
         hero_text = ", ".join(_fmt_hero_segment(seg, include_detail) for seg in segments)
         return f"{{ 位置: {pos}, 玩家: {display}, 消灭参与率: {kp_rate:.3f}, 英雄片段: [ {hero_text} ] }}"
 

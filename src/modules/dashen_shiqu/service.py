@@ -343,6 +343,30 @@ def _parse_llm_json_result(raw_text: str, target_id: str) -> Optional[dict]:
 
 # ── Prompt 构建（与原始 shiqu.py 一致）──
 
+def _segment_present_guids(entry: dict, hero_guid: str, name_map: dict) -> set:
+    """返回该分段真实数据中「存在 + 白名单允许 + 非跳过 + 可归一化」的统计 guid 集合。
+
+    与 _hero_detail_text / _fmt_hero_segment 使用的过滤口径完全一致，用于约束参考数据：
+    真实对局里没出现的数据，给参考没有意义。
+    """
+    sm = (entry or {}).get("statMap", {}) or {}
+    ut = float((entry or {}).get("userTimeSec", 600) or 600)
+    guids: set = set()
+    for guid, raw_val in sm.items():
+        g = str(guid)
+        if not _stat_allowed_for_hero(g, hero_guid):
+            continue
+        name = name_map.get(g)
+        if not name:
+            continue
+        if should_skip_prompt_stat(value_guid=g, value_text=name):
+            continue
+        if normalize_stat_value(raw_val, ut, value_text=name, value_guid=g) is None:
+            continue
+        guids.add(g)
+    return guids
+
+
 def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) -> str:
     ROLE_ORDER = {"tank": 0, "dps": 1, "healer": 2}
     ROLE_LABEL = {"tank": "坦克", "dps": "输出", "healer": "辅助"}
@@ -363,15 +387,15 @@ def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) 
             labeled.append((p, f"{lb}{role_ct[r]}" if ct > 1 else lb))
         return labeled
 
-    STAT_KEYS = [("kill", "击杀"), ("assist", "助攻"), ("death", "阵亡"), ("finalHit", "最后一击"),
+    STAT_KEYS = [("kill", "消灭"), ("assist", "助攻"), ("death", "阵亡"), ("finalHit", "最后一击"),
                  ("heroDamage", "伤害"), ("damageTaken", "承伤"), ("cure", "治疗"),
                  ("healingTaken", "受疗"), ("resistDamage", "格挡")]
-    # 击杀参与率 = (原始击杀 + 原始助攻) / 敌方原始总死亡数（均用本局原始数据，
+    # 消灭参与率 = (原始消灭 + 原始助攻) / 敌方原始总死亡数（均用本局原始数据，
     # 不做 10 分钟归一化）。
     KILL_GUID = "603482350067646495"
     ASSIST_GUID = "603482350067648392"
     ENTRY_STAT_GUIDS = [
-        ("击杀", ("603482350067646495",)),
+        ("消灭", ("603482350067646495",)),
         ("阵亡", ("603482350067646506",)),
         ("最后一击", ("603482350067646507",)),
         ("单独消灭", ("603482350067646509",)),
@@ -519,7 +543,7 @@ def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) 
         for seg in segments:
             entry = seg.get("entry")
             if entry:
-                # 原始击杀 + 原始助攻：直接取 statMap 中的原始值，不做 10 分钟归一化
+                # 原始消灭 + 原始助攻：直接取 statMap 中的原始值，不做 10 分钟归一化
                 sm = entry.get("statMap", {}) or {}
                 for g in (KILL_GUID, ASSIST_GUID):
                     raw = sm.get(g)
@@ -532,14 +556,21 @@ def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) 
                 player_total_kills += int(p.get("kill", 0) or 0) + int(p.get("assist", 0) or 0)
         kp_rate = player_total_kills / enemy_total_deaths if enemy_total_deaths > 0 else 0
         hero_text = ", ".join(_fmt_hero_segment(seg, include_detail) for seg in segments)
-        return f"{{ 位置: {pos}, 玩家: {display}, 击杀参与率: {kp_rate:.3f}, 英雄片段: [ {hero_text} ] }}"
+        return f"{{ 位置: {pos}, 玩家: {display}, 消灭参与率: {kp_rate:.3f}, 英雄片段: [ {hero_text} ] }}"
 
     def _player_ref_text(seg, player_name):
         if db is None:
             return ""
+        entry = seg.get("entry")
+        if not isinstance(entry, dict):
+            return ""
         hg = str(seg.get("hero_guid", ""))
         hn = HERO_DICT.get(hg, {}).get("name", "?")
-        return build_broad_reference_text(db, player_name, hg, hn)
+        name_map = seg.get("name_map") or load_stat_name_map()
+        present = _segment_present_guids(entry, hg, name_map)
+        if not present:
+            return ""
+        return build_broad_reference_text(db, player_name, hg, hn, present_guids=present)
 
     result_map = {1: "胜", 0: "平", -1: "负"}
     lines = []
@@ -632,16 +663,16 @@ def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) 
 
 [WORKFLOW] 评判规则与工作流
 步骤一：职责核心指标评估（综合评估，技能指标权重低）
-坦克位参考：单独消灭、最后一击、(伤害减受疗)、阵亡数、击杀参与率等其他技能指标。
-输出位参考：单独消灭、最后一击、伤害、阵亡数、击杀参与率等其他技能指标。
-辅助位参考：最后一击、阵亡数、拯救玩家、单独消灭、伤害、治疗量、击杀参与率等其他技能指标。
+坦克位参考：单独消灭、最后一击、(伤害减受疗)、阵亡数、消灭参与率等其他技能指标。
+输出位参考：单独消灭、最后一击、伤害、阵亡数、消灭参与率等其他技能指标。
+辅助位参考：最后一击、阵亡数、拯救玩家、单独消灭、伤害、治疗量、消灭参与率等其他技能指标。
 
 步骤二：数据对比与百分制评分（输出 score 整数 0到100）
 1. 将焦点玩家数据与同英雄「数据参考行」对比，低于参考值应扣分，禁止跨英雄比较。
 2. 同一玩家同一局可能在「英雄片段」内出现多个英雄，时长小于3分钟的片段为低权重。
 3. 最后一击和单独消灭应额外加分，频繁阵亡且团队贡献低应加重扣分。
 4. 综合看英雄数据。例如有的输出英雄伤害低但最后一击高，有的辅助英雄输出高但治疗少，需综合参考值考虑，不要跨英雄对比。
-5. 解构无效数据：不要被表面虚高数据欺骗。若空有治疗或伤害但击杀参与率极低，评价为「无效数据刷子」。
+5. 解构无效数据：不要被表面虚高数据欺骗。若空有治疗或伤害但消灭参与率极低，评价为「无效数据刷子」。
 6. 对于单独消灭高的玩家应赞赏，单独消灭低不批评不评价。
 7. 比赛胜负不影响评分，只论数据。
 8. 若某局数据异常，该局不参与评分或低权重，comment 写「数据缺失，无法评价」。

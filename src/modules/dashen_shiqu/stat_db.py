@@ -78,8 +78,14 @@ def build_broad_reference_text(
     player_name: str,
     hero_guid: str,
     hero_name: str,
+    present_guids: Optional[set] = None,
 ) -> str:
-    """为一局玩家构建聚合参考文本（竞技 + 快速各 50% 权重），复用 IDPoolDB.get_statmap_summary。"""
+    """为一局玩家构建聚合参考文本（竞技 + 快速各 50% 权重），复用 IDPoolDB.get_statmap_summary。
+
+    present_guids: 可选。该玩家真实对局数据里并未出现的统计项，给参考没有意义，
+    因此传此集合时仅输出「真实数据里存在 + 通过白名单 + 非跳过」的统计项；
+    为 None / 空集时退化为输出该英雄全部有中位数的统计项（旧行为）。
+    """
     if db is None:
         return ""
     name_map = load_stat_name_map()
@@ -89,8 +95,11 @@ def build_broad_reference_text(
 
     comp_med: Dict[str, list[float]] = {}
     for (statmap_name, _rs), info in comp.items():
-        name = name_map.get(str(statmap_name))
-        if not name or should_skip_prompt_stat(value_guid=str(statmap_name), value_text=name):
+        g = str(statmap_name)
+        if present_guids is not None and g not in present_guids:
+            continue
+        name = name_map.get(g)
+        if not name or should_skip_prompt_stat(value_guid=g, value_text=name):
             continue
         median = info.get("median")
         if median is None:
@@ -99,8 +108,11 @@ def build_broad_reference_text(
 
     qpt_med: Dict[str, float] = {}
     for (statmap_name, _rs), info in qpt.items():
-        name = name_map.get(str(statmap_name))
-        if not name or should_skip_prompt_stat(value_guid=str(statmap_name), value_text=name):
+        g = str(statmap_name)
+        if present_guids is not None and g not in present_guids:
+            continue
+        name = name_map.get(g)
+        if not name or should_skip_prompt_stat(value_guid=g, value_text=name):
             continue
         median = info.get("median")
         if median is None:

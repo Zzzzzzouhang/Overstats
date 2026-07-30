@@ -143,19 +143,19 @@ _COURT_SYSTEM_PROMPT = """[ROLE] 角色与语气设定
 
 [WORKFLOW] 评判规则与审判工作流
 步骤一：职责核心指标评估（综合评估，技能指标权重低）
-坦克位参考：单独消灭、最后一击、(伤害减受疗)、阵亡数、击杀参与率等其他技能指标。
-输出位参考：单独消灭、最后一击、伤害、阵亡数、击杀参与率等其他技能指标。
-辅助位参考：最后一击、阵亡数、拯救玩家、单独消灭、伤害、治疗量、击杀参与率等其他技能指标。
+坦克位参考：单独消灭、最后一击、(伤害减受疗)、阵亡数、消灭参与率等其他技能指标。
+输出位参考：单独消灭、最后一击、伤害、阵亡数、消灭参与率等其他技能指标。
+辅助位参考：最后一击、阵亡数、拯救玩家、单独消灭、伤害、治疗量、消灭参与率等其他技能指标。
 
 步骤二：数据对比与评分
 1. 将焦点玩家数据与同英雄「数据参考行」对比，低于参考值应扣分，禁止跨英雄比较。
 2. 同一玩家同一局可能在「英雄片段」内出现多个英雄，时长小于3分钟的片段为低权重。
 3. 最后一击和单独消灭应额外加分，频繁阵亡且团队贡献低应加重扣分。
 4. 综合看英雄数据。例如有的输出英雄伤害低但最后一击高，有的辅助英雄输出高但治疗少，需综合参考值考虑，不要跨英雄对比。
-5. 解构无效数据：不要被表面虚高数据欺骗（如坦克刷伤害无击杀且参与率低；辅助刷治疗无拯救且参与率低；输出伤害高但参与率低）。若空有治疗或伤害但击杀参与率极低，评价为「无效数据刷子」。注意部分输出英雄定位为收割或骚扰，可能伤害低但参与率高、最后一击多，值得赞赏。
+5. 解构无效数据：不要被表面虚高数据欺骗（如坦克刷伤害无消灭且参与率低；辅助刷治疗无拯救且参与率低；输出伤害高但参与率低）。若空有治疗或伤害但消灭参与率极低，评价为「无效数据刷子」。注意部分输出英雄定位为收割或骚扰，可能伤害低但参与率高、最后一击多，值得赞赏。
 6. 对于单独消灭高的玩家应赞赏，单独消灭低不批评不评价。
 7. 比赛胜负不影响评分，只论数据。
-8. 若某局数据异常（如焦点玩家和队友英雄全空、字段全空；击杀阵亡是参考值正负230%导致参考价值低），注释写「数据缺失，无法评价」。
+8. 若某局数据异常（如焦点玩家和队友英雄全空、字段全空；消灭阵亡是参考值正负230%导致参考价值低），注释写「数据缺失，无法评价」。
 
 步骤三：审判任务
 1. 从焦点玩家所在队伍的队友（不含对手）中找出本局 MVP（最佳表现者），给出判决理由。
@@ -277,6 +277,34 @@ def _is_valid_court_json(text: str) -> bool:
 
 
 # ── Prompt 构建 ──
+
+def _player_present_guids(p_dict: dict, name_map: dict) -> set:
+    """返回该玩家真实数据中「存在 + 白名单允许 + 非跳过 + 可归一化」的统计 guid 集合
+    （跨其 _heroList 各分段取并集）。用于约束参考数据：真实对局里没出现的数据，给参考没有意义。"""
+    guids: set = set()
+    hl = p_dict.get("_heroList")
+    if not hl or not isinstance(hl, list):
+        return guids
+    for entry in hl:
+        if not isinstance(entry, dict):
+            continue
+        sm = entry.get("statMap", {}) or {}
+        ut = float(entry.get("userTimeSec", 600) or 600)
+        hg = str(entry.get("heroId", ""))
+        for guid, raw_val in sm.items():
+            g = str(guid)
+            if not _stat_allowed_for_hero(g, hg):
+                continue
+            name = name_map.get(g)
+            if not name:
+                continue
+            if should_skip_prompt_stat(value_guid=g, value_text=name):
+                continue
+            if normalize_stat_value(raw_val, ut, value_text=name, value_guid=g) is None:
+                continue
+            guids.add(g)
+    return guids
+
 
 def _build_court_prompt(raw_data: Dict[str, Any], target_id: str, db: Optional[IDPoolDB] = None) -> str:
     """基于对局详情构建电竞法庭 LLM prompt（函数体移植自 court.py）。"""
@@ -408,7 +436,7 @@ def _build_court_prompt(raw_data: Dict[str, Any], target_id: str, db: Optional[I
         "targetCompetingTime",
     }
     _STAT_FIELD_ORDER = [
-        ("kill", "击杀"), ("assist", "助攻"), ("death", "阵亡"),
+        ("kill", "消灭"), ("assist", "助攻"), ("death", "阵亡"),
         ("finalHit", "最后一击"), ("heroDamage", "伤害"),
         ("damageTaken", "承伤"), ("cure", "治疗"),
         ("healingTaken", "受疗"), ("resistDamage", "格挡"),
@@ -493,7 +521,11 @@ def _build_court_prompt(raw_data: Dict[str, Any], target_id: str, db: Optional[I
             if db is not None:
                 hg = str(p.get("heroGuid", ""))
                 hn = HERO_DICT.get(hg, {}).get("name", "?")
-                ref = build_broad_reference_text(db, str(p.get("name", "?")), hg, hn)
+                name_map = load_stat_name_map()
+                present = _player_present_guids(p, name_map)
+                ref = build_broad_reference_text(
+                    db, str(p.get("name", "?")), hg, hn, present_guids=present
+                ) if present else ""
                 if ref:
                     lines.append(f"    # 数据参考: {ref}")
         lines.append("]")

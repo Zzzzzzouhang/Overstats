@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import logging
 from collections.abc import Awaitable, Callable
 import contextvars
 import locale
@@ -11,6 +12,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from typing import Any, Dict, Iterable, List, Optional, TypeVar
+
+logger = logging.getLogger("overstats.server")
 
 try:
     from overstats.config import APIConfig
@@ -27,6 +30,7 @@ try:
         normalize_request_metric_url,
     )
     from overstats.src.db.shiqu_llm import shiqu_llm_recorder
+    from overstats.src.db.match_stats import IDPoolDB
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
@@ -97,6 +101,7 @@ except ModuleNotFoundError:
         normalize_request_metric_url,
     )
     from src.db.shiqu_llm import shiqu_llm_recorder
+    from src.db.match_stats import IDPoolDB
     from src.modules.errors import ModuleError
     from src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
@@ -171,6 +176,22 @@ def _coerce_profile_render_mode(payload: Dict[str, object]) -> str:
     if raw_mode in {"competitive", "comp", "ranked"}:
         return "competitive"
     return "quick"
+
+
+# 是区吗 / 电竞法庭 的分段参考数据库（同英雄「数据参考行」来源）。
+# 延迟创建并复用单例，避免每次请求都新建 sqlite 连接。
+_SHIQU_REF_DB: "Optional[IDPoolDB]" = None
+
+
+def _get_shiqu_ref_db() -> "Optional[IDPoolDB]":
+    global _SHIQU_REF_DB
+    if _SHIQU_REF_DB is None:
+        try:
+            _SHIQU_REF_DB = IDPoolDB()
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"[shiqu] 参考数据库初始化失败，参考数据将跳过: {exc}")
+            _SHIQU_REF_DB = None
+    return _SHIQU_REF_DB
 
 
 def _coerce_optional_int(payload: Dict[str, object], *keys: str) -> Optional[int]:
@@ -1852,6 +1873,7 @@ class OverstatsCoreService:
                 match_count=match_count,
                 use_db=use_db,
             ),
+            db=_get_shiqu_ref_db(),
         )
         result["ok"] = True
         return result
@@ -1884,6 +1906,7 @@ class OverstatsCoreService:
                 match_count=match_count,
                 use_db=use_db,
             ),
+            db=_get_shiqu_ref_db(),
         )
         try:
             from overstats.src.modules.dashen_shiqu.render import render_shiqu_image
@@ -1926,6 +1949,7 @@ class OverstatsCoreService:
                 index=index,
                 use_db=use_db,
             ),
+            db=_get_shiqu_ref_db(),
         )
         result["ok"] = True
         return result
@@ -1958,6 +1982,7 @@ class OverstatsCoreService:
                 index=index,
                 use_db=use_db,
             ),
+            db=_get_shiqu_ref_db(),
         )
         try:
             from overstats.src.modules.dashen_court.render import render_court_image

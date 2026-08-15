@@ -41,10 +41,10 @@ api_test_data.json
 !/test/test_blizzard_profile.py
 !/test/test_ow_guess_catalog.py
 !/test/test_ow_hero_leaderboard_service.py
+!/test/test_risk_status.py
 src/db/match_stats.sqlite3.old
-.gitignore
 .vibe/review_diff.txt
-CUsersDocumorialAppDataLocalTempseason_diff.txt
+C:/Users/Documorial/AppData/Local/Temp/season_diff.txt
 /openspec
 src/db/request_metrics.sqlite3-journal
 /doceker_test

@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections import OrderedDict
 from typing import Any, Iterable, Optional, Sequence
 
+from ....constants.ranks import normalize_raw_rank_bucket
+
 
 def _report_memory_cache_hit() -> None:
     try:
@@ -43,15 +45,7 @@ def clamp_percent_value(value: Any) -> Optional[float]:
 
 
 def normalize_hero_rank_score(rank_score: Any) -> Optional[int]:
-    if rank_score is None:
-        return None
-    try:
-        rank_score = int(rank_score)
-    except (TypeError, ValueError):
-        return None
-    if rank_score >= 100:
-        return rank_score // 100
-    return rank_score
+    return normalize_raw_rank_bucket(rank_score)
 
 
 def get_hero_avg_percent_guids(config: dict[str, Any], stat_guids: Optional[Iterable[Any]] = None) -> list[str]:

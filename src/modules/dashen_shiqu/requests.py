@@ -23,3 +23,4 @@ class ShiquQuery:
     customer_token: str = ""
     match_count: int = 12
     use_db: bool = False
+    use_cache: bool = True

@@ -147,38 +147,39 @@ def _infer_hero_guid_from_stat_map(stat_map: dict, fallback_hero_guid: str = "",
     return fallback_hero_guid if allow_fallback else ""
 
 
+# 严格子集：只用 type / enum / required / properties / items，避免 strict 模式不支持的
+# minLength / minItems / minimum / maximum / additionalProperties 导致网关整段拒答（返回空）。
 _SHIQU_JSON_SCHEMA = {
     "type": "object",
-    "additionalProperties": False,
     "required": ["target_id", "score", "summary", "match_comments", "overall_comment", "teammate_comments"],
     "properties": {
         "target_id": {"type": "string"},
-        "score": {"type": "integer", "minimum": 0, "maximum": 100},
-        "summary": {"type": "string", "minLength": 1},
+        "score": {"type": "integer"},
+        "summary": {"type": "string"},
         "match_comments": {
-            "type": "array", "minItems": 1,
+            "type": "array",
             "items": {
-                "type": "object", "additionalProperties": False,
+                "type": "object",
                 "required": ["index", "result", "hero", "comment"],
                 "properties": {
-                    "index": {"type": "integer", "minimum": 1},
+                    "index": {"type": "integer"},
                     "result": {"type": "string", "enum": ["胜", "负", "平", "未知"]},
                     "hero": {"type": "string"},
-                    "comment": {"type": "string", "minLength": 1},
+                    "comment": {"type": "string"},
                 },
             },
         },
-        "overall_comment": {"type": "string", "minLength": 1},
+        "overall_comment": {"type": "string"},
         "teammate_comments": {
             "type": "array",
             "items": {
-                "type": "object", "additionalProperties": False,
+                "type": "object",
                 "required": ["name", "games", "score", "comment"],
                 "properties": {
                     "name": {"type": "string"},
-                    "games": {"type": "integer", "minimum": 1},
-                    "score": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "comment": {"type": "string", "minLength": 1},
+                    "games": {"type": "integer"},
+                    "score": {"type": "integer"},
+                    "comment": {"type": "string"},
                 },
             },
         },
@@ -216,6 +217,14 @@ def _score_rule(score: int) -> dict:
     return _VERDICT_RULES[-1]
 
 
+_RESULT_ALIASES = {
+    "胜": "胜", "赢": "胜", "胜利": "胜", "w": "胜", "win": "胜",
+    "负": "负", "输": "负", "败": "负", "失败": "负", "l": "负", "lose": "负", "loss": "负",
+    "平": "平", "平局": "平", "d": "平", "draw": "平",
+    "未知": "未知", "": "未知", "none": "未知", "null": "未知",
+}
+
+
 def _normalize_result(data: dict, target_id: str) -> dict:
     score = _clamp_score(data.get("score"), 0)
     result = {
@@ -230,9 +239,22 @@ def _normalize_result(data: dict, target_id: str) -> dict:
     for i, item in enumerate(data.get("match_comments") or [], start=1):
         if not isinstance(item, dict):
             continue
+        raw_result = str(item.get("result") or "未知").strip()
+        norm_result = _RESULT_ALIASES.get(raw_result, None)
+        if norm_result is None:
+            # 尝试修复被 Latin-1 错误编码的乱码（如 '\u00e8\u0083\u009c' -> '胜'）
+            try:
+                hexes = re.findall(r"\\u([0-9a-fA-F]{4})", raw_result)
+                if len(hexes) >= 2:
+                    decoded = bytes(int(h, 16) for h in hexes).decode("utf-8", "ignore")
+                    norm_result = _RESULT_ALIASES.get(decoded, None)
+            except Exception:
+                norm_result = None
+        if norm_result is None:
+            norm_result = "未知"
         result["match_comments"].append({
             "index": _clamp_score(item.get("index"), i),
-            "result": str(item.get("result") or "未知"),
+            "result": norm_result,
             "hero": str(item.get("hero") or "未知英雄"),
             "comment": str(item.get("comment") or "暂无点评。").strip(),
         })
@@ -293,19 +315,66 @@ def _repair_json_values(text: str) -> str:
     return text
 
 
+def _repair_json_delimiters(text: str) -> str:
+    """补全模型输出中缺失的 JSON 分隔符（逗号/冒号）。
+
+    覆盖两类高频格式错误：
+    1) 键名后直接换行/空格再接冒号（如 ``"match_comments" \\n :``）；
+    2) 对象 ``}`` / 数组 ``]`` 结束后、下一个值或 ``}`` / ``]`` 之前缺少逗号
+       （如 ``...胜"}\\n{...``、``...胜"}]\\n]``）。
+    """
+    # key 与 ':' 之间允许任意空白（包括换行）
+    t = re.sub(r'("(?:[^"\\]|\\.)*")\s*:', r'\1:', text)
+    # 在结构闭合符 } ] 与后续的结构起始符 " { [ } ] 之间补逗号
+    t = re.sub(r'([}\]])\s*(?=["{\[\]}])', r'\1,', t)
+    # 去掉数组/对象开头处的多余逗号（如 [, {...）
+    t = re.sub(r'([\[{])\s*,', r'\1', t)
+    return t
+
+
+def _fix_mojibake(text: str) -> str:
+    """还原被错误 Latin-1 转义的 UTF-8 字节序列，如 '\\u00e8\\u0083\\u009c' -> '胜'。"""
+    def repl(m):
+        hexes = re.findall(r"\\u([0-9a-fA-F]{4})", m.group(0))
+        try:
+            raw = bytes(int(h, 16) for h in hexes)
+            return raw.decode("utf-8", "ignore") or m.group(0)
+        except Exception:
+            return m.group(0)
+    # 仅当整段由多个 \\uXXXX 连成（非合法 JSON 转义）时才尝试还原
+    return re.sub(r"(?:\\u[0-9a-fA-F]{4}){2,}", repl, text)
+
+
 def _extract_json_object(text: str) -> Optional[dict]:
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
         cleaned = re.sub(r"\s*```$", "", cleaned)
+    # 兼容根对象为数组（如模型返回 [{...}]）的情况
+    cleaned = _fix_mojibake(cleaned)
+    if cleaned[:1] == "[":
+        arr = None
+        try:
+            arr = json.loads(cleaned)
+        except Exception:
+            pass
+        if isinstance(arr, list) and arr:
+            cleaned = json.dumps(arr[0], ensure_ascii=False) if not isinstance(arr[0], dict) else cleaned
+            if isinstance(arr[0], dict):
+                return arr[0]
     attempts = [
         cleaned,
+        _repair_json_delimiters(cleaned),
         _repair_json(cleaned),
         _repair_json_structure(cleaned),
         _repair_json_values(cleaned),
         _repair_json(_repair_json_structure(cleaned)),
         _repair_json(_repair_json_values(cleaned)),
         _repair_json_structure(_repair_json_values(cleaned)),
+        _repair_json_delimiters(_repair_json(cleaned)),
+        _repair_json_delimiters(_repair_json_structure(cleaned)),
+        _repair_json_delimiters(_repair_json_values(cleaned)),
+        _repair_json(_repair_json_delimiters(_repair_json_structure(cleaned))),
     ]
     for attempt in attempts:
         try:
@@ -316,14 +385,18 @@ def _extract_json_object(text: str) -> Optional[dict]:
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start >= 0 and end > start:
+        snippet = _fix_mojibake(cleaned[start:end + 1])
         attempts = [
-            cleaned[start:end + 1],
-            _repair_json(cleaned[start:end + 1]),
-            _repair_json_structure(cleaned[start:end + 1]),
-            _repair_json_values(cleaned[start:end + 1]),
-            _repair_json(_repair_json_structure(cleaned[start:end + 1])),
-            _repair_json(_repair_json_values(cleaned[start:end + 1])),
-            _repair_json_structure(_repair_json_values(cleaned[start:end + 1])),
+            snippet,
+            _repair_json_delimiters(snippet),
+            _repair_json(snippet),
+            _repair_json_structure(snippet),
+            _repair_json_values(snippet),
+            _repair_json(_repair_json_structure(snippet)),
+            _repair_json(_repair_json_values(snippet)),
+            _repair_json_structure(_repair_json_values(snippet)),
+            _repair_json_delimiters(_repair_json_structure(snippet)),
+            _repair_json_delimiters(_repair_json_values(snippet)),
         ]
         for attempt in attempts:
             try:
@@ -729,7 +802,7 @@ async def _call_llm(prompt: str) -> Optional[str]:
         "stream": cfg.stream,
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "shiqu_result", "strict": True, "schema": _SHIQU_JSON_SCHEMA},
+            "json_schema": {"name": "shiqu_result", "strict": False, "schema": _SHIQU_JSON_SCHEMA},
         },
     }
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
@@ -855,6 +928,14 @@ class ShiquModule:
                 except Exception as exc:
                     logger.warning(f"[shiqu] 队友 {p.get('name')} 详情拉取失败: {exc}")
 
+    @staticmethod
+    def _build_list_key(preset_ids: Sequence[str]) -> str:
+        """根据对局 match_id 列表生成稳定的指纹键。
+
+        排序后拼接，确保对局顺序变化不影响判等。
+        """
+        return "|".join(sorted(str(mid) for mid in preset_ids))
+
     async def analyze(self, query, *, db: Optional[IDPoolDB] = None) -> dict:
         """业务主入口：抓取对局 → 构建 Prompt → 调用独立 LLM → 解析结构化结果。
 
@@ -903,27 +984,50 @@ class ShiquModule:
         resolved = list_output.resolved_bnet
         full_id = resolved.full_id if resolved else (query.bnet_id or f"token:{customer_token[:8]}")
 
-        # ── 阶段二：逐条拉取详情，仅保留预设/6v6（复用 overstats query_match_detail）──
-        details = await self._collect_preset_details(customer_token, list_output.matches, match_count)
-
-        # 单次网络抖动重试（对齐原版 _fetch_matches 重试逻辑）
-        if len(details) < 2 and query.bnet_id:
-            try:
-                list_output = await self.match_module.query_match_list(list_query, render=False)
-                details = await self._collect_preset_details(customer_token, list_output.matches, match_count)
-            except Exception as exc:
-                logger.warning(f"[shiqu] 列表重试拉取失败: {exc}")
-
-        if len(details) < 2:
-            raise ModuleError(
-                error="insufficient_matches",
-                message=f"仅获取到 {len(details)} 场预设/6v6 对局，至少需要 2 场。",
-                status_code=404,
-                hint="[决斗领域]暂未适配；请确保该玩家有最近 2 场以上的竞技/快速预设对局。",
+        # ── 阶段 1.5：对局列表缓存命中检查 ──
+        # 若本次上游返回的对局列表（按 match_count 截取）与上次提示词所用列表完全一致，
+        # 则跳过耗时的逐条详情抓取 + 队友补齐，直接复用上次缓存的 details 来构建提示词；
+        # LLM 调用仍照常进行（不跳过），保证判定结果始终由最新模型/提示词生成。
+        # 注意：命中基于"列表相同则视为数据相同"的假设（队友快照等不在比较范围内）。
+        _list_ids = [
+            str(m.get("matchId") or "")
+            for m in (list_output.matches or [])[:match_count]
+        ]
+        _list_ids = [mid for mid in _list_ids if mid]
+        list_key = f"{match_count}#" + self._build_list_key(_list_ids)
+        cache_hit = False
+        details: List[dict] = []
+        if query.use_cache and _list_ids:
+            _cached = await asyncio.to_thread(
+                shiqu_llm_recorder.db.get_cached_details, full_id, list_key
             )
+            if _cached:
+                details = _cached
+                cache_hit = True
+                logger.info(f"[shiqu] 对局列表命中缓存，复用上次抓取的 details（跳过详情抓取与队友补齐），list_key={list_key}")
 
-        # ── 阶段二（补充）：队友多英雄 heroList 补齐（best-effort，复用 overstats 详情查询）──
-        await self._enrich_teammate_details(details, customer_token)
+        if not cache_hit:
+            # ── 阶段二：逐条拉取详情，仅保留预设/6v6（复用 overstats query_match_detail）──
+            details = await self._collect_preset_details(customer_token, list_output.matches, match_count)
+
+            # 单次网络抖动重试（对齐原版 _fetch_matches 重试逻辑）
+            if len(details) < 2 and query.bnet_id:
+                try:
+                    list_output = await self.match_module.query_match_list(list_query, render=False)
+                    details = await self._collect_preset_details(customer_token, list_output.matches, match_count)
+                except Exception as exc:
+                    logger.warning(f"[shiqu] 列表重试拉取失败: {exc}")
+
+            if len(details) < 2:
+                raise ModuleError(
+                    error="insufficient_matches",
+                    message=f"仅获取到 {len(details)} 场预设/6v6 对局，至少需要 2 场。",
+                    status_code=404,
+                    hint="[决斗领域]暂未适配；请确保该玩家有最近 2 场以上的竞技/快速预设对局。",
+                )
+
+            # ── 阶段二（补充）：队友多英雄 heroList 补齐（best-effort，复用 overstats 详情查询）──
+            await self._enrich_teammate_details(details, customer_token)
 
         prompt = _build_prompt(details, full_id, db=db)
 
@@ -1002,6 +1106,21 @@ class ShiquModule:
             except Exception as exc:
                 logger.warning(f"[shiqu] LLM 调用记录落库失败（已忽略）: {exc}")
 
+            # ── 阶段四（补充）：对局列表 → details 缓存 ──
+            # 仅当非缓存命中且 LLM 成功解析出结果时落库，供下次同样的对局列表复用、
+            # 跳过详情抓取与队友补齐（LLM 调用仍照常进行）。失败/命中分支不写缓存。
+            if success and query.use_cache and not cache_hit:
+                try:
+                    await asyncio.to_thread(
+                        shiqu_llm_recorder.db.save_cached_details,
+                        full_id, list_key, details,
+                    )
+                except Exception as exc:
+                    logger.warning(f"[shiqu] 对局详情缓存写入失败（已忽略）: {exc}")
+
+        if result is not None:
+            result["cache_hit"] = cache_hit
+            result["target_id"] = full_id
         return result
 
     async def _analyze_from_db(self, query: ShiquQuery) -> Dict[str, Any]:

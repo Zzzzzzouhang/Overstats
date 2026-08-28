@@ -24,6 +24,7 @@ MATCH_LIST_PAGE_CACHE_TABLE = "match_list_page_cache"
 MATCH_META_TABLE = "match_meta"
 MATCH_PLAYER_TABLE = "match_player"
 OVERALL_RANK_BUCKET_KEY = -1
+SQLITE_BUSY_TIMEOUT_MS = 15_000
 
 # Field order used when inserting match_meta rows.
 MATCH_META_FIELDS = (
@@ -93,20 +94,39 @@ class IDPoolDB:
             self._warn_once(f"match stats sqlite db not found: {self.db_path}")
             return None
         try:
-            connection = sqlite3.connect(str(self.db_path))
+            connection = sqlite3.connect(
+                str(self.db_path),
+                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+            )
             connection.row_factory = None
+            connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             return connection
         except Exception as exc:
             self._warn_once(f"match stats sqlite connection failed: {type(exc).__name__}: {exc}")
             return None
 
     def _get_write_connection(self) -> Optional[sqlite3.Connection]:
+        connection: Optional[sqlite3.Connection] = None
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(str(self.db_path), timeout=30)
+            connection = sqlite3.connect(
+                str(self.db_path),
+                timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+            )
             connection.row_factory = None
+            connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            # WAL keeps readers on a stable snapshot while the recorder appends a
+            # batch, avoiding the read/write lock collision in strength renders.
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA wal_autocheckpoint=1000")
             return connection
         except Exception as exc:
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
             self._warn_once(f"match stats sqlite write connection failed: {type(exc).__name__}: {exc}")
             return None
 

@@ -565,7 +565,7 @@ async def _call_llm(prompt: str) -> Optional[str]:
         "stream": cfg.stream,
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "court_verdict", "strict": True, "schema": _COURT_JSON_SCHEMA},
+            "json_schema": {"name": "court_verdict", "strict": False, "schema": _COURT_JSON_SCHEMA},
         },
     }
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 SHIQU_LLM_DB_PATH = Path(__file__).resolve().parent / "shiqu_llm.sqlite3"
 SHIQU_LLM_RESULT_TABLE = "shiqu_llm_result"
+SHIQU_LLM_CACHE_TABLE = "shiqu_llm_prompt_cache"
 
 # 有界队列，避免 SQLite 写盘卡顿（磁盘 IO / 锁竞争 / 满盘）时内存无限增长；
 # best-effort 遥测在队列满时直接丢弃。
@@ -127,6 +129,24 @@ class ShiquLLMDB:
                 f"""
                 CREATE INDEX IF NOT EXISTS idx_shiqu_result_target
                 ON {SHIQU_LLM_RESULT_TABLE}(target_id, created_at)
+                """
+            )
+            # 对局详情缓存：同一玩家 + 相同对局列表时，复用上次抓取并补齐队友后的
+            # details（用于构建提示词），跳过逐条详情抓取 + 队友补齐；仍会重新调用 LLM。
+            connection.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {SHIQU_LLM_CACHE_TABLE} (
+                    target_id TEXT NOT NULL,
+                    list_key TEXT NOT NULL,
+                    details_json TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                f"""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_shiqu_cache_target_list
+                ON {SHIQU_LLM_CACHE_TABLE}(target_id, list_key)
                 """
             )
             connection.commit()
@@ -252,6 +272,66 @@ class ShiquLLMDB:
             }
         except Exception:
             return None
+        finally:
+            connection.close()
+
+    def get_cached_details(self, target_id: str, list_key: str) -> Optional[List[Dict[str, Any]]]:
+        """按 target_id + 对局列表指纹读取缓存的 details。
+
+        命中返回解析后的 details 列表（已含队友 _heroList 补齐）；无记录/解析失败返回 ``None``。
+        """
+        connection = self._get_connection()
+        if connection is None or not str(target_id or "").strip() or not str(list_key or "").strip():
+            return None
+        try:
+            row = connection.execute(
+                f"""
+                SELECT details_json, created_at
+                FROM {SHIQU_LLM_CACHE_TABLE}
+                WHERE target_id = ? AND list_key = ?
+                LIMIT 1
+                """,
+                (str(target_id), str(list_key)),
+            ).fetchone()
+            if row is None:
+                return None
+            raw = str(row[0] or "").strip()
+            if not raw:
+                return None
+            details = json.loads(raw)
+            if not isinstance(details, list) or not details:
+                return None
+            return details
+        except Exception:
+            return None
+        finally:
+            connection.close()
+
+    def save_cached_details(
+        self, target_id: str, list_key: str, details: Sequence[Dict[str, Any]]
+    ) -> None:
+        """写入/更新一条 details 缓存（同 target_id + list_key 覆盖）。"""
+        connection = self._get_write_connection()
+        if connection is None:
+            return
+        try:
+            details_json = json.dumps(list(details or []), ensure_ascii=False)
+            connection.execute(
+                f"""
+                INSERT INTO {SHIQU_LLM_CACHE_TABLE} (target_id, list_key, details_json, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(target_id, list_key)
+                DO UPDATE SET details_json=excluded.details_json, created_at=excluded.created_at
+                """,
+                (str(target_id), str(list_key), details_json, int(time.time())),
+            )
+            connection.commit()
+        except Exception as exc:
+            self._warn_once(f"shiqu llm cache save failed: {type(exc).__name__}: {exc}")
+            try:
+                connection.rollback()
+            except Exception:
+                pass
         finally:
             connection.close()
 

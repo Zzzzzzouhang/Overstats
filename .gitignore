@@ -42,6 +42,10 @@ api_test_data.json
 !/test/test_ow_guess_catalog.py
 !/test/test_ow_hero_leaderboard_service.py
 !/test/test_risk_status.py
+!/test/test_rank_emerald.py
+!/test/test_personal_data_percentile.py
+!/test/test_font_resolver.py
+!/test/test_dashen_profile_render.py
 src/db/match_stats.sqlite3.old
 .vibe/review_diff.txt
 C:/Users/Documorial/AppData/Local/Temp/season_diff.txt

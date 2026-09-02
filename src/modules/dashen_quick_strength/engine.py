@@ -6,8 +6,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 try:
     from overstats.src.constants.ranks import get_rank_score, raw_rank_score_to_strength, strength_score_to_rank
+    from overstats.src.modules.personal_data_percentile import calculate_personal_data_ranking
 except ModuleNotFoundError:
     from src.constants.ranks import get_rank_score, raw_rank_score_to_strength, strength_score_to_rank
+    from src.modules.personal_data_percentile import calculate_personal_data_ranking
 
 from .requests import DashenQuickStrengthRequests, get_live_dashen_season
 
@@ -327,6 +329,9 @@ class DashenQuickStrengthEngine:
                     "overall_avg_rank": "Unranked",
                     "score_range": {"min": 0, "max": 0},
                     "used_previous_season_fallback": False,
+                    "personal_data_exceeded_percent": None,
+                    "personal_data_top_percent": None,
+                    "personal_data_metric_count": 0,
                 },
                 "matches": [],
             }
@@ -472,6 +477,11 @@ class DashenQuickStrengthEngine:
         ]
         summary_score_range = _range_dict(int(round(score)) for score in valid_avg_scores)
         overall_avg_score = round(sum(valid_avg_scores) / len(valid_avg_scores), 1) if valid_avg_scores else 0.0
+        personal_data_ranking = await asyncio.to_thread(
+            calculate_personal_data_ranking,
+            config,
+            list(match_detail_cache.values()),
+        )
 
         # Strip internal keys from output
         for point in match_points:
@@ -484,6 +494,15 @@ class DashenQuickStrengthEngine:
                 "overall_avg_rank": score_to_rank(overall_avg_score) if overall_avg_score > 0 else "Unranked",
                 "score_range": summary_score_range,
                 "used_previous_season_fallback": used_previous_fallback,
+                "personal_data_exceeded_percent": (
+                    personal_data_ranking.exceeded_percent if personal_data_ranking else None
+                ),
+                "personal_data_top_percent": (
+                    personal_data_ranking.top_percent if personal_data_ranking else None
+                ),
+                "personal_data_metric_count": (
+                    personal_data_ranking.metric_count if personal_data_ranking else 0
+                ),
             },
             "matches": match_points,
         }

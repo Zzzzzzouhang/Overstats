@@ -32,6 +32,10 @@ ow_guess_assets/
 /data/
 
 # Test artifacts
+test/
+tests/
+test_*.py
+*_test.py
 test_*.json
 test_*.md
 test_report_*.md
@@ -54,3 +58,13 @@ src/db/request_metrics.sqlite3-journal
 /doceker_test
 /.codebuddy
 /.workbuddy
+
+# SCF source and deployment hygiene
+accounts*.json
+**/accounts*.json
+scf-update-*.json
+build-*.log
+benchmark-*.log
+smoke-*
+*.tar
+/cache/

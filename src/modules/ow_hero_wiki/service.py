@@ -18,6 +18,7 @@ except ModuleNotFoundError:
     from src.modules.query_tool import load_query_tool
 
 from .render import RenderedImage, render_hero_wiki_overview
+from .retrieval import retrieve, evidence_context, extractive_answer
 from .cache_store import IMAGE_CACHE_DIR, STRUCTURED_CACHE_DIR, build_cache_file_path, hash_text, read_bytes_file, read_json_file, write_bytes_atomic, write_json_atomic
 from .requests import (
     OWHeroWikiPage,
@@ -33,8 +34,8 @@ HERO_WIKI_UNAVAILABLE_MESSAGE = "当前暂时无法获取英雄维基资料。"
 QUESTION_UNAVAILABLE_MESSAGE = "当前问答不可用，请稍后重试。"
 STRUCTURED_CACHE_TTL_SECONDS = PAGE_CACHE_TTL_SECONDS
 STRUCTURED_CACHE_VERSION = 1
-STRUCTURED_PAYLOAD_VERSION = "v2"
-RENDER_CACHE_VERSION = "v3"
+STRUCTURED_PAYLOAD_VERSION = "v5-assets-localization"
+RENDER_CACHE_VERSION = "v9-tags-parameter-bands"
 FANDOM_TITLE_OVERRIDES = {
     "junkerqueen": "Junker_Queen",
     "wreckingball": "Wrecking_Ball",
@@ -241,6 +242,8 @@ class OWHeroWikiOutput:
     source: Dict[str, Any]
     question: str = ""
     answer: str = ""
+    citations: Sequence[Dict[str, Any]] = ()
+    answer_mode: str = ""
     accent_color: Sequence[int] = (96, 191, 255)
     icon_url: str = ""
     image_url: str = ""
@@ -259,10 +262,14 @@ class OWHeroWikiOutput:
             "abilities": [dict(item) for item in self.abilities],
             "perks": [dict(item) for item in self.perks],
             "source": dict(self.source),
+            "icon_url": self.icon_url,
+            "image_url": self.image_url,
         }
         if self.question:
             payload["question"] = self.question
             payload["answer"] = self.answer
+            payload["citations"] = [dict(item) for item in self.citations]
+            payload["answer_mode"] = self.answer_mode
         return payload
 
 
@@ -320,16 +327,26 @@ class OWHeroWikiModule:
         )
 
         answer = ""
+        citations = []
+        answer_mode = ""
         if resolved_query.question:
+            citations = retrieve(structured_payload, resolved_query.question)
+            answer = extractive_answer(citations, resolved_query.question)
+            answer_mode = "extractive" if citations else "insufficient_evidence"
             try:
-                answer = await self._answer_question(
+                generated = await self._answer_question(
                     hero_context=hero_context,
                     structured_payload=structured_payload,
                     question=resolved_query.question,
-                )
+                    hits=citations,
+                ) if citations else ""
+                # Require valid citations before presenting model prose as grounded.
+                ids = {int(value) for value in re.findall(r"\[(\d+)\]", generated)}
+                if generated and ids and ids <= {hit["id"] for hit in citations}:
+                    answer = generated
+                    answer_mode = "generated"
             except Exception as exc:
-                print(f"[overstats] hero wiki question answering failed: {type(exc).__name__}: {exc}")
-                answer = QUESTION_UNAVAILABLE_MESSAGE
+                print(f"[overstats] hero wiki question answering failed: {type(exc).__name__}")
 
         output = OWHeroWikiOutput(
             hero=hero_context.hero_cn,
@@ -344,6 +361,8 @@ class OWHeroWikiModule:
             source=dict(structured_payload.get("source") or {}),
             question=resolved_query.question,
             answer=answer,
+            citations=tuple(citations),
+            answer_mode=answer_mode,
             accent_color=tuple(structured_payload.get("accent_color") or hero_context.accent_color),
             icon_url=str(structured_payload.get("icon_url") or hero_context.icon_url),
             image_url=str(structured_payload.get("image_url") or ""),
@@ -376,6 +395,8 @@ class OWHeroWikiModule:
             source=output.source,
             question=output.question,
             answer=output.answer,
+            citations=output.citations,
+            answer_mode=output.answer_mode,
             accent_color=output.accent_color,
             icon_url=output.icon_url,
             image_url=output.image_url,
@@ -388,9 +409,6 @@ class OWHeroWikiModule:
     ) -> Dict[str, Any]:
         cache_key = self._build_cache_key(hero_context)
         now = time.time()
-        cached = self._structured_cache.get(cache_key)
-        if cached and cached.expires_at > now:
-            return deepcopy(cached.value)
 
         disk_cached = self._load_structured_payload_from_disk(hero_context)
         disk_payload: Dict[str, Any] | None = None
@@ -400,8 +418,8 @@ class OWHeroWikiModule:
         if disk_cached is not None:
             disk_payload, disk_page_hash, disk_expires_at, disk_created_at = disk_cached
             self._structured_cache[cache_key] = _CacheEntry(value=deepcopy(disk_payload), expires_at=disk_expires_at)
-            if disk_expires_at > now:
-                return deepcopy(disk_payload)
+            # Always pass through the page revision check, even when derived
+            # data remains reusable. Its own short check interval handles TTL.
 
         try:
             page = await self.requests.fetch_page(hero_context.page_title)
@@ -430,7 +448,10 @@ class OWHeroWikiModule:
                 source_payload["fandom_page_id"] = page.page_id
                 source_payload["fandom_url"] = page.source_url
                 source_payload["image_url"] = page.image_url
+                source_payload["revision_id"] = page.revision_id
+                source_payload["modified_at"] = page.modified_at
             reused_payload["image_url"] = page.image_url
+            await self._refresh_enrichments(reused_payload)
             self._store_structured_payload_to_disk(
                 hero_context,
                 reused_payload,
@@ -504,16 +525,41 @@ class OWHeroWikiModule:
                 "fandom_page_id": page.page_id,
                 "fandom_url": page.source_url,
                 "image_url": page.image_url,
+                "content_hash": page.wikitext_hash,
+                "revision_id": page.revision_id,
+                "modified_at": page.modified_at,
             },
             "accent_color": hero_context.accent_color,
             "icon_url": hero_context.icon_url,
             "image_url": page.image_url,
         }
 
-        await self._translate_free_text_fields(structured)
+        await self._refresh_enrichments(structured)
         return structured
 
-    async def _translate_free_text_fields(self, payload: Dict[str, Any]) -> None:
+    async def _refresh_enrichments(self, payload: Dict[str, Any]) -> None:
+        now = time.time()
+        cards = list(payload.get("abilities") or []) + list(payload.get("perks") or [])
+        if float(payload.get("_icons_retry_at") or 0) <= now:
+            filenames = [str(card["icon_file"]) for card in cards if card.get("icon_file")]
+            if filenames:
+                try:
+                    urls = await self.requests.fetch_file_urls(filenames)
+                    for card in cards:
+                        if card.get("icon_file") in urls:
+                            card["icon_url"] = urls[card["icon_file"]]
+                    payload["_icons_retry_at"] = now + (86400 if len(urls) == len(set(filenames)) else 300)
+                except Exception as exc:
+                    print(f"[overstats] wiki icon lookup failed: {type(exc).__name__}")
+                    payload["_icons_retry_at"] = now + 300
+        profile = self.requests.translation_profile()
+        if profile and (payload.get("_translation_profile") != profile
+                        or float(payload.get("_translation_retry_at") or 0) <= now):
+            complete = await self._translate_free_text_fields(payload)
+            payload["_translation_profile"] = profile
+            payload["_translation_retry_at"] = now + (86400 if complete else 300)
+
+    async def _translate_free_text_fields(self, payload: Dict[str, Any]) -> bool:
         targets: list[tuple[tuple[Any, ...], str]] = []
         if _needs_translation(payload.get("overview")):
             targets.append((("overview",), str(payload.get("overview") or "")))
@@ -522,8 +568,16 @@ class OWHeroWikiModule:
             for index, card in enumerate(list(payload.get(section_name) or [])):
                 if not isinstance(card, dict):
                     continue
+                if not card.get("name_cn") and _needs_translation(card.get("name_en")):
+                    targets.append(((section_name, index, "name_cn"), str(card["name_en"])))
                 if _needs_translation(card.get("description")):
                     targets.append(((section_name, index, "description"), str(card.get("description") or "")))
+                for stat_index, stat in enumerate(card.get("stats") or []):
+                    if _needs_translation(stat.get("value")):
+                        targets.append(((section_name, index, "stats", stat_index, "value"), str(stat["value"])))
+                for tag_index, tag in enumerate(card.get("tags") or []):
+                    if _needs_translation(tag):
+                        targets.append(((section_name, index, "tags", tag_index), str(tag)))
                 for note_index, note in enumerate(list(card.get("notes") or [])):
                     if _needs_translation(note):
                         targets.append(((section_name, index, "notes", note_index), str(note or "")))
@@ -532,19 +586,28 @@ class OWHeroWikiModule:
                         targets.append(((section_name, index, "mode_notes", note_index), str(note or "")))
 
         if not targets:
-            return
+            return True
 
         glossary = _build_translation_glossary(payload)
         try:
             translated_texts = await self.requests.translate_texts([text for _, text in targets], glossary=glossary)
         except Exception as exc:
             print(f"[overstats] hero wiki translation failed: {type(exc).__name__}: {exc}")
-            return
+            return False
         if not translated_texts:
-            return
+            return False
 
-        for (path, _), translated_text in zip(targets, translated_texts):
-            _set_nested_value(payload, path, _clean_localized_text(translated_text))
+        complete = len(translated_texts) == len(targets)
+        for (path, original), translated_text in zip(targets, translated_texts):
+            cleaned = _clean_localized_text(translated_text)
+            if (not cleaned or re.findall(r"\d+(?:\.\d+)?", original) != re.findall(r"\d+(?:\.\d+)?", cleaned)
+                    or original.count("%") != cleaned.count("%")):
+                complete = False
+                continue
+            _set_nested_value(payload, path, cleaned)
+            if path[-1] == "name_cn":
+                payload[path[0]][path[1]]["name"] = cleaned
+        return complete
 
     async def _answer_question(
         self,
@@ -552,9 +615,10 @@ class OWHeroWikiModule:
         hero_context: _HeroContext,
         structured_payload: Mapping[str, Any],
         question: str,
+        hits: list[Dict[str, Any]],
     ) -> str:
         glossary = _build_translation_glossary(structured_payload)
-        context_text = _build_question_context(structured_payload)
+        context_text = evidence_context(hits)
         answer = await self.requests.answer_question(
             hero_cn=hero_context.hero_cn,
             hero_en=str(structured_payload.get("hero_en") or hero_context.hero_en),
@@ -621,6 +685,7 @@ class OWHeroWikiModule:
     def _build_render_cache_key(self, output: OWHeroWikiOutput, *, structured_payload: Mapping[str, Any]) -> str:
         render_payload = {
             "render_version": RENDER_CACHE_VERSION,
+            "source": dict(output.source),
             "hero": output.hero,
             "hero_cn": output.hero_cn,
             "hero_en": output.hero_en,
@@ -632,6 +697,8 @@ class OWHeroWikiModule:
             "perks": [dict(item) for item in output.perks],
             "question": output.question,
             "answer": output.answer,
+            "citations": list(output.citations),
+            "answer_mode": output.answer_mode,
             "accent_color": list(output.accent_color),
             "icon_url": output.icon_url,
             "image_url": output.image_url,
@@ -673,6 +740,7 @@ class OWHeroWikiModule:
                     "name": name_cn or name_en,
                     "name_cn": name_cn or "",
                     "name_en": name_en,
+                    "icon_file": str(card.get("ability_image") or "").strip(),
                     "description": description_cn or description_en,
                     "description_en": description_en,
                     "key": key_raw,
@@ -694,7 +762,13 @@ class OWHeroWikiModule:
         perks = [item for item in list(hero_context.hero_config.get("Perks") or []) if isinstance(item, dict)]
         localized_cards = []
         for index, card in enumerate(cards):
-            matched_item = perks[index] if index < len(perks) else {}
+            wiki_name = _normalize_query_key(card.get("ability_name"))
+            # Local configuration and Wiki can have different perk sets/order.
+            # Only explicit name matches are safe; do not infer by list position.
+            matched_item = next((item for item in perks if wiki_name and any(
+                _normalize_query_key(item.get(key)) == wiki_name
+                for key in ("Name", "NameEN", "name_en", "WikiName")
+            )), {})
             name_cn = _clean_query_tool_text(matched_item.get("Name")) if isinstance(matched_item, dict) else ""
             description_cn = _clean_query_tool_text(matched_item.get("Description")) if isinstance(matched_item, dict) else ""
             if _contains_placeholder(description_cn):
@@ -708,6 +782,7 @@ class OWHeroWikiModule:
                     "name": name_cn or name_en,
                     "name_cn": name_cn or "",
                     "name_en": name_en,
+                    "icon_file": str(card.get("ability_image") or "").strip(),
                     "description": description_cn or description_en,
                     "description_en": description_en,
                     "key": _clean_localized_text(card.get("key") or ""),
@@ -897,10 +972,10 @@ def _contains_cjk(text: Any) -> bool:
 
 def _needs_translation(text: Any) -> bool:
     normalized = str(text or "").strip()
-    if not normalized or _contains_cjk(normalized):
+    if not normalized:
         return False
-    alphabetic = re.findall(r"[A-Za-z]", normalized)
-    return len(alphabetic) >= 3
+    normalized = re.sub(r"\b(?:HP|DPS|HPS|XP|PvE|PvP|AoE)\b", "", normalized, flags=re.I)
+    return bool(re.search(r"[A-Za-z]{3,}", normalized))
 
 
 def _clean_localized_text(text: Any) -> str:
@@ -928,6 +1003,7 @@ def _localize_inline_text(text: Any) -> str:
     result = re.sub(r"(\d+(?:\.\d+)?)\s*seconds?\b", r"\1 秒", result, flags=re.IGNORECASE)
     result = re.sub(r"(\d+(?:\.\d+)?)\s*meters?\b", r"\1 米", result, flags=re.IGNORECASE)
     result = re.sub(r"(\d+(?:\.\d+)?)\s*points?\b", r"\1 点", result, flags=re.IGNORECASE)
+    result = re.sub(r"\bm\s*/\s*s\b", "米/秒", result)
     result = re.sub(r"\bper second\b", "/秒", result, flags=re.IGNORECASE)
     result = re.sub(r"\bper hit\b", "/次命中", result, flags=re.IGNORECASE)
     result = re.sub(r"\bper shot\b", "/次射击", result, flags=re.IGNORECASE)
@@ -1248,11 +1324,12 @@ def _build_card_stats(fields: Mapping[str, Any]) -> list[Dict[str, str]]:
             continue
         items.append(
             {
+                "key": key,
                 "label": FIELD_LABELS.get(key, key),
                 "value": _localize_inline_text(value.replace("\n", " / ")),
             }
         )
-    return items[:14]
+    return items
 
 
 def _build_card_notes(fields: Mapping[str, Any]) -> list[str]:
@@ -1269,7 +1346,8 @@ def _build_card_notes(fields: Mapping[str, Any]) -> list[str]:
             lowered = cleaned.lower()
             if not cleaned or "calcdps" in lowered or "damage per second" in lowered or "healing per second" in lowered:
                 continue
-            notes.append(_localize_inline_text(cleaned))
+            prefix = "PvE / 合作模式：" if source_key == "coop_details" else ""
+            notes.append(prefix + _localize_inline_text(cleaned))
     return _dedupe_strings(notes)
 
 

@@ -49,3 +49,16 @@ openspec/
 doceker_test/*
 !doceker_test/entrypoint.sh
 !doceker_test/Dockerfile
+
+# 上游补充：环境变量与 SCF 构建产物
+.env
+.env.*
+smoke-*
+*.tar
+LOCAL_BUILD_RESULT.md
+accounts*.json
+**/accounts*.json
+build-*.log
+benchmark-*.log
+SCF_V5_BENCHMARK.md
+scf-update-*.json

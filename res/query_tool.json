@@ -1,12 +1,16 @@
 {
   "antiCrawlerConfig": {
-    "enabled": false,
-    "searchEnabled": true,
+    "enabled": true,
+    "searchEnabled": false,
     "minEndorsementLevel": 1,
-    "minGameTimeMinutes": 600,
-    "recentDays": 7,
+    "minGameTimeMinutes": 300,
+    "recentDays": 5,
     "minRecentMatches": 1,
-    "whitelist": []
+    "whitelist": [
+      "217943997",
+      "236361981",
+      "207219421"
+    ]
   },
   "whiteList": [
     "yd.bafe4ef249214ccb8@163.com",
@@ -86,7 +90,7 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "部分对局数据存在异常，正在处理中！",
+  "noticeMessage": "搜索接口暂时维护中！",
   "pcNoticeMessage": {
     "sport": "",
     "leisure": "",
@@ -1245,7 +1249,7 @@
     {
       "key": "Emerald",
       "name": "翡翠",
-      "icon": "https://img.166.net/gameyw-misc/opd/squash/20260812/110401-ylm2tg3nop.png",
+      "icon": "https://img.166.net/gameyw-misc/opd/squash/20260813/151353-jzms913ipf.png",
       "level": [
         2500,
         2999
@@ -20315,6 +20319,12 @@
       },
       {
         "heroId": "0x02E0000000000042",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/b0d48ad9c8bdf1ce4ec5aeb9fe01b8fe8c1db55e4a5c411eedb74a7c41967526.png",
+        "id": "0x0CC8000000002ADA",
+        "name": "得儿驾<br />使用战术翻滚后，卡西迪获得会在1.5秒内衰减的速度加成"
+      },
+      {
+        "heroId": "0x02E0000000000042",
         "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/4eb33f06a39774d03562b84d4541ed691de840de3aedefc18fb6b809a9f01b8f.png",
         "id": "0x0CC800000000286A",
         "name": "翻身愈合<br />每用战术翻滚装填一颗子弹，还会治疗15点生命值"
@@ -20563,9 +20573,9 @@
       },
       {
         "heroId": "0x02E000000000013E",
-        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/79fbe7ca9c3b645dd510dbf395d3741d89ea7d2c9ff9edb2c157951ba45f0852.png",
-        "id": "0x0CC8000000002552",
-        "name": "充能标枪<br />长按 {0} 可为能量标枪充能，充能使标枪击退效果提高最多25%，弹道速度加快最多100%。充满后可贯穿敌人"
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/bcfd342643f783df7b6710fd613f2a2a7fc4e84d33e2d2235f203e8e6c6e58ea.png",
+        "id": "0x0CC8000000002AD5",
+        "name": "重型标枪<br />能量标枪的击退效果提高25%，撞墙伤害提高15点"
       },
       {
         "heroId": "0x02E000000000013E",
@@ -21254,6 +21264,32 @@
         "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/6d7c27041b9a59820556eb5b7795fb1a320973482553c6f509d386b2cd371a80.png",
         "id": "0x0CC80000000028EF",
         "name": "别有用心<br />生物猫爪弹会恢复燃料，数值为治疗量的15%"
+      }
+    ],
+    "0x02E0000000000542": [
+      {
+        "heroId": "0x02E0000000000542",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/a49a4aa586ec9a0f10b16d299e541fdfeb6da4ee2c1bf75a4f2bab1f4170ee45.png",
+        "id": "0x0CC80000000029E3",
+        "name": "野兽之心<br />等离子剑命中会为强力屏障治疗40点生命值"
+      },
+      {
+        "heroId": "0x02E0000000000542",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/b87f463706a6816a371f8c8b0cb62cd77f33860e85baa19998dd2aad97f89662.png",
+        "id": "0x0CC80000000029E4",
+        "name": "强突刺击<br />突进刺击获得150%生命汲取"
+      },
+      {
+        "heroId": "0x02E0000000000542",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/46d8466d7de4b04dea213c55cae621e407206055eb3b9247796b3f8cd7ba2b4e.png",
+        "id": "0x0CC80000000029E5",
+        "name": "聚焦聚变<br />聚变连发枪发射没有散布的强效射击，但射速降低"
+      },
+      {
+        "heroId": "0x02E0000000000542",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/8d2f97ae5a2dc9b137d45bcf277030fc32754a67155c55d3d7f0525d6ea9ac6e.png",
+        "id": "0x0CC80000000029E6",
+        "name": "MEKA机动<br />按住强力屏障时，助推器燃料消耗降低30%"
       }
     ],
     "0x02E000000000052C": [

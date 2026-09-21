@@ -541,7 +541,9 @@ async def _build_image_base64(
         runtime.summary._fetch_details(customer_token, matches, focus_bnet_id=focus_bnet_id)
     )
     quick_dist_task = asyncio.create_task(runtime.summary._build_quick_strength_distribution_data(customer_token, matches))
-    detail_pairs, quick_dist_data = await asyncio.gather(detail_task, quick_dist_task)
+    detail_pairs = await detail_task
+    match_awards = await runtime.summary._build_match_awards(customer_token, matches, detail_pairs, resolved_target, all_matches)
+    quick_dist_data = await quick_dist_task
     timer.mark(
         "DETAIL_AND_QUICK_DIST_DONE",
         f"detail_count={len(detail_pairs)}; quick_dist_points={len((quick_dist_data or {}).get('sampled_matches') or [])}",
@@ -559,7 +561,7 @@ async def _build_image_base64(
         detail_pairs,
         title_text,
         all_matches=all_matches,
-        quick_dist_data=quick_dist_data,
+        match_awards=match_awards,
         render_stage_log=lambda stage, extra=None: timer.mark(f"RENDER_{stage}", extra),
     )
     timer.mark("RENDER_DONE")

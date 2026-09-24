@@ -769,6 +769,7 @@ class IDPoolDB:
         rank_scores: Optional[List[int]] = None,
         ratio_statmap_names: Optional[List[str]] = None,
         group_by_rank: bool = True,
+        preaggregated_only: bool = False,
     ) -> Dict[str, Any]:
         hero_guid = str(hero_guid or "").strip()
         if not hero_guid:
@@ -789,7 +790,7 @@ class IDPoolDB:
             rank_scores=rank_scores,
             group_by_rank=group_by_rank,
         )
-        if summary_rows:
+        if summary_rows or preaggregated_only:
             try:
                 conn.close()
             except Exception:
@@ -970,6 +971,7 @@ class IDPoolDB:
                         target_value,
                         reverse,
                         COUNT(*) AS player_count,
+                        AVG(player_value) AS population_average,
                         COALESCE(
                             SUM(
                                 CASE
@@ -992,7 +994,7 @@ class IDPoolDB:
                 (hero_guid, statmap_name): index
                 for index, (hero_guid, statmap_name, _, _) in enumerate(normalized_features)
             }
-            for hero_guid, statmap_name, value, reverse, player_count, exceeded_count in rows:
+            for hero_guid, statmap_name, value, reverse, player_count, population_average, exceeded_count in rows:
                 player_count = int(player_count or 0)
                 exceeded_count = int(exceeded_count or 0)
                 if player_count <= 0:
@@ -1004,6 +1006,7 @@ class IDPoolDB:
                         "value": float(value),
                         "reverse": bool(reverse),
                         "player_count": player_count,
+                        "average": float(population_average),
                         "exceeded_count": exceeded_count,
                         "exceeded_percent": exceeded_count * 100.0 / player_count,
                     }
@@ -1029,6 +1032,7 @@ class IDPoolDB:
         kill_guid: str = "603482350067646495",
         assist_guid: str = "603482350067648392",
         death_guid: str = "603482350067646506",
+        death_floor: float = 1.0,
     ) -> List[Dict[str, Any]]:
         """Compare derived KDA values after aggregating each database player."""
         normalized_features: List[tuple[str, float]] = []
@@ -1102,7 +1106,7 @@ class IDPoolDB:
                             hero_guid,
                             target_value,
                             player_bnet_id,
-                            (kills + assists) / MAX(deaths, 1.0) AS player_value
+                            (kills + assists) / CASE WHEN deaths = 0 THEN 1.0 ELSE MAX(deaths, ?) END AS player_value
                         FROM player_components
                         WHERE kills IS NOT NULL AND deaths IS NOT NULL
                     )
@@ -1110,6 +1114,7 @@ class IDPoolDB:
                         hero_guid,
                         target_value,
                         COUNT(*) AS player_count,
+                        AVG(player_value) AS population_average,
                         COALESCE(
                             SUM(CASE WHEN player_value < target_value THEN 1 ELSE 0 END),
                             0
@@ -1125,6 +1130,7 @@ class IDPoolDB:
                         kill_guid,
                         assist_guid,
                         death_guid,
+                        float(death_floor),
                     ),
                 )
                 rows = cursor.fetchall() or []
@@ -1133,7 +1139,7 @@ class IDPoolDB:
 
             by_hero = {hero_guid: index for index, (hero_guid, _) in enumerate(normalized_features)}
             results = []
-            for hero_guid, value, player_count, exceeded_count in rows:
+            for hero_guid, value, player_count, population_average, exceeded_count in rows:
                 player_count = int(player_count or 0)
                 exceeded_count = int(exceeded_count or 0)
                 if player_count <= 0:
@@ -1145,6 +1151,7 @@ class IDPoolDB:
                         "value": float(value),
                         "reverse": False,
                         "player_count": player_count,
+                        "average": float(population_average),
                         "exceeded_count": exceeded_count,
                         "exceeded_percent": exceeded_count * 100.0 / player_count,
                     }

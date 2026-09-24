@@ -11,10 +11,12 @@ from ...constants.backgrounds import build_random_map_background
 try:
     from overstats.src.modules.font_resolver import load_font
     from overstats.src.modules.query_tool import get_cached_asset_path
+    from overstats.src.modules.render_base import load_image_rgba
     from overstats.src.modules.risk_status import draw_risk_status_badge
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
     from src.modules.query_tool import get_cached_asset_path
+    from src.modules.render_base import load_image_rgba
     from src.modules.risk_status import draw_risk_status_badge
 
 from .engine import ROLE_LABELS, cloud_summary

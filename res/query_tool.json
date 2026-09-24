@@ -1,7 +1,7 @@
 {
   "antiCrawlerConfig": {
-    "enabled": true,
-    "searchEnabled": false,
+    "enabled": false,
+    "searchEnabled": true,
     "minEndorsementLevel": 1,
     "minGameTimeMinutes": 300,
     "recentDays": 5,
@@ -90,7 +90,7 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "搜索接口暂时维护中！",
+  "noticeMessage": "新英雄血律正在适配中，请耐心等待！",
   "pcNoticeMessage": {
     "sport": "",
     "leisure": "",
@@ -1983,6 +1983,18 @@
       "smallIconUrl": "https://img.166.net/gameyw-misc/opd/squash/20260617/103249-y40i5fglj9.png",
       "cover": "",
       "destinyHeroBanner": "https://img.166.net/gameyw-misc/opd/squash/20260811/131236-6p9avmoh2u.png",
+      "ddHeroIcon": ""
+    },
+    {
+      "id": "0x02E0000000000570",
+      "heroGuid": "207165582859044208",
+      "roleGuid": "972777519512029265",
+      "roleType": "healer",
+      "name": "血律",
+      "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/2492a15c575c12314907d0d77501ec337b4d56796bc7f03e5dfb50d415612bae.png",
+      "smallIconUrl": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/534fea21e25537daa24a40b68384f2cd0c4d22bac5f4cd58cbb8b4aa38b16f3e.png",
+      "cover": "",
+      "destinyHeroBanner": "",
       "ddHeroIcon": ""
     },
     {
@@ -19888,6 +19900,20 @@
       "heroName": "D.Mon",
       "valueGuid": "603482350067646497",
       "valueText": "累计游戏时间",
+      "valueType": "通用数据"
+    },
+    {
+      "heroGuid": "207165582859044208",
+      "heroName": "血律",
+      "valueGuid": "603482350067646497",
+      "valueText": "累计游戏时间",
+      "valueType": "通用数据"
+    },
+    {
+      "heroGuid": "207165582859044208",
+      "heroName": "血律",
+      "valueGuid": "603482350067647671",
+      "valueText": "对英雄伤害量",
       "valueType": "通用数据"
     },
     {

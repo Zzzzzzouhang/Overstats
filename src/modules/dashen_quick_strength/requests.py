@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 try:
     from overstats.src.client.apiclient import DashenAPIClient, dashen_api_client
     from overstats.src.modules.dashen_request_cache import (
-        fetch_paginated_match_entries,
+        fetch_match_list_page_cached,
         list_page_singleflight,
         season_key,
     )
@@ -16,7 +16,7 @@ try:
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient, dashen_api_client
     from src.modules.dashen_request_cache import (
-        fetch_paginated_match_entries,
+        fetch_match_list_page_cached,
         list_page_singleflight,
         season_key,
     )
@@ -149,11 +149,19 @@ class DashenQuickStrengthRequests:
                 while count_unique_match_entries(season_matches) < int(limit):
                     previous_count = count_unique_match_entries(season_matches)
                     tasks = [
-                        self.api_client.query_match_list(
-                            customer_token,
-                            "leisure",
-                            page=page + offset,
+                        fetch_match_list_page_cached(
+                            source_kind="normal",
+                            customer_token=customer_token,
+                            game_mode="leisure",
                             season=request_season,
+                            page=page + offset,
+                            bnet_id=bnet_id,
+                            fetch_page=lambda p, request_season=request_season: self.api_client.query_match_list(
+                                customer_token,
+                                "leisure",
+                                page=p,
+                                season=request_season,
+                            ),
                         )
                         for offset in range(max(1, int(pages_per_batch)))
                     ]

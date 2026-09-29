@@ -23,6 +23,7 @@ PLAYER_COMPETITIVE_RANK_FETCH_TABLE = "player_competitive_rank_fetch"
 MATCH_LIST_PAGE_CACHE_TABLE = "match_list_page_cache"
 MATCH_META_TABLE = "match_meta"
 MATCH_PLAYER_TABLE = "match_player"
+GROUP_TITLE_TABLE = "group_title"
 OVERALL_RANK_BUCKET_KEY = -1
 SQLITE_BUSY_TIMEOUT_MS = 15_000
 
@@ -489,6 +490,42 @@ class IDPoolDB:
                 except Exception:
                     pass
 
+    def _initialize_group_title_table(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {GROUP_TITLE_TABLE} (
+                bnet_id TEXT NOT NULL,
+                battletag TEXT NOT NULL DEFAULT '',
+                battlenum TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                color TEXT NOT NULL DEFAULT '',
+                created_at TEXT,
+                PRIMARY KEY (bnet_id, title)
+            )
+            """
+        )
+        connection.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{GROUP_TITLE_TABLE}_bnet ON {GROUP_TITLE_TABLE} (bnet_id)"
+        )
+
+    def initialize_group_title_schema(self) -> bool:
+        with self._write_lock:
+            conn = self._get_write_connection()
+            if conn is None:
+                return False
+            try:
+                self._initialize_group_title_table(conn)
+                conn.commit()
+                return True
+            except Exception as exc:
+                self._warn_once(f"match stats sqlite initialize group title schema failed: {type(exc).__name__}: {exc}")
+                return False
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     @staticmethod
     def _escape_like_pattern(text: str) -> str:
         return str(text or "").replace("!", "!!").replace("%", "!%").replace("_", "!_")
@@ -730,6 +767,8 @@ class IDPoolDB:
         try:
             cursor = conn.cursor()
             try:
+                # Ensure the table exists so a missing schema never raises "no such table".
+                self._initialize_group_title_table(conn)
                 cursor.execute(
                     f"""
                     SELECT bnet_id, battletag, battlenum, title, color, {created_at_sql} AS created_at_ts

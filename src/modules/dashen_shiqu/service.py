@@ -858,6 +858,21 @@ async def _call_llm(prompt: str) -> Optional[str]:
 
 # ── 主流程 ──
 
+# shiqu 数据抓取步并发上限。与上游 datamsapi 的 domain 信号量（默认 2）对齐：
+# 模块级 Semaphore 跨所有 shiqu 请求共享，把提交侧并发压在 2，避免无谓地把
+# 远超真实在飞上限（domain=2）的任务塞进队列，也降低抖动期扇出放大雪崩的风险。
+SHIQU_MATCH_CONCURRENCY = int(os.getenv("OVERSTATS_SHIQU_MATCH_CONCURRENCY", "2"))
+_SHIQU_FETCH_SEMAPHORE: "Optional[asyncio.Semaphore]" = None
+
+
+def _shiqu_fetch_semaphore() -> "asyncio.Semaphore":
+    """懒加载模块级并发信号量，绑定到运行中的事件循环，避免启动期创建。"""
+    global _SHIQU_FETCH_SEMAPHORE
+    if _SHIQU_FETCH_SEMAPHORE is None:
+        _SHIQU_FETCH_SEMAPHORE = asyncio.Semaphore(max(1, SHIQU_MATCH_CONCURRENCY))
+    return _SHIQU_FETCH_SEMAPHORE
+
+
 class ShiquModule:
     def __init__(self) -> None:
         self.match_module = dashen_match_module
@@ -869,42 +884,65 @@ class ShiquModule:
     async def _collect_preset_details(
         self, customer_token: str, entries: List[dict], match_count: int
     ) -> List[dict]:
-        """逐条获取对局详情，仅保留预设/6v6 模式。
+        """并发获取对局详情（受模块级 Semaphore 限流），仅保留预设/6v6 模式。
 
         严格复用 overstats 的 DashenMatchModule.query_match_detail：
         内部通过 DashenMatchRequests.get_match_detail 选择 query_match_info /
         fight_query_match_info，并用 render._extract_match_detail_data 提取根数据。
         模式判定优先取详情根数据 gameMode（与原版 _get_match_mode 一致）。
+
+        将原本的串行逐条 await 改为带 Semaphore 的并发 gather（对齐 quick_strength
+        的 match_concurrency 模式）：既提升抓取速度，又通过模块级信号量把全局并发
+        压在 SHIQU_MATCH_CONCURRENCY 以内，避免多查询叠加打满上游共享通道。
         """
-        details: List[dict] = []
-        for e in entries:
-            if len(details) >= match_count:
-                break
+        sem = _shiqu_fetch_semaphore()
+
+        async def _fetch_one(e: Any) -> Optional[dict]:
             if not isinstance(e, dict):
-                continue
+                return None
             match_id = str(e.get("matchId") or "")
             try:
-                detail_output = await self.match_module.query_match_detail(customer_token, e, render=False)
+                async with sem:
+                    detail_output = await self.match_module.query_match_detail(
+                        customer_token, e, render=False
+                    )
             except Exception as exc:
                 logger.warning(f"[shiqu] 拉取对局 {match_id} 详情失败: {exc}")
-                continue
+                return None
             detail = detail_output.detail
             root = _extract_match_detail_data(detail.payload)
             if not self._is_preset_mode(root, detail.source_match):
-                continue
-            details.append({
+                return None
+            return {
                 "match_id": detail.match_id or match_id,
                 "detail": {"data": root},
                 "source_match": detail.source_match,
-            })
+            }
+
+        # 削峰：最多只提交 match_count*3 条，避免网络抖动期一次性扇出全部
+        # entries（可达 100 条）→ 放大 ConnectTimeout 与 60s 冻号雪崩。
+        entries_iter = entries if len(entries) <= match_count * 3 else entries[: match_count * 3]
+        results = await asyncio.gather(
+            *(_fetch_one(e) for e in entries_iter), return_exceptions=True
+        )
+        details: List[dict] = []
+        for r in results:
+            if isinstance(r, dict):
+                details.append(r)
+                if len(details) >= match_count:
+                    break
         return details
 
     async def _enrich_teammate_details(self, details: List[dict], customer_token: str) -> None:
-        """用队友各自 token + 比赛 match_id 重新拉取同局详情，补齐 _heroList。
+        """并发补齐队友多英雄 heroList（受模块级 Semaphore 限流）。
 
+        用队友各自 token + 比赛 match_id 重新拉取同局详情，补齐 _heroList。
         复用 overstats 的 DashenMatchModule.query_match_detail（按 match_id 直查），
         与原版 _fetch_match_by_token_match_id 的意图一致，但走项目内部模块而非 HTTP。
+        改为带 Semaphore 的并发 gather，避免队友数量多时一次性打满上游通道。
         """
+        sem = _shiqu_fetch_semaphore()
+        tasks = []
         for m in details:
             source = m.get("source_match") or {}
             focus_match_id = str(m.get("match_id") or source.get("matchId") or "")
@@ -919,14 +957,29 @@ class ShiquModule:
                 teammate_token = str(p.get("customerToken", "") or "").strip()
                 if not teammate_token:
                     continue
-                try:
-                    detail_output = await self.match_module.query_match_detail(teammate_token, focus_match_id, render=False)
-                    tm_root = _extract_match_detail_data(detail_output.detail.payload)
-                    hl = tm_root.get("heroList") or []
-                    if hl:
-                        p["_heroList"] = hl
-                except Exception as exc:
-                    logger.warning(f"[shiqu] 队友 {p.get('name')} 详情拉取失败: {exc}")
+
+                async def _fetch_teammate(
+                    tok: str = teammate_token,
+                    mid: str = focus_match_id,
+                    peer: dict = p,
+                ) -> None:
+                    try:
+                        async with sem:
+                            detail_output = await self.match_module.query_match_detail(
+                                tok, mid, render=False
+                            )
+                        tm_root = _extract_match_detail_data(detail_output.detail.payload)
+                        hl = tm_root.get("heroList") or []
+                        if hl:
+                            peer["_heroList"] = hl
+                    except Exception as exc:
+                        logger.warning(
+                            f"[shiqu] 队友 {peer.get('name')} 详情拉取失败: {exc}"
+                        )
+
+                tasks.append(_fetch_teammate())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     @staticmethod
     def _build_list_key(preset_ids: Sequence[str]) -> str:

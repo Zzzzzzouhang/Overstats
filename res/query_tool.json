@@ -1,7 +1,7 @@
 {
   "antiCrawlerConfig": {
     "enabled": false,
-    "searchEnabled": true,
+    "searchEnabled": false,
     "minEndorsementLevel": 1,
     "minGameTimeMinutes": 300,
     "recentDays": 5,
@@ -90,7 +90,7 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "新英雄血律正在适配中，请耐心等待！",
+  "noticeMessage": "搜索接口暂时维护中！",
   "pcNoticeMessage": {
     "sport": "",
     "leisure": "",

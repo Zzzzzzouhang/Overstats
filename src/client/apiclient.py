@@ -1233,7 +1233,15 @@ class DashenAPIClient:
     ) -> Any:
         _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
         try:
-            return await self._request_payload_inner(method, url, use_proxy=use_proxy, credential=credential, auth_dts_override=auth_dts_override, **kwargs)
+            return await self._request_payload_inner(
+                method,
+                url,
+                use_proxy=use_proxy,
+                credential=credential,
+                auth_dts_override=auth_dts_override,
+                raise_on_http_error=raise_on_http_error,
+                **kwargs,
+            )
         finally:
             _upstream_call_label_var.reset(_lbl_tok)
 
@@ -1245,6 +1253,7 @@ class DashenAPIClient:
         use_proxy: bool = False,
         credential: Optional[DashenCredential] = None,
         auth_dts_override: Optional[int] = None,
+        raise_on_http_error: bool = False,
         **kwargs: Any,
     ) -> Any:
         client = self.proxy_client if use_proxy else self.netease_client

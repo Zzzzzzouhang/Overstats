@@ -1228,6 +1228,7 @@ class DashenAPIClient:
         use_proxy: bool = False,
         credential: Optional[DashenCredential] = None,
         auth_dts_override: Optional[int] = None,
+        raise_on_http_error: bool = False,
         **kwargs: Any,
     ) -> Any:
         _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
@@ -1294,6 +1295,8 @@ class DashenAPIClient:
         upstream_success = _is_successful_upstream_payload(response.status_code, payload)
         request_url = str(response.request.url)
         await self._record_upstream_metric(request_url, upstream_success)
+        if raise_on_http_error:
+            response.raise_for_status()
         if upstream_success:
             await self._record_player_identity_payload(request_url, payload)
             await self._record_match_detail_payload(request_url, payload)
@@ -1316,8 +1319,10 @@ class DashenAPIClient:
         finally:
             _upstream_call_label_var.reset(_lbl_tok)
 
-    async def search_bnet_account(self, bnet: str) -> Dict[str, Any]:
-        credential = self._select_credential()
+    async def search_bnet_account(
+        self, bnet: str, *, credential: Optional[DashenCredential] = None
+    ) -> Dict[str, Any]:
+        credential = credential if credential is not None else self._select_credential()
         payload = {
             "token": credential.token,
             "roleId": credential.role_id,
@@ -1329,6 +1334,7 @@ class DashenAPIClient:
             "POST",
             SEARCH_BNET_ACCOUNT_URL,
             credential=credential,
+            raise_on_http_error=True,
             json=payload,
             timeout=SEARCH_BNET_ACCOUNT_TIMEOUT,
         )

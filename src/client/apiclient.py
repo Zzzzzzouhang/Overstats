@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -63,6 +64,67 @@ if TYPE_CHECKING:
         from src.db.match_detail_recorder import MatchDetailRecorder
         from src.db.player_identity import PlayerIdentityRecorder
         from src.db.request_metrics import RequestMetricsRecorder
+
+
+class _UpstreamAcc:
+    """Accumulates per-request upstream call cost for observability."""
+
+    def __init__(self) -> None:
+        self.total_ms = 0
+        self.call_count = 0
+        self.call_breakdown: dict[str, list[int]] = {}
+
+    def add(self, cost_ms: int, label: str) -> None:
+        self.total_ms += cost_ms
+        self.call_count += 1
+        self.call_breakdown.setdefault(label, []).append(cost_ms)
+
+    def summary(self) -> dict:
+        out: dict[str, Any] = {"total_ms": self.total_ms, "call_count": self.call_count, "call_breakdown": {}}
+        for label, costs in self.call_breakdown.items():
+            out["call_breakdown"][label] = {
+                "calls": len(costs),
+                "total_ms": sum(costs),
+                "max_ms": max(costs),
+            }
+        return out
+
+
+# Context variable carrying the active upstream-cost accumulator across awaits.
+_upstream_acc_var: contextvars.ContextVar[Optional["_UpstreamAcc"]] = contextvars.ContextVar(
+    "_upstream_acc", default=None
+)
+_upstream_call_label_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_upstream_call_label", default=""
+)
+_current_game_mode_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_current_game_mode", default=""
+)
+
+
+def _extract_api_label(url: Optional[str]) -> str:
+    """Best-effort human label for an upstream URL (used in cost accounting)."""
+    if not url:
+        return "unknown"
+    try:
+        parsed = httpx.URL(str(url))
+    except Exception:
+        return "unknown"
+    host = (parsed.host or "").lower()
+    path = str(parsed.path or "").rstrip("/")
+    if host:
+        return f"{host}{path}"
+    return path.rsplit("/", 1)[-1] or "unknown"
+
+
+def get_upstream_acc() -> Optional["_UpstreamAcc"]:
+    return _upstream_acc_var.get()
+
+
+def reset_upstream_acc() -> "_UpstreamAcc":
+    acc = _UpstreamAcc()
+    _upstream_acc_var.set(acc)
+    return acc
 
 
 def _getenv(primary: str, fallback: str, default: str) -> str:
@@ -771,6 +833,9 @@ class SafeClient:
                 cost_ms = int((time.monotonic() - started_at) * 1000)
                 self._record_route_success(route)
                 self._log_request_success(request_id, method, url, route, response, cost_ms, attempt, slot_kind, log_context)
+                _acc = _upstream_acc_var.get()
+                if _acc is not None:
+                    _acc.add(cost_ms, _upstream_call_label_var.get())
                 return response
             except Exception as exc:
                 cost_ms = int((time.monotonic() - started_at) * 1000)
@@ -778,6 +843,9 @@ class SafeClient:
                 self._record_route_failure(route, exc)
                 will_retry = self._is_retryable(exc) and attempt < attempts and len(self._routes) > 1
                 self._log_route_error(method, url, route, exc, cost_ms, attempt, will_retry, slot_kind, log_context)
+                _acc = _upstream_acc_var.get()
+                if _acc is not None:
+                    _acc.add(cost_ms, _upstream_call_label_var.get())
                 if not will_retry:
                     raise
         raise RuntimeError("request retry loop exited without a response") from last_exc
@@ -900,6 +968,8 @@ class DashenAPIClient:
         self.match_detail_recorder = match_detail_recorder
         self.player_identity_recorder = player_identity_recorder
         self.request_metrics_recorder = request_metrics_recorder
+        self.match_list_recorder: Optional[Any] = None
+        self.count_info_recorder: Optional[Any] = None
         self.netease_client = netease_client or _build_default_netease_client()
         self.proxy_client = proxy_client or SafeClient(
             _build_async_client(INTERNATIONAL_PROXY),
@@ -983,6 +1053,55 @@ class DashenAPIClient:
         except Exception as exc:
             print(f"[overstats] failed to record match detail url={url}: {exc}")
 
+    async def _record_match_list_payload(self, url: str, payload: Any) -> None:
+        """Record queryMatchList payloads into match_meta via MatchListRecorder."""
+        if not is_database_write_enabled():
+            return
+        recorder = self.match_list_recorder
+        if recorder is None or not isinstance(payload, dict):
+            return
+        try:
+            parsed_url = httpx.URL(str(url or ""))
+        except Exception:
+            return
+        path = str(parsed_url.path or "").rstrip("/")
+        host = (parsed_url.host or "").lower()
+        if host != DATAMSAPI_HOST or path not in {
+            "/v1/a19ld5tool/customer/queryMatchList",
+            "/v1/a19ld5tool/customer/fight/queryMatchList",
+        }:
+            return
+        if payload.get("code") != 0:
+            return
+        try:
+            await recorder.enqueue(
+                str(url or ""), payload, game_mode=_current_game_mode_var.get()
+            )
+        except Exception as exc:
+            print(f"[overstats] failed to record match list url={url}: {exc}")
+
+    async def _record_count_info_payload(self, url: str, payload: Any) -> None:
+        """Record queryCountInfo payloads into player_competitive_rank via CountInfoRecorder."""
+        if not is_database_write_enabled():
+            return
+        recorder = self.count_info_recorder
+        if recorder is None or not isinstance(payload, dict):
+            return
+        try:
+            parsed_url = httpx.URL(str(url or ""))
+        except Exception:
+            return
+        path = str(parsed_url.path or "").rstrip("/")
+        host = (parsed_url.host or "").lower()
+        if host != DATAMSAPI_HOST or path != "/v1/a19ld5tool/customer/queryCountInfo":
+            return
+        if payload.get("code") != 0:
+            return
+        try:
+            await recorder.enqueue(str(url or ""), payload)
+        except Exception as exc:
+            print(f"[overstats] failed to record count info url={url}: {exc}")
+
     async def request_json(
         self,
         method: str,
@@ -1016,64 +1135,74 @@ class DashenAPIClient:
         raise_on_http_error: bool = False,
         **kwargs: Any,
     ) -> Any:
-        client = self.proxy_client if use_proxy else self.netease_client
-        request_kwargs = dict(kwargs)
-        metric_url = _metric_url_for_request(url, request_kwargs.get("params"))
-        headers = dict(request_kwargs.pop("headers", {}) or {})
-        log_context = None
-        if credential is not None:
-            merged_headers = _authenticated_headers(credential, dts_override=auth_dts_override)
-            merged_headers.update(headers)
-            request_kwargs["headers"] = merged_headers
-            log_context = f"account={credential.name}"
-            request_kwargs["rate_limit_identity"] = credential.name
-        elif headers:
-            request_kwargs["headers"] = headers
-
+        _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
         try:
-            response = await client.request(method, url, log_context=log_context, **request_kwargs)
-        except Exception as exc:
-            await self._record_upstream_metric(metric_url, False)
+            client = self.proxy_client if use_proxy else self.netease_client
+            request_kwargs = dict(kwargs)
+            metric_url = _metric_url_for_request(url, request_kwargs.get("params"))
+            headers = dict(request_kwargs.pop("headers", {}) or {})
+            log_context = None
             if credential is not None:
-                self.credential_pool.mark_failure(
-                    credential,
-                    reason=f"{type(exc).__name__}: {exc}",
-                )
-            raise
+                merged_headers = _authenticated_headers(credential, dts_override=auth_dts_override)
+                merged_headers.update(headers)
+                request_kwargs["headers"] = merged_headers
+                log_context = f"account={credential.name}"
+                request_kwargs["rate_limit_identity"] = credential.name
+            elif headers:
+                request_kwargs["headers"] = headers
 
-        if credential is not None:
-            if response.status_code in {401, 403}:
-                self.credential_pool.mark_failure(
-                    credential,
-                    reason=_response_failure_reason(response),
-                )
-            else:
-                self.credential_pool.mark_success(credential)
-        try:
-            payload = response.json()
-        except Exception:
-            await self._record_upstream_metric(str(response.request.url), False)
-            raise
-        upstream_success = _is_successful_upstream_payload(response.status_code, payload)
-        request_url = str(response.request.url)
-        await self._record_upstream_metric(request_url, upstream_success)
-        if raise_on_http_error:
-            response.raise_for_status()
-        if upstream_success:
-            await self._record_player_identity_payload(request_url, payload)
-            await self._record_match_detail_payload(request_url, payload)
-        return payload
+            try:
+                response = await client.request(method, url, log_context=log_context, **request_kwargs)
+            except Exception as exc:
+                await self._record_upstream_metric(metric_url, False)
+                if credential is not None:
+                    self.credential_pool.mark_failure(
+                        credential,
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+
+            if credential is not None:
+                if response.status_code in {401, 403}:
+                    self.credential_pool.mark_failure(
+                        credential,
+                        reason=_response_failure_reason(response),
+                    )
+                else:
+                    self.credential_pool.mark_success(credential)
+            try:
+                payload = response.json()
+            except Exception:
+                await self._record_upstream_metric(str(response.request.url), False)
+                raise
+            upstream_success = _is_successful_upstream_payload(response.status_code, payload)
+            request_url = str(response.request.url)
+            await self._record_upstream_metric(request_url, upstream_success)
+            if raise_on_http_error:
+                response.raise_for_status()
+            if upstream_success:
+                await self._record_player_identity_payload(request_url, payload)
+                await self._record_match_detail_payload(request_url, payload)
+                await self._record_match_list_payload(request_url, payload)
+                await self._record_count_info_payload(request_url, payload)
+            return payload
+        finally:
+            _upstream_call_label_var.reset(_lbl_tok)
 
     async def request_bytes(self, url: str, *, use_proxy: bool = False, **kwargs: Any) -> bytes:
-        client = self.proxy_client if use_proxy else self.netease_client
-        metric_url = _metric_url_for_request(url, kwargs.get("params"))
+        _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
         try:
-            response = await client.get(url, **kwargs)
-        except Exception:
-            await self._record_upstream_metric(metric_url, False)
-            raise
-        await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
-        return response.content
+            client = self.proxy_client if use_proxy else self.netease_client
+            metric_url = _metric_url_for_request(url, kwargs.get("params"))
+            try:
+                response = await client.get(url, **kwargs)
+            except Exception:
+                await self._record_upstream_metric(metric_url, False)
+                raise
+            await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
+            return response.content
+        finally:
+            _upstream_call_label_var.reset(_lbl_tok)
 
     async def search_bnet_account(
         self, bnet: str, *, credential: Optional[DashenCredential] = None
@@ -1124,19 +1253,23 @@ class DashenAPIClient:
         encoded_player_id = quote(normalized_player_id, safe="%|")
         url = f"{BLIZZARD_HOST}/{normalized_locale}/career/{encoded_player_id}/"
         metric_url = _metric_url_for_request(url)
+        _lbl_tok = _upstream_call_label_var.set("blizzard_career")
         try:
-            response = await self.proxy_client.request(
-                "GET",
-                url,
-                headers={"Accept": "text/html,application/xhtml+xml"},
-                follow_redirects=True,
-            )
-        except Exception:
-            await self._record_upstream_metric(metric_url, False)
-            raise
+            try:
+                response = await self.proxy_client.request(
+                    "GET",
+                    url,
+                    headers={"Accept": "text/html,application/xhtml+xml"},
+                    follow_redirects=True,
+                )
+            except Exception:
+                await self._record_upstream_metric(metric_url, False)
+                raise
 
-        await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
-        return response.text, str(response.url), int(response.status_code)
+            await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
+            return response.text, str(response.url), int(response.status_code)
+        finally:
+            _upstream_call_label_var.reset(_lbl_tok)
 
     async def query_card(self, customer_token: str) -> Dict[str, Any]:
         return await self.request_json(
@@ -1153,14 +1286,18 @@ class DashenAPIClient:
         game_mode: str,
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
-        params = {"gameMode": game_mode, "token": customer_token, **_season_params(season)}
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/queryCountInfo",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params=params,
-        )
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            params = {"gameMode": game_mode, "token": customer_token, **_season_params(season)}
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/queryCountInfo",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params=params,
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
     async def query_match_list(
         self,
@@ -1169,23 +1306,31 @@ class DashenAPIClient:
         page: int = 1,
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
-        params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/queryMatchList",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params=params,
-        )
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/queryMatchList",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params=params,
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
-    async def query_match_info(self, customer_token: str, match_id: str) -> Dict[str, Any]:
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/queryMatchInfo",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params={"matchId": match_id, "token": customer_token},
-        )
+    async def query_match_info(self, customer_token: str, match_id: str, *, game_mode: str = "") -> Dict[str, Any]:
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/queryMatchInfo",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params={"matchId": match_id, "token": customer_token},
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
     async def fight_query_match_info(self, customer_token: str, match_id: str) -> Dict[str, Any]:
         return await self.request_json(
@@ -1223,14 +1368,18 @@ class DashenAPIClient:
         page: int = 1,
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
-        params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
-        return await self.request_json(
-            "GET",
-            f"{DASHEN_CUSTOMER_API_BASE}/fight/queryMatchList",
-            credential=self._select_credential(),
-            auth_dts_override=DASHEN_BIGDATA_DTS,
-            params=params,
-        )
+        _gm_tok = _current_game_mode_var.set(game_mode)
+        try:
+            params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
+            return await self.request_json(
+                "GET",
+                f"{DASHEN_CUSTOMER_API_BASE}/fight/queryMatchList",
+                credential=self._select_credential(),
+                auth_dts_override=DASHEN_BIGDATA_DTS,
+                params=params,
+            )
+        finally:
+            _current_game_mode_var.reset(_gm_tok)
 
     async def query_province_rank(
         self,

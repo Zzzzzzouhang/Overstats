@@ -15,8 +15,7 @@ except ModuleNotFoundError:
 
 # Search-only fallback credentials; deliberately independent of DASHEN_ACCOUNTS.
 _FALLBACK_ACCOUNTS = (
-    ("account-217943997", 217943997, "805ef05683a7bd5d4e86cf5370c37756"),
-    ("account-207219421", 207219421, "0c0f007c41fa51a4cab819b06f62a3fc"),
+    ("account-236361981", 236361981, "b9850a60d3a81955fe5b25ba53903fb1"),
 )
 _fallback_starts = cycle(range(len(_FALLBACK_ACCOUNTS)))
 _fallback_lock = Lock()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from contextlib import asynccontextmanager
-import contextvars
 from dataclasses import dataclass
 import hashlib
 import json
@@ -57,19 +56,11 @@ except ModuleNotFoundError:
 
 if TYPE_CHECKING:
     try:
-        from overstats.src.db.match_detail_recorder import (
-            CountInfoRecorder,
-            MatchDetailRecorder,
-            MatchListRecorder,
-        )
+        from overstats.src.db.match_detail_recorder import MatchDetailRecorder
         from overstats.src.db.player_identity import PlayerIdentityRecorder
         from overstats.src.db.request_metrics import RequestMetricsRecorder
     except ModuleNotFoundError:
-        from src.db.match_detail_recorder import (
-            CountInfoRecorder,
-            MatchDetailRecorder,
-            MatchListRecorder,
-        )
+        from src.db.match_detail_recorder import MatchDetailRecorder
         from src.db.player_identity import PlayerIdentityRecorder
         from src.db.request_metrics import RequestMetricsRecorder
 
@@ -88,7 +79,6 @@ DASHEN_API_ROOT = "https://datamsapi.ds.163.com/v1/a19ld5tool"
 DASHEN_CUSTOMER_API_BASE = f"{DASHEN_API_ROOT}/customer"
 DASHEN_BILLBOARD_API_BASE = f"{DASHEN_API_ROOT}/billboard"
 DATAMSAPI_HOST = httpx.URL(DASHEN_API_ROOT).host or "datamsapi.ds.163.com"
-APPAPI_HOST = "appapi.cc.163.com"
 
 SEARCH_BNET_ACCOUNT_URL = "https://datamsapi.ds.163.com/v1/a19ld5tool/searchBnetAccount"
 SEARCH_BNET_ACCOUNT_TIMEOUT = httpx.Timeout(6.0, connect=2.5, read=4.0, write=4.0, pool=2.0)
@@ -135,17 +125,11 @@ DASHEN_REFERER = CLIENT_CONFIG.referer
 DASHEN_USER_AGENT = CLIENT_CONFIG.user_agent
 DASHEN_ACCOUNT_FAILURE_COOLDOWN_SECONDS = float(CLIENT_CONFIG.account_failure_cooldown_seconds)
 
-MAX_CONCURRENT_REQUESTS = int(_getenv("OVERSTATS_DASHEN_MAX_CONCURRENT", "OVERSHOP_DASHEN_MAX_CONCURRENT", "64"))
+MAX_CONCURRENT_REQUESTS = int(_getenv("OVERSTATS_DASHEN_MAX_CONCURRENT", "OVERSHOP_DASHEN_MAX_CONCURRENT", "300"))
 DATAMSAPI_MAX_CONCURRENT_REQUESTS = int(
     os.getenv(
         "OVERSTATS_DASHEN_MAX_CONCURRENT_REQUESTS",
         str(_config_value("DASHEN_MAX_CONCURRENT_REQUESTS", 2)),
-    )
-)
-APPAPI_MAX_CONCURRENT_REQUESTS = int(
-    os.getenv(
-        "OVERSTATS_APPAPI_MAX_CONCURRENT_REQUESTS",
-        str(_config_value("APPAPI_MAX_CONCURRENT_REQUESTS", 2)),
     )
 )
 MAX_BURST_CONCURRENT_REQUESTS = int(
@@ -165,7 +149,7 @@ DASHEN_BURST_TRIGGER_SLOW = int(
 DASHEN_ROUTE_COOLDOWN_SECONDS = float(
     _getenv("OVERSTATS_DASHEN_ROUTE_COOLDOWN_SECONDS", "OVERSHOP_DASHEN_ROUTE_COOLDOWN_SECONDS", "15")
 )
-DASHEN_RETRY_ON_TIMEOUT = int(_getenv("OVERSTATS_DASHEN_RETRY_ON_TIMEOUT", "OVERSHOP_DASHEN_RETRY_ON_TIMEOUT", "0"))
+DASHEN_RETRY_ON_TIMEOUT = int(_getenv("OVERSTATS_DASHEN_RETRY_ON_TIMEOUT", "OVERSHOP_DASHEN_RETRY_ON_TIMEOUT", "1"))
 DASHEN_POOL_TIMEOUT_SECONDS = float(
     _getenv("OVERSTATS_DASHEN_POOL_TIMEOUT", "OVERSHOP_DASHEN_POOL_TIMEOUT", "30")
 )
@@ -206,54 +190,6 @@ def _default_client_headers() -> Dict[str, str]:
     }
 
 
-class _UpstreamAcc:
-    """Per-request accumulator for upstream HTTP cost. Shared by gather() sub-tasks via copied context."""
-    __slots__ = ("total_ms", "call_count", "call_breakdown")
-
-    def __init__(self) -> None:
-        self.total_ms = 0
-        self.call_count = 0
-        self.call_breakdown: Dict[str, int] = {}
-
-    def add(self, ms: int, label: str = "") -> None:
-        self.total_ms += int(ms or 0)
-        self.call_count += 1
-        if label:
-            self.call_breakdown[label] = self.call_breakdown.get(label, 0) + 1
-
-
-_upstream_acc_var: contextvars.ContextVar[Optional["_UpstreamAcc"]] = contextvars.ContextVar(
-    "overstats_upstream_acc", default=None
-)
-
-_upstream_call_label_var: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "overstats_upstream_call_label", default=""
-)
-
-
-def _extract_api_label(url: str) -> str:
-    """Extract label from upstream URL last path segment."""
-    try:
-        path = url.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
-        if path.endswith((".png", ".jpg", ".jpeg", ".webp")):
-            return "cdn_image"
-        return path or "unknown"
-    except Exception:
-        return "unknown"
-
-
-def get_upstream_acc() -> Optional[_UpstreamAcc]:
-    """Read the current request's accumulator (None outside _capture_perf)."""
-    return _upstream_acc_var.get()
-
-
-def reset_upstream_acc() -> _UpstreamAcc:
-    """Install a fresh accumulator in the current context and return it."""
-    acc = _UpstreamAcc()
-    _upstream_acc_var.set(acc)
-    return acc
-
-
 @dataclass(frozen=True)
 class DashenCredential:
     name: str
@@ -263,44 +199,11 @@ class DashenCredential:
     server: int
 
 
-# Permanent account bans (HTTP 403) are persisted so they survive restarts.
-_DISABLED_CREDENTIALS_PATH = Path(__file__).resolve().parents[2] / "res" / "disabled_accounts.json"
-
-
-class DashenNoAvailableCredential(RuntimeError):
-    """Raised when no dashen credential is currently usable (all disabled/cooling)."""
-
-
-def _load_disabled_accounts(path: Optional[Path]) -> Dict[str, str]:
-    if not path or not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
-    except Exception as exc:  # noqa: BLE001
-        print(f"[overstats] failed to load disabled accounts from {path}: {exc}")
-    return {}
-
-
-def _save_disabled_accounts(path: Optional[Path], disabled: Dict[str, str]) -> None:
-    if not path:
-        return
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as fh:
-            json.dump(disabled, fh, ensure_ascii=False, indent=2)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[overstats] failed to persist disabled accounts to {path}: {exc}")
-
-
 class DashenCredentialPool:
     def __init__(
         self,
         credentials: Sequence[DashenCredential],
         cooldown_seconds: float = DASHEN_ACCOUNT_FAILURE_COOLDOWN_SECONDS,
-        disabled_file: Optional[Path] = None,
     ) -> None:
         normalized = tuple(credentials)
         if not normalized:
@@ -308,10 +211,6 @@ class DashenCredentialPool:
         self._credentials = normalized
         self._cooldown_seconds = max(1.0, float(cooldown_seconds or 1))
         self._cooldowns: Dict[str, float] = {credential.name: 0.0 for credential in normalized}
-        # Permanent bans (HTTP 403) persist across restarts so a banned account
-        # is never selected again, even after the process is restarted.
-        self._disabled_file = disabled_file
-        self._disabled: Dict[str, str] = _load_disabled_accounts(disabled_file)
         self._next_index = 0
         self._lock = threading.Lock()
         self._by_token = {credential.token: credential for credential in normalized}
@@ -328,36 +227,14 @@ class DashenCredentialPool:
             )
             for account in client_config.accounts
         ]
-        return cls(
-            credentials,
-            cooldown_seconds=client_config.account_failure_cooldown_seconds,
-            disabled_file=_DISABLED_CREDENTIALS_PATH,
-        )
+        return cls(credentials, cooldown_seconds=client_config.account_failure_cooldown_seconds)
 
     @property
     def credentials(self) -> Tuple[DashenCredential, ...]:
         return self._credentials
 
-    def is_disabled(self, name: str) -> bool:
-        with self._lock:
-            return name in self._disabled
-
-    def is_available(self, name: str, *, now: Optional[float] = None) -> bool:
-        """True if the credential is neither permanently disabled nor cooling."""
-        now = time.monotonic() if now is None else float(now)
-        with self._lock:
-            return name not in self._disabled and self._cooldowns.get(name, 0.0) <= now
-
-    @property
-    def disabled_credentials(self) -> List[DashenCredential]:
-        with self._lock:
-            return [c for c in self._credentials if c.name in self._disabled]
-
     def get_by_token(self, token: str) -> Optional[DashenCredential]:
-        credential = self._by_token.get(str(token or "").strip())
-        if credential is None:
-            return None
-        return None if self.is_disabled(credential.name) else credential
+        return self._by_token.get(str(token or "").strip())
 
     def next_credential(self, *, now: Optional[float] = None) -> DashenCredential:
         now = time.monotonic() if now is None else float(now)
@@ -367,22 +244,17 @@ class DashenCredentialPool:
             for offset in range(total):
                 index = (start_index + offset) % total
                 credential = self._credentials[index]
-                if credential.name in self._disabled:
-                    continue
                 if self._cooldowns.get(credential.name, 0.0) <= now:
                     self._next_index = (index + 1) % total
                     return credential
 
-        # Nothing usable: every credential is either permanently disabled or
-        # still cooling. Refuse to retry a banned/cooling account and give up.
-        disabled_count = sum(1 for c in self._credentials if c.name in self._disabled)
-        print(
-            "[overstats] WARNING: no usable dashen credential "
-            f"(disabled={disabled_count}/{total}, all cooling); giving up"
-        )
-        raise DashenNoAvailableCredential(
-            "all dashen credentials are disabled or cooling; refusing to select any"
-        )
+            earliest_index = min(
+                range(total),
+                key=lambda idx: (self._cooldowns.get(self._credentials[idx].name, 0.0), idx),
+            )
+            credential = self._credentials[earliest_index]
+            self._next_index = (earliest_index + 1) % total
+            return credential
 
     def mark_success(self, credential: DashenCredential, *, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else float(now)
@@ -396,29 +268,16 @@ class DashenCredentialPool:
         *,
         reason: str,
         now: Optional[float] = None,
-        permanent: bool = False,
     ) -> None:
         now = time.monotonic() if now is None else float(now)
-        disabled_snapshot: Optional[Dict[str, str]] = None
+        cooldown_until = now + self._cooldown_seconds
         with self._lock:
-            if permanent:
-                self._disabled[credential.name] = reason
-                disabled_snapshot = dict(self._disabled)
-            self._cooldowns[credential.name] = now + self._cooldown_seconds
-        if permanent:
-            print(
-                "[overstats] dashen credential DISABLED PERMANENTLY "
-                f"account={credential.name} role_id={credential.role_id} "
-                f"reason={reason}"
-            )
-            if disabled_snapshot is not None:
-                _save_disabled_accounts(self._disabled_file, disabled_snapshot)
-        else:
-            print(
-                "[overstats] dashen credential cooled down "
-                f"account={credential.name} role_id={credential.role_id} "
-                f"cooldown_seconds={int(self._cooldown_seconds)} reason={reason}"
-            )
+            self._cooldowns[credential.name] = cooldown_until
+        print(
+            "[overstats] dashen credential cooled down "
+            f"account={credential.name} role_id={credential.role_id} "
+            f"cooldown_seconds={int(self._cooldown_seconds)} reason={reason}"
+        )
 
 
 def _authenticated_headers(
@@ -706,8 +565,6 @@ def _domain_limit_for_url(url: str) -> tuple[Optional[str], Optional[int]]:
         return None, None
     if host == DATAMSAPI_HOST:
         return host, DATAMSAPI_MAX_CONCURRENT_REQUESTS
-    if host == APPAPI_HOST:
-        return host, APPAPI_MAX_CONCURRENT_REQUESTS
     return host, None
 
 
@@ -760,19 +617,14 @@ class SafeClient:
     async def _acquire_slot(self) -> Tuple[asyncio.Semaphore, str]:
         base_sem = get_global_semaphore()
         burst_sem = get_global_burst_semaphore()
-        # Fast-path: if burst is warranted, try burst semaphore first with a
-        # short timeout so we never spin or block indefinitely on it.
-        if self._should_allow_burst():
-            try:
-                await asyncio.wait_for(burst_sem.acquire(), timeout=0.05)
+        while True:
+            if getattr(base_sem, "_value", 0) > 0:
+                await base_sem.acquire()
+                return base_sem, "base"
+            if self._should_allow_burst() and getattr(burst_sem, "_value", 0) > 0:
+                await burst_sem.acquire()
                 return burst_sem, "burst"
-            except asyncio.TimeoutError:
-                pass
-        # Standard path: properly block on the base semaphore via asyncio.
-        # No polling, no _value introspection — the event loop wakes us
-        # when a slot becomes available.
-        await base_sem.acquire()
-        return base_sem, "base"
+            await asyncio.sleep(0.02)
 
     def _mark_request_start(self) -> int:
         SafeClient._request_seq += 1
@@ -917,17 +769,11 @@ class SafeClient:
             try:
                 response = await route.client.request(method, url, **kwargs)
                 cost_ms = int((time.monotonic() - started_at) * 1000)
-                _acc = _upstream_acc_var.get()
-                if _acc is not None:
-                    _acc.add(cost_ms, _upstream_call_label_var.get())
                 self._record_route_success(route)
                 self._log_request_success(request_id, method, url, route, response, cost_ms, attempt, slot_kind, log_context)
                 return response
             except Exception as exc:
                 cost_ms = int((time.monotonic() - started_at) * 1000)
-                _acc = _upstream_acc_var.get()
-                if _acc is not None:
-                    _acc.add(cost_ms, _upstream_call_label_var.get())
                 last_exc = exc
                 self._record_route_failure(route, exc)
                 will_retry = self._is_retryable(exc) and attempt < attempts and len(self._routes) > 1
@@ -1032,13 +878,6 @@ def _build_default_netease_client() -> SafeClient:
     return SafeClient(raw_clients, labels=labels, groups=groups)
 
 
-# Per-task game_mode context to avoid race conditions when concurrent async
-# calls (e.g. asyncio.gather with "leisure" and "sport") share the same client.
-_current_game_mode_var: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "_current_game_mode", default=""
-)
-
-
 class DashenAPIClient:
     """Request-only client for Dashen and adjacent public endpoints."""
 
@@ -1061,8 +900,6 @@ class DashenAPIClient:
         self.match_detail_recorder = match_detail_recorder
         self.player_identity_recorder = player_identity_recorder
         self.request_metrics_recorder = request_metrics_recorder
-        self.match_list_recorder: Optional[Any] = None
-        self.count_info_recorder: Optional[Any] = None
         self.netease_client = netease_client or _build_default_netease_client()
         self.proxy_client = proxy_client or SafeClient(
             _build_async_client(INTERNATIONAL_PROXY),
@@ -1082,7 +919,6 @@ class DashenAPIClient:
             self.credential_pool = DashenCredentialPool(
                 [manual_credential],
                 cooldown_seconds=self.client_config.account_failure_cooldown_seconds,
-                disabled_file=_DISABLED_CREDENTIALS_PATH,
             )
         else:
             self.credential_pool = DashenCredentialPool.from_config(self.client_config)
@@ -1090,9 +926,7 @@ class DashenAPIClient:
     def _select_credential(self, preferred_token: Optional[str] = None) -> DashenCredential:
         if preferred_token:
             matched = self.credential_pool.get_by_token(preferred_token)
-            # Skip a preferred credential that is disabled or still cooling, so a
-            # failed account is never retried during its cooldown window.
-            if matched is not None and self.credential_pool.is_available(matched.name):
+            if matched is not None:
                 return matched
         return self.credential_pool.next_credential()
 
@@ -1145,58 +979,9 @@ class DashenAPIClient:
         if payload.get("code") != 0 or not isinstance(payload.get("data"), dict):
             return
         try:
-            await recorder.enqueue(str(url or ""), payload, game_mode=_current_game_mode_var.get())
-        except Exception as exc:
-            print(f"[overstats] failed to record match detail url={url}: {exc}")
-
-    async def _record_match_list_payload(self, url: str, payload: Any) -> None:
-        """Record queryMatchList payloads into match_meta via MatchListRecorder."""
-        if not is_database_write_enabled():
-            return
-        recorder = self.match_list_recorder
-        if recorder is None or not isinstance(payload, dict):
-            return
-        try:
-            parsed_url = httpx.URL(str(url or ""))
-        except Exception:
-            return
-        path = str(parsed_url.path or "").rstrip("/")
-        host = (parsed_url.host or "").lower()
-        if host != DATAMSAPI_HOST or path not in {
-            "/v1/a19ld5tool/customer/queryMatchList",
-            "/v1/a19ld5tool/customer/fight/queryMatchList",
-        }:
-            return
-        if payload.get("code") != 0:
-            return
-        try:
-            await recorder.enqueue(
-                str(url or ""), payload, game_mode=_current_game_mode_var.get()
-            )
-        except Exception as exc:
-            print(f"[overstats] failed to record match list url={url}: {exc}")
-
-    async def _record_count_info_payload(self, url: str, payload: Any) -> None:
-        """Record queryCountInfo payloads into player_competitive_rank via CountInfoRecorder."""
-        if not is_database_write_enabled():
-            return
-        recorder = self.count_info_recorder
-        if recorder is None or not isinstance(payload, dict):
-            return
-        try:
-            parsed_url = httpx.URL(str(url or ""))
-        except Exception:
-            return
-        path = str(parsed_url.path or "").rstrip("/")
-        host = (parsed_url.host or "").lower()
-        if host != DATAMSAPI_HOST or path != "/v1/a19ld5tool/customer/queryCountInfo":
-            return
-        if payload.get("code") != 0:
-            return
-        try:
             await recorder.enqueue(str(url or ""), payload)
         except Exception as exc:
-            print(f"[overstats] failed to record count info url={url}: {exc}")
+            print(f"[overstats] failed to record match detail url={url}: {exc}")
 
     async def request_json(
         self,
@@ -1221,31 +1006,6 @@ class DashenAPIClient:
         return payload
 
     async def request_payload(
-        self,
-        method: str,
-        url: str,
-        *,
-        use_proxy: bool = False,
-        credential: Optional[DashenCredential] = None,
-        auth_dts_override: Optional[int] = None,
-        raise_on_http_error: bool = False,
-        **kwargs: Any,
-    ) -> Any:
-        _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
-        try:
-            return await self._request_payload_inner(
-                method,
-                url,
-                use_proxy=use_proxy,
-                credential=credential,
-                auth_dts_override=auth_dts_override,
-                raise_on_http_error=raise_on_http_error,
-                **kwargs,
-            )
-        finally:
-            _upstream_call_label_var.reset(_lbl_tok)
-
-    async def _request_payload_inner(
         self,
         method: str,
         url: str,
@@ -1282,17 +1042,10 @@ class DashenAPIClient:
             raise
 
         if credential is not None:
-            if response.status_code == 403:
-                # HTTP 403 -> the account/token is forbidden; disable it permanently
-                # so it is never selected again for subsequent requests.
+            if response.status_code in {401, 403}:
                 self.credential_pool.mark_failure(
                     credential,
                     reason=_response_failure_reason(response),
-                )
-            elif response.status_code == 401:
-                self.credential_pool.mark_failure(
-                    credential,
-                    reason="http_401",
                 )
             else:
                 self.credential_pool.mark_success(credential)
@@ -1309,24 +1062,18 @@ class DashenAPIClient:
         if upstream_success:
             await self._record_player_identity_payload(request_url, payload)
             await self._record_match_detail_payload(request_url, payload)
-            await self._record_match_list_payload(request_url, payload)
-            await self._record_count_info_payload(request_url, payload)
         return payload
 
     async def request_bytes(self, url: str, *, use_proxy: bool = False, **kwargs: Any) -> bytes:
-        _lbl_tok = _upstream_call_label_var.set(_extract_api_label(url))
+        client = self.proxy_client if use_proxy else self.netease_client
+        metric_url = _metric_url_for_request(url, kwargs.get("params"))
         try:
-            client = self.proxy_client if use_proxy else self.netease_client
-            metric_url = _metric_url_for_request(url, kwargs.get("params"))
-            try:
-                response = await client.get(url, **kwargs)
-            except Exception:
-                await self._record_upstream_metric(metric_url, False)
-                raise
-            await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
-            return response.content
-        finally:
-            _upstream_call_label_var.reset(_lbl_tok)
+            response = await client.get(url, **kwargs)
+        except Exception:
+            await self._record_upstream_metric(metric_url, False)
+            raise
+        await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
+        return response.content
 
     async def search_bnet_account(
         self, bnet: str, *, credential: Optional[DashenCredential] = None
@@ -1377,22 +1124,19 @@ class DashenAPIClient:
         encoded_player_id = quote(normalized_player_id, safe="%|")
         url = f"{BLIZZARD_HOST}/{normalized_locale}/career/{encoded_player_id}/"
         metric_url = _metric_url_for_request(url)
-        _lbl_tok = _upstream_call_label_var.set("blizzard_career")
         try:
-            try:
-                response = await self.proxy_client.request(
-                    "GET",
-                    url,
-                    headers={"Accept": "text/html,application/xhtml+xml"},
-                    follow_redirects=True,
-                )
-            except Exception:
-                await self._record_upstream_metric(metric_url, False)
-                raise
-            await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
-            return response.text, str(response.url), int(response.status_code)
-        finally:
-            _upstream_call_label_var.reset(_lbl_tok)
+            response = await self.proxy_client.request(
+                "GET",
+                url,
+                headers={"Accept": "text/html,application/xhtml+xml"},
+                follow_redirects=True,
+            )
+        except Exception:
+            await self._record_upstream_metric(metric_url, False)
+            raise
+
+        await self._record_upstream_metric(str(response.request.url), _is_success_status(response.status_code))
+        return response.text, str(response.url), int(response.status_code)
 
     async def query_card(self, customer_token: str) -> Dict[str, Any]:
         return await self.request_json(
@@ -1410,17 +1154,13 @@ class DashenAPIClient:
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
         params = {"gameMode": game_mode, "token": customer_token, **_season_params(season)}
-        _gm_tok = _current_game_mode_var.set(game_mode)
-        try:
-            return await self.request_json(
-                "GET",
-                f"{DASHEN_CUSTOMER_API_BASE}/queryCountInfo",
-                credential=self._select_credential(),
-                auth_dts_override=DASHEN_BIGDATA_DTS,
-                params=params,
-            )
-        finally:
-            _current_game_mode_var.reset(_gm_tok)
+        return await self.request_json(
+            "GET",
+            f"{DASHEN_CUSTOMER_API_BASE}/queryCountInfo",
+            credential=self._select_credential(),
+            auth_dts_override=DASHEN_BIGDATA_DTS,
+            params=params,
+        )
 
     async def query_match_list(
         self,
@@ -1430,30 +1170,22 @@ class DashenAPIClient:
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
         params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
-        _gm_tok = _current_game_mode_var.set(game_mode)
-        try:
-            return await self.request_json(
-                "GET",
-                f"{DASHEN_CUSTOMER_API_BASE}/queryMatchList",
-                credential=self._select_credential(),
-                auth_dts_override=DASHEN_BIGDATA_DTS,
-                params=params,
-            )
-        finally:
-            _current_game_mode_var.reset(_gm_tok)
+        return await self.request_json(
+            "GET",
+            f"{DASHEN_CUSTOMER_API_BASE}/queryMatchList",
+            credential=self._select_credential(),
+            auth_dts_override=DASHEN_BIGDATA_DTS,
+            params=params,
+        )
 
-    async def query_match_info(self, customer_token: str, match_id: str, *, game_mode: str = "") -> Dict[str, Any]:
-        _gm_tok = _current_game_mode_var.set(game_mode)
-        try:
-            return await self.request_json(
-                "GET",
-                f"{DASHEN_CUSTOMER_API_BASE}/queryMatchInfo",
-                credential=self._select_credential(),
-                auth_dts_override=DASHEN_BIGDATA_DTS,
-                params={"matchId": match_id, "token": customer_token},
-            )
-        finally:
-            _current_game_mode_var.reset(_gm_tok)
+    async def query_match_info(self, customer_token: str, match_id: str) -> Dict[str, Any]:
+        return await self.request_json(
+            "GET",
+            f"{DASHEN_CUSTOMER_API_BASE}/queryMatchInfo",
+            credential=self._select_credential(),
+            auth_dts_override=DASHEN_BIGDATA_DTS,
+            params={"matchId": match_id, "token": customer_token},
+        )
 
     async def fight_query_match_info(self, customer_token: str, match_id: str) -> Dict[str, Any]:
         return await self.request_json(
@@ -1492,17 +1224,13 @@ class DashenAPIClient:
         season: Optional[int] = None,
     ) -> Dict[str, Any]:
         params = {"token": customer_token, "gameMode": game_mode, "page": page, **_season_params(season)}
-        _gm_tok = _current_game_mode_var.set(game_mode)
-        try:
-            return await self.request_json(
-                "GET",
-                f"{DASHEN_CUSTOMER_API_BASE}/fight/queryMatchList",
-                credential=self._select_credential(),
-                auth_dts_override=DASHEN_BIGDATA_DTS,
-                params=params,
-            )
-        finally:
-            _current_game_mode_var.reset(_gm_tok)
+        return await self.request_json(
+            "GET",
+            f"{DASHEN_CUSTOMER_API_BASE}/fight/queryMatchList",
+            credential=self._select_credential(),
+            auth_dts_override=DASHEN_BIGDATA_DTS,
+            params=params,
+        )
 
     async def query_province_rank(
         self,

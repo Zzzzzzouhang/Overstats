@@ -1,7 +1,7 @@
 {
   "antiCrawlerConfig": {
     "enabled": false,
-    "searchEnabled": false,
+    "searchEnabled": true,
     "minEndorsementLevel": 1,
     "minGameTimeMinutes": 300,
     "recentDays": 5,
@@ -33,8 +33,8 @@
   ],
   "dynamicBanner": [
     {
-      "img": "https://img.166.net/gameyw-misc/opd/squash/20260806/112554-bn9drajwvi.png",
-      "url": "https://act.ds.163.com/6cd050e87b181b32/6a6ae17030d6bc055216045d/gl/?wvFullScreen=true&wvStatusBarStyle=white"
+      "img": "",
+      "url": ""
     }
   ],
   "isOpenCustomerFreind": true,
@@ -90,7 +90,7 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "搜索接口暂时维护中！",
+  "noticeMessage": "",
   "pcNoticeMessage": {
     "sport": "",
     "leisure": "",

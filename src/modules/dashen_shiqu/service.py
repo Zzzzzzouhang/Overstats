@@ -35,7 +35,7 @@ try:
     from overstats.src.modules.font_resolver import resolve_resource_dir
     from overstats.src.db.shiqu_llm import shiqu_llm_recorder
     from .stat_db import (
-        build_broad_reference_text,
+        build_broad_reference_map,
         load_stat_name_map,
         normalize_stat_value,
         should_skip_prompt_stat,
@@ -55,7 +55,7 @@ except ModuleNotFoundError:  # pragma: no cover
     from src.modules.font_resolver import resolve_resource_dir
     from src.db.shiqu_llm import shiqu_llm_recorder
     from .stat_db import (
-        build_broad_reference_text,
+        build_broad_reference_map,
         load_stat_name_map,
         normalize_stat_value,
         should_skip_prompt_stat,
@@ -123,6 +123,27 @@ for _hero_name, _allowed in _ALLOWED_SPECIAL_BY_HERO.items():
     _special = {_ATTR_TEXT_TO_GUID[t] for t in _allowed if t in _ATTR_TEXT_TO_GUID}
     _HERO_SPECIAL_ATTR_GUIDS[_hero_guid] = _special
     _HERO_ATTR_GUIDS[_hero_guid] = _ALLOWED_COMMON_GUIDS | _special
+
+
+# 压缩提示词：英雄片段字段短键映射（中文统计名 → 短键）。
+# 与 prompt 中「字段说明」严格对应：h英雄 t时长 k消灭 d阵亡 f最后一击
+# s单独消灭 acc命中率 cr暴击率 heal治疗 save拯救。ref 同义。
+_STAT_TEXT_TO_SHORT = {
+    "消灭": "k", "阵亡": "d", "最后一击": "f", "单独消灭": "s",
+    "武器命中率": "acc", "暴击命中率": "cr", "治疗量": "heal", "拯救玩家": "save",
+}
+# 命中率一般写作「武器命中率」，个别英雄为「命中率」，两者都映射到 acc。
+if "命中率" in _ATTR_TEXT_TO_GUID and "武器命中率" not in _ATTR_TEXT_TO_GUID:
+    _STAT_TEXT_TO_SHORT.setdefault("武器命中率", "acc")
+
+_STAT_GUID_TO_SHORT: Dict[str, str] = {}
+for _txt, _short in _STAT_TEXT_TO_SHORT.items():
+    _g = _ATTR_TEXT_TO_GUID.get(_txt)
+    if _g:
+        _STAT_GUID_TO_SHORT[_g] = _short
+# 用 guids 反查，避免重复映射
+_STAT_SHORT_TO_GUID = {v: k for k, v in _STAT_GUID_TO_SHORT.items()}
+
 
 
 def _stat_allowed_for_hero(value_guid: str, hero_guid: str) -> bool:
@@ -419,7 +440,7 @@ def _parse_llm_json_result(raw_text: str, target_id: str) -> Optional[dict]:
 def _segment_present_guids(entry: dict, hero_guid: str, name_map: dict) -> set:
     """返回该分段真实数据中「存在 + 白名单允许 + 非跳过 + 可归一化」的统计 guid 集合。
 
-    与 _hero_detail_text / _fmt_hero_segment 使用的过滤口径完全一致，用于约束参考数据：
+    与 _fmt_hero_line 使用的过滤口径完全一致，用于约束参考数据：
     真实对局里没出现的数据，给参考没有意义。
     """
     sm = (entry or {}).get("statMap", {}) or {}
@@ -440,257 +461,242 @@ def _segment_present_guids(entry: dict, hero_guid: str, name_map: dict) -> set:
     return guids
 
 
-def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) -> str:
-    ROLE_ORDER = {"tank": 0, "dps": 1, "healer": 2}
-    ROLE_LABEL = {"tank": "坦克", "dps": "输出", "healer": "辅助"}
+# ── 压缩提示词：模块级共享数据结构 ──
 
-    def _get_role(p):
-        return HERO_DICT.get(str(p.get("heroGuid", "")), {}).get("role", "unknown")
+def _get_role(p) -> str:
+    return HERO_DICT.get(str(p.get("heroGuid", "")), {}).get("role", "unknown")
 
-    def _sort_and_label(players):
-        indexed = [(ROLE_ORDER.get(_get_role(p), 9), i, p) for i, p in enumerate(players) if isinstance(p, dict)]
-        indexed.sort(key=lambda x: (x[0], x[1]))
-        role_ct = {}
-        labeled = []
-        for _, _, p in indexed:
-            r = _get_role(p)
-            role_ct[r] = role_ct.get(r, 0) + 1
-            lb = ROLE_LABEL.get(r, r)
-            ct = sum(1 for pp in players if isinstance(pp, dict) and _get_role(pp) == r)
-            labeled.append((p, f"{lb}{role_ct[r]}" if ct > 1 else lb))
-        return labeled
 
-    STAT_KEYS = [("kill", "消灭"), ("assist", "助攻"), ("death", "阵亡"), ("finalHit", "最后一击"),
-                 ("heroDamage", "伤害"), ("damageTaken", "承伤"), ("cure", "治疗"),
-                 ("healingTaken", "受疗"), ("resistDamage", "格挡")]
-    # 消灭参与率 = (原始消灭 + 原始助攻/2) / 敌方原始总死亡数（均用本局原始数据，
-    # 不做 10 分钟归一化）。
-    KILL_GUID = "603482350067646495"
-    ASSIST_GUID = "603482350067648392"
-    ENTRY_STAT_GUIDS = [
-        ("消灭", ("603482350067646495",)),
-        ("阵亡", ("603482350067646506",)),
-        ("最后一击", ("603482350067646507",)),
-        ("单独消灭", ("603482350067646509",)),
-        ("伤害", ("603482350067647671",)),
-        ("治疗", ("603482350067647479", "603482350067646913")),
-    ]
-
-    def _rate(v, t):
-        return f"{v * 600 / max(t, 60):.1f}" if t > 0 else str(v)
-
-    def _fmt_num(v):
-        if v is None:
-            return "?"
-        if isinstance(v, (int, float)) and float(v) == int(v):
-            return str(int(v))
-        return f"{float(v):.2f}"
-
-    def _fmt_minsec(seconds):
-        seconds = max(0, int(seconds or 0))
-        return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-    def _normalized_stat(sm, guids, ut, name_map, hero_guid):
-        values = []
-        for guid in guids:
-            if guid not in sm or not _stat_allowed_for_hero(guid, hero_guid):
-                continue
-            name = name_map.get(guid, "")
-            if should_skip_prompt_stat(value_guid=guid, value_text=name):
-                continue
-            nv = normalize_stat_value(sm.get(guid), ut, value_text=name, value_guid=guid)
-            if nv is not None:
-                values.append(nv)
-        if not values:
-            return None
-        return max(values)
-
-    def _hero_detail_text(entry, hero_guid, name_map):
-        sm = entry.get("statMap", {}) or {}
-        ut = float(entry.get("userTimeSec", 600) or 600)
-        seen = {}
-        for guid, raw_val in sm.items():
-            guid = str(guid)
-            if not _stat_allowed_for_hero(guid, hero_guid):
-                continue
-            name = name_map.get(guid)
-            if not name:
-                continue
-            if should_skip_prompt_stat(value_guid=guid, value_text=name):
-                continue
-            nv = normalize_stat_value(raw_val, ut, value_text=name, value_guid=guid)
-            if nv is None:
-                continue
-            seen.setdefault(name, _fmt_num(nv))
-        return ", ".join(f"{name}: {value}" for name, value in seen.items())
-
-    def _expand_player_segments(p):
-        name_map = load_stat_name_map()
-        hl = p.get("_heroList")
-        fallback_hg = str(p.get("heroGuid", ""))
-        if not hl or not isinstance(hl, list):
-            return [{"player": p, "hero_guid": fallback_hg, "entry": None, "name_map": name_map}]
-        segments = []
-        long_entries = [entry for entry in hl if isinstance(entry, dict) and float(entry.get("userTimeSec", 0) or 0) >= 60]
-        for entry in long_entries:
-            if not isinstance(entry, dict):
-                continue
-            hg = str(entry.get("heroId", ""))
-            if hg:
-                segments.append({"player": p, "hero_guid": hg, "entry": entry, "name_map": name_map})
-                continue
-            sm = entry.get("statMap", {}) or {}
-            hg = _infer_hero_guid_from_stat_map(sm, fallback_hg, allow_fallback=(len(long_entries) == 1))
-            if not hg:
-                continue
+def _expand_player_segments(p):
+    name_map = load_stat_name_map()
+    hl = p.get("_heroList")
+    fallback_hg = str(p.get("heroGuid", ""))
+    if not hl or not isinstance(hl, list):
+        return [{"player": p, "hero_guid": fallback_hg, "entry": None, "name_map": name_map}]
+    segments = []
+    long_entries = [entry for entry in hl if isinstance(entry, dict) and float(entry.get("userTimeSec", 0) or 0) >= 60]
+    for entry in long_entries:
+        if not isinstance(entry, dict):
+            continue
+        hg = str(entry.get("heroId", ""))
+        if hg:
             segments.append({"player": p, "hero_guid": hg, "entry": entry, "name_map": name_map})
-        if segments:
-            return segments
-        return []
+            continue
+        sm = entry.get("statMap", {}) or {}
+        hg = _infer_hero_guid_from_stat_map(sm, fallback_hg, allow_fallback=(len(long_entries) == 1))
+        if not hg:
+            continue
+        segments.append({"player": p, "hero_guid": hg, "entry": entry, "name_map": name_map})
+    if segments:
+        return segments
+    return []
 
-    def _get_segment_role(seg):
-        return HERO_DICT.get(str(seg.get("hero_guid", "")), {}).get("role", "unknown")
 
-    def _player_primary_role(player_segments, fallback_player):
-        best_role = HERO_DICT.get(str(fallback_player.get("heroGuid", "")), {}).get("role", "unknown")
-        best_time = -1.0
-        for seg in player_segments:
-            entry = seg.get("entry") or {}
-            ut = float(entry.get("userTimeSec", 0) or 0)
-            role = _get_segment_role(seg)
-            if ut > best_time:
-                best_time = ut
-                best_role = role
-        return best_role
+def _player_primary_role(player_segments, fallback_player) -> str:
+    best_role = HERO_DICT.get(str(fallback_player.get("heroGuid", "")), {}).get("role", "unknown")
+    best_time = -1.0
+    for seg in player_segments:
+        entry = seg.get("entry") or {}
+        ut = float(entry.get("userTimeSec", 0) or 0)
+        role = HERO_DICT.get(str(seg.get("hero_guid", "")), {}).get("role", "unknown")
+        if ut > best_time:
+            best_time = ut
+            best_role = role
+    return best_role
 
-    def _sort_and_label_players(players):
-        indexed = []
-        for pi, p in enumerate(players):
-            if not isinstance(p, dict):
-                continue
-            segments = _expand_player_segments(p)
-            if not segments:
-                continue
-            role = _player_primary_role(segments, p)
-            indexed.append((ROLE_ORDER.get(role, 9), pi, role, p, segments))
-        indexed.sort(key=lambda x: (x[0], x[1]))
-        role_ct = {}
-        role_total = {}
-        for _, _, role, _, _ in indexed:
-            role_total[role] = role_total.get(role, 0) + 1
-        labeled = []
-        for _, _, role, p, segments in indexed:
-            role_ct[role] = role_ct.get(role, 0) + 1
-            lb = ROLE_LABEL.get(role, role)
-            labeled.append((p, segments, f"{lb}{role_ct[role]}" if role_total.get(role, 0) > 1 else lb))
-        return labeled
 
-    def _fmt_hero_segment(seg, include_detail):
-        p = seg["player"]
-        hg = str(seg.get("hero_guid", ""))
-        hn = HERO_DICT.get(hg, {}).get("name", "?")
-        entry = seg.get("entry")
-        parts = [f"英雄: {hn}"]
-        if entry:
-            ut = float(entry.get("userTimeSec", 0) or 0)
-            sm = entry.get("statMap", {}) or {}
-            parts.append(f"时长: {_fmt_minsec(ut)}")
-            for cn, guids in ENTRY_STAT_GUIDS:
-                nv = _normalized_stat(sm, guids, ut, seg["name_map"], hg)
-                if nv is not None:
-                    parts.append(f"{cn}: {_fmt_num(nv)}")
-            detail = _hero_detail_text(entry, hg, seg["name_map"]) if include_detail else ""
+def _fmt_compact_num(v):
+    if v is None:
+        return None
+    f = float(v)
+    if abs(f - round(f)) < 1e-9:
+        return int(round(f))
+    return round(f, 2)
+
+
+# 消灭参与率计算用到的原始统计 guid（与旧版 _build_prompt 口径一致）。
+_KILL_GUID = "603482350067646495"
+_ASSIST_GUID = "603482350067648392"
+_DEATH_GUID = "603482350067646506"
+
+
+def _fmt_hero_line(seg, db) -> str:
+    """把单个英雄分段格式化为行协议：
+
+      h=英雄 t=时长(秒) k=消灭 d=阵亡 f=最后一击 s=单独消灭 acc=命中 cr=暴击 heal=治疗 save=拯救
+      [特殊命中率=val ...] | ref:同义参考值
+
+    英雄自身字段按 per-10min 归一化（与 normalize_stat_value 口径一致）。
+    普通字段用短键；该英雄的特殊命中率字段（ALLOWED_SPECIAL_BY_HERO）以中文名原样给出，
+    避免跨英雄歧义。ref 为同英雄分段参考中位数（build_broad_reference_map），仅含真实出现字段。
+    """
+    hg = str(seg.get("hero_guid", ""))
+    hn = HERO_DICT.get(hg, {}).get("name", "?")
+    entry = seg.get("entry")
+    if not entry:
+        return f"  h={hn}"
+    ut = float(entry.get("userTimeSec", 0) or 0)
+    sm = entry.get("statMap", {}) or {}
+    name_map = seg.get("name_map") or load_stat_name_map()
+
+    common_parts: list = []
+    ref_guids: set = set()
+    for g, short in _STAT_GUID_TO_SHORT.items():
+        if g not in sm:
+            continue
+        if not _stat_allowed_for_hero(g, hg):
+            continue
+        nm = name_map.get(g, "")
+        if should_skip_prompt_stat(value_guid=g, value_text=nm):
+            continue
+        nv = normalize_stat_value(sm.get(g), ut, value_text=nm, value_guid=g)
+        if nv is None:
+            continue
+        common_parts.append(f"{short}={_fmt_compact_num(nv)}")
+        ref_guids.add(g)
+
+    special_parts: list = []
+    for g in _HERO_SPECIAL_ATTR_GUIDS.get(hg, set()):
+        if g in _STAT_GUID_TO_SHORT or g not in sm:
+            continue
+        nm = name_map.get(g, "")
+        if not nm or should_skip_prompt_stat(value_guid=g, value_text=nm):
+            continue
+        nv = normalize_stat_value(sm.get(g), ut, value_text=nm, value_guid=g)
+        if nv is None:
+            continue
+        special_parts.append(f"{nm}={_fmt_compact_num(nv)}")
+        ref_guids.add(g)
+
+    parts = [f"h={hn}", f"t={int(round(ut))}"] + common_parts + special_parts
+    line = "  " + " ".join(parts)
+
+    if db and ref_guids:
+        ref_map = build_broad_reference_map(db, hg, present_guids=ref_guids)
+        if ref_map:
+            ref_items: list = []
+            for g, short in _STAT_GUID_TO_SHORT.items():
+                if g in ref_guids:
+                    nm = name_map.get(g, "")
+                    if nm in ref_map:
+                        ref_items.append(f"{short}={_fmt_compact_num(ref_map[nm])}")
+            for g in _HERO_SPECIAL_ATTR_GUIDS.get(hg, set()):
+                if g in _STAT_GUID_TO_SHORT or g not in ref_guids:
+                    continue
+                nm = name_map.get(g, "")
+                if nm in ref_map:
+                    ref_items.append(f"{nm}={_fmt_compact_num(ref_map[nm])}")
+            if ref_items:
+                line += " | ref:" + " ".join(ref_items)
+    return line
+
+
+def _compact_label_players(players, *, enemy: bool = False):
+    ROLE_ORDER = {"tank": 0, "dps": 1, "healer": 2}
+    ROLE_SHORT = {"tank": "坦", "dps": "输", "healer": "辅"}
+    indexed = []
+    for pi, p in enumerate(players):
+        if not isinstance(p, dict):
+            continue
+        segs = _expand_player_segments(p)
+        if not segs:
+            continue
+        role = _player_primary_role(segs, p)
+        indexed.append((ROLE_ORDER.get(role, 9), pi, role, p, segs))
+    indexed.sort(key=lambda x: (x[0], x[1]))
+    prefix = "敌" if enemy else ""
+    role_ct: dict = {}
+    role_total = {r: sum(1 for x in indexed if x[2] == r) for _, _, r, _, _ in indexed}
+    labeled = []
+    for _, _, role, p, segs in indexed:
+        role_ct[role] = role_ct.get(role, 0) + 1
+        lb = ROLE_SHORT.get(role, role)
+        pos = f"{prefix}{lb}{role_ct[role]}" if role_total.get(role, 0) > 1 else f"{prefix}{lb}"
+        labeled.append((p, segs, pos))
+    return labeled
+
+
+def _compute_enemy_total_deaths(enemy_list: list) -> float:
+    total = 0.0
+    for p in enemy_list or []:
+        if not isinstance(p, dict):
+            continue
+        d = p.get("death")
+        if d is None and isinstance(p.get("_heroList"), list):
+            for e in p["_heroList"]:
+                sm = (e or {}).get("statMap", {}) or {}
+                if _DEATH_GUID in sm:
+                    try:
+                        total += float(sm[_DEATH_GUID])
+                    except (TypeError, ValueError):
+                        pass
         else:
-            for k, cn in STAT_KEYS:
-                v = int(p.get(k, 0) or 0)
-                parts.append(f"{cn}: {_rate(v, game_sec)}")
-            detail = ""
-        if include_detail and detail:
-            parts.append(f"详细: {{ {detail} }}")
-        return "{ " + ", ".join(parts) + " }"
+            try:
+                total += float(d or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
 
-    def _fmt_player_block(p, segments, pos, game_sec, include_detail, enemy_total_deaths=0):
+
+def _compute_pr(player: dict, enemy_total_deaths: float) -> float:
+    """(原始消灭 + 原始助攻/2) / 敌方原始总死亡数；与旧版口径一致。"""
+    total_kill = 0.0
+    total_assist = 0.0
+    for seg in _expand_player_segments(player):
+        entry = seg.get("entry")
+        if entry:
+            sm = entry.get("statMap", {}) or {}
+            for g, bucket in ((_KILL_GUID, "kill"), (_ASSIST_GUID, "assist")):
+                raw = sm.get(g)
+                if raw is None:
+                    continue
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    continue
+                if bucket == "kill":
+                    total_kill += val
+                else:
+                    total_assist += val
+        else:
+            total_kill += int(player.get("kill", 0) or 0)
+            total_assist += int(player.get("assist", 0) or 0)
+    kp = total_kill + total_assist / 2.0
+    return kp / enemy_total_deaths if enemy_total_deaths > 0 else 0.0
+
+
+def _fmt_match_block(m: dict, target_id: str, idx: int, db) -> str:
+    """把一局比赛格式化为行协议块：
+
+    第{i}局|res|map|比分
+    {pos}|{p}|{pr}
+      h=... t=... ... | ref:...
+    """
+    detail_data = (m.get("detail", {}) or {}).get("data") or {}
+    source = m.get("source_match", {}) or {}
+    map_guid = str(detail_data.get("mapGuid") or source.get("mapGuid") or "")
+    ret = detail_data.get("matchRet", source.get("matchRet"))
+    result_map = {1: "胜", 0: "平", -1: "负"}
+    res = result_map.get(ret, "未知")
+    score_line = f"{detail_data.get('teamScore', '?')}:{detail_data.get('opponentScore', '?')}"
+    tm = detail_data.get("teammateList", []) or []
+    en = detail_data.get("enemyList", []) or []
+    enemy_total_deaths = _compute_enemy_total_deaths(en)
+
+    lines = [f"第{idx}局|{res}|{MAP_DICT.get(map_guid, '?')}|{score_line}"]
+    for p, segs, pos in _compact_label_players(tm):
         name = str(p.get("name", "?"))
         display = f"*{name}" if name == target_id else name
-        total_kill = 0.0
-        total_assist = 0.0
-        for seg in segments:
-            entry = seg.get("entry")
-            if entry:
-                # 原始消灭 + 原始助攻/2：直接取 statMap 中的原始值，不做 10 分钟归一化
-                sm = entry.get("statMap", {}) or {}
-                for g, bucket in ((KILL_GUID, "kill"), (ASSIST_GUID, "assist")):
-                    raw = sm.get(g)
-                    if raw is not None:
-                        try:
-                            val = float(raw)
-                        except (TypeError, ValueError):
-                            continue
-                        if bucket == "kill":
-                            total_kill += val
-                        else:
-                            total_assist += val
-            else:
-                total_kill += int(p.get("kill", 0) or 0)
-                total_assist += int(p.get("assist", 0) or 0)
-        # 消灭参与率 = (消灭 + 助攻/2) / 敌方原始总死亡数
-        kp_num = total_kill + total_assist / 2.0
-        kp_rate = kp_num / enemy_total_deaths if enemy_total_deaths > 0 else 0
-        hero_text = ", ".join(_fmt_hero_segment(seg, include_detail) for seg in segments)
-        return f"{{ 位置: {pos}, 玩家: {display}, 消灭参与率: {kp_rate:.3f}, 英雄片段: [ {hero_text} ] }}"
+        pr = _compute_pr(p, enemy_total_deaths)
+        lines.append(f"{pos}|{display}|{pr:.3f}")
+        for seg in segs:
+            lines.append(_fmt_hero_line(seg, db))
+    return "\n".join(lines)
 
-    def _player_ref_text(seg, player_name):
-        if db is None:
-            return ""
-        entry = seg.get("entry")
-        if not isinstance(entry, dict):
-            return ""
-        hg = str(seg.get("hero_guid", ""))
-        hn = HERO_DICT.get(hg, {}).get("name", "?")
-        name_map = seg.get("name_map") or load_stat_name_map()
-        present = _segment_present_guids(entry, hg, name_map)
-        if not present:
-            return ""
-        return build_broad_reference_text(db, player_name, hg, hn, present_guids=present)
 
-    result_map = {1: "胜", 0: "平", -1: "负"}
-    lines = []
-    for idx, m in enumerate(matches):
-        detail_data = (m.get("detail", {}) or {}).get("data") or {}
-        source = m.get("source_match", {}) or {}
-        game_sec = float(detail_data.get("gameTimeSec", 600) or 600)
-        map_guid = str(detail_data.get("mapGuid") or source.get("mapGuid") or "")
-        ret = detail_data.get("matchRet", source.get("matchRet"))
-        dur = f"{int(game_sec // 60):02d}:{int(game_sec % 60):02d}"
-        lines.append(f"[第{idx + 1}局] {result_map.get(ret, '?')} {MAP_DICT.get(map_guid, '?')} {dur} 焦点玩家: {target_id}")
-        lines.append("{")
-        lines.append(f"  比分: {detail_data.get('teamScore', '?')}:{detail_data.get('opponentScore', '?')},")
-
-        tm = detail_data.get("teammateList", [])
-        en = detail_data.get("enemyList", [])
-        enemy_total_deaths = sum(int((p if isinstance(p, dict) else {}).get("death", 0) or 0) for p in en)
-
-        def _append_players(label, players, *, include_detail, include_reference):
-            lines.append(f"  [{label}]")
-            lines.append("  [")
-            for p, segments, pos in _sort_and_label_players(players):
-                player_name = str(p.get("name", "?"))
-                lines.append(f"    {_fmt_player_block(p, segments, pos, game_sec, include_detail, enemy_total_deaths)},")
-                if include_reference:
-                    for seg in segments:
-                        ref = _player_ref_text(seg, player_name)
-                        if ref:
-                            lines.append(f"    # 数据参考: {ref}")
-            lines.append("  ],")
-
-        if tm:
-            _append_players("队友", tm, include_detail=True, include_reference=True)
-        lines.append("}")
-        lines.append("")
-
-    n = len(matches)
-
-    teammate_counts = {}
+def _compute_friend_list(matches: list, target_id: str) -> List[str]:
+    """统计好友出现场次，出现≥3局视为好友，返回好友 ID 列表（仅 ID，games 不再预计算）。"""
+    teammate_counts: dict = {}
     for m in matches:
         detail_data = (m.get("detail", {}) or {}).get("data") or {}
         seen = set()
@@ -698,107 +704,113 @@ def _build_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) 
             if not isinstance(p, dict):
                 continue
             name = str(p.get("name", ""))
-            if name == target_id or name in seen:
+            if name == target_id or name in seen or not name:
                 continue
-            if name:
-                seen.add(name)
-                teammate_counts[name] = teammate_counts.get(name, 0) + 1
-    friend_ids = sorted(name for name, cnt in teammate_counts.items() if cnt >= 3)
-    friend_id_text = "\n".join(f"- {name}" for name in friend_ids) or "无"
-    match_text = "\n".join(lines)
+            seen.add(name)
+            teammate_counts[name] = teammate_counts.get(name, 0) + 1
+    return [name for name, cnt in sorted(teammate_counts.items()) if cnt >= 3]
 
-    _metaphor_categories = [
-        ("状态不稳定类", ["数据过山车", "随机数生成器", "情绪盲盒", "情绪不稳定的数据电池", "人形骰子", "薛定谔的C位", "信号不好的路由器", "间歇性战神体验卡"]),
-        ("无效贡献类", ["空气掩护", "用身体打伤害", "行走的充电宝", "战术性自杀", "蹭地图经验涨KD", "团队ATM机", "敌方能量加速器", "移动复活点"]),
-        ("高光统治类", ["战神下凡", "把对面点位焊死", "职业选手体验生活", "人形外挂", "把对面当兵补", "准心端装了GPS"]),
-        ("拉胯下限类", ["会飞的咸鱼", "空中活靶子", "观光客", "落地成盒", "纯度极高的咸鱼", "键盘撒米鸡啄选手", "人机练习赛VIP"]),
-        ("数据结果背离类", ["华丽数据证明无用", "KDA骗子", "用队友的命换评分", "胜利是队友扛着走的"]),
-    ]
-    random.shuffle(_metaphor_categories)
-    _metaphor_lines = []
-    for _cat_name, _items in _metaphor_categories:
-        random.shuffle(_items)
-        _metaphor_lines.append(f"{_cat_name}：{'、'.join(_items)}。")
-    _metaphor_text = "\n".join(_metaphor_lines)
 
-    return f"""[ROLE] 角色与语气设定
-你是一位资深竞技游戏玩家兼数据分析师，擅长用「脱口秀式毒舌」风格对玩家的对局数据进行复盘点评。你的文字既有专业数据的支撑，又有极强的娱乐性和画面感，读起来像是一位又爱又恨的老队友在赛后吐槽。
-语气要求：戏谑、犀利、阴阳怪气但不恶意，保持「损友」般的亲切感。善用反讽、夸张和反转。
-修辞要求：大量使用游戏黑话与生活化比喻的混搭，避免干巴巴的描述。尽可能理解并且创造新的比喻。
-输出评价符合人设和说话习惯，对好的部分赞赏，差的部分指出，可少量使用 emoji。
+_METAPHOR_CATEGORIES = [
+    ("状态不稳定类", ["数据过山车", "随机数生成器", "情绪盲盒", "情绪不稳定的数据电池", "人形骰子", "薛定谔的C位", "信号不好的路由器", "间歇性战神体验卡"]),
+    ("无效贡献类", ["空气掩护", "用身体打伤害", "行走的充电宝", "战术性自杀", "蹭地图经验涨KD", "团队ATM机", "敌方能量加速器", "移动复活点"]),
+    ("高光统治类", ["战神下凡", "把对面点位焊死", "职业选手体验生活", "人形外挂", "把对面当兵补", "准心端装了GPS"]),
+    ("拉胯下限类", ["会飞的咸鱼", "空中活靶子", "观光客", "落地成盒", "纯度极高的咸鱼", "键盘撒米鸡啄选手", "人机练习赛VIP"]),
+    ("数据结果背离类", ["华丽数据证明无用", "KDA骗子", "用队友的命换评分", "胜利是队友扛着走的"]),
+]
 
-[CONTEXT] 游戏背景与修辞库
-1. 守望先锋段位名称：青铜、白银、黄金、白金、钻石、大师、宗师、英杰。
-2. 比喻参考库：
-{_metaphor_text}
 
-[OBJECTIVE] 核心任务
-严格基于提供的原始对局数据，对焦点玩家及其好友进行复盘点评，并最终输出符合指定 JSON Schema 的合法 JSON 对象。
+def _build_metaphor_text() -> str:
+    cats = list(_METAPHOR_CATEGORIES)
+    random.shuffle(cats)
+    lines = []
+    for cat_name, items in cats:
+        items = list(items)
+        random.shuffle(items)
+        lines.append(f"{cat_name}：{'、'.join(items)}。")
+    return "\n".join(lines)
 
-[CONSTRAINTS] 硬性约束与底线
-1. 仅针对游戏内数据、赛场表现、英雄数据点评，绝不涉及外貌、私生活、人品等人身攻击；不输出任何歧视、引战、恶意辱骂内容。
-2. 所有解读严格基于提供的原始数据，禁止编造数据、篡改数据含义、夸大数据结论。
-3. 严禁单一数据全盘否定：必须复盘全部 {n} 场数据的宏观表现。如果玩家有打得极好的高光对局，必须予以承认和赞赏；差的对局应调侃。
-4. 严禁跨职责直接比较伤害或治疗等核心指标，阴阳调侃必须对应明确的数据论据。
-5. 不讨论外挂、代练等违规行为，禁止进行反事实推演或假设性陈述，仅限描述已发生事件。
 
-[WORKFLOW] 评判规则与工作流
-步骤一：职责核心指标评估（综合评估，技能指标权重低）
-坦克位参考：单独消灭、最后一击、(伤害减受疗)、阵亡数、消灭参与率等其他技能指标。
-输出位参考：单独消灭、最后一击、伤害、阵亡数、消灭参与率等其他技能指标。
-辅助位参考：最后一击、阵亡数、拯救玩家、单独消灭、伤害、治疗量、消灭参与率等其他技能指标。
+def _build_system_prompt() -> str:
+    """常驻、与具体对局无关的内容，放入 system（可被 prompt caching 命中）。"""
+    return f"""[ROLE] 角色与语气
+你是一位资深竞技游戏玩家兼数据分析师，用「脱口秀式毒舌」风格复盘对局数据。戏谑、犀利、阴阳怪气但不恶意，保持损友亲切感；善用反讽、夸张、反转；大量使用游戏黑话与生活化比喻混搭，可理解并创造新比喻；对好的部分赞赏，差的部分指出。
 
-步骤二：数据对比与百分制评分（输出 score 整数 0到100）
-1. 将焦点玩家数据与同英雄「数据参考行」对比，低于参考值应扣分，禁止跨英雄比较。
-2. 同一玩家同一局可能在「英雄片段」内出现多个英雄，时长小于3分钟的片段为低权重。
-3. 最后一击和单独消灭应额外加分，频繁阵亡且团队贡献低应加重扣分。
-4. 综合看英雄数据。例如有的输出英雄伤害低但最后一击高，有的辅助英雄输出高但治疗少，需综合参考值考虑，不要跨英雄对比。
-5. 解构无效数据：不要被表面虚高数据欺骗。若空有治疗或伤害但消灭参与率极低，评价为「无效数据刷子」。
-6. 对于单独消灭高的玩家应赞赏，单独消灭低不批评不评价。
-7. 比赛胜负不影响评分，只论数据。
-8. 若某局数据异常，该局不参与评分或低权重，comment 写「数据缺失，无法评价」。
+[CONTEXT] 背景
+守望先锋段位：青铜、白银、黄金、白金、钻石、大师、宗师、英杰。
 
-步骤三：综合判定结构构建（overall_comment 约 350 字，可少量使用 emoji）
-1. 用一个精准的比喻或定性标签概括玩家特点。
-2. 列举高光场次与拉胯场次的极端对比，突出方差大、不稳定或偏科等特质。
-3. 细节吐槽或表扬：针对具体英雄、技能释放、走位等进行画面感描述。
-4. 收尾建议：以调侃口吻给出实质性建议。
+[OBJECTIVE] 任务
+严格基于提供的原始对局数据，对焦点玩家及其好友复盘点评，输出符合指定 JSON Schema 的合法 JSON 对象。
 
-步骤四：好友点评生成
-1. 必须点评下方「焦点玩家的好友 ID」中出现的每一位好友，缺一不可。
-2. 好友点评只能基于他们的比赛数据，比赛胜负不影响评价。
-3. 评分标准同焦点玩家（大于等于50夸或赞赏，小于50串），但没有数据时语气要保守。
+[CONSTRAINTS] 硬约束
+1. 只评游戏数据，不评外貌/私生活/人品；不引战、不歧视、不聊外挂代练；不编造数据；不跨职责/跨英雄比较；高光必夸，差局调侃；胜负不影响评分。
+2. 仅描述已发生事件，禁止反事实推演或假设性陈述。
 
-[OUTPUT FORMAT] 输出格式与字段规范
-严格输出符合下方 JSON Schema 的合法 JSON 对象，禁止输出 markdown 代码块、注释或任何 JSON 之外的文字。
-1. 所有字符串使用中文，内容简练。字符串内禁止英文双引号，引用请用「」或『』，emoji 可正常使用。
-2. result 字段仅可取值：胜、负、平、未知。
-3. summary 字段是纯客观数据概览点评（约 100 字）。
-4. match_comments 字段必须覆盖比赛数据全部 {n} 局，index 从 1 递增到 {n}，禁止跳号或重复（约50字）。
-5. teammate_comments 字段必须为焦点玩家的好友 ID 中的每一位好友都生成一条点评，缺一不可。
+[WORKFLOW] 评分规则
+步骤一 职责核心指标：
+坦克参考 单独消灭、最后一击、(伤害减受疗)、阵亡、消灭参与率；
+输出参考 单独消灭、最后一击、伤害、阵亡、消灭参与率；
+辅助参考 最后一击、阵亡、拯救、单独消灭、伤害、治疗、消灭参与率。
+步骤二 对比与评分（score 整数 0-100，基准线50）：
+1. 与同英雄 ref 对比，低于参考扣分，禁止跨英雄比较；
+2. 同一局多英雄，时长<3分钟片段低权重；
+3. 最后一击、单独消灭额外加分；频繁阵亡且贡献低加重扣分；
+4. 综合看英雄数据（如输出伤害低但最后一击高、辅助输出高但治疗少），不跨英雄对比；
+5. 解构无效数据：空有治疗/伤害但消灭参与率极低，判为「无效数据刷子」；
+6. 单独消灭高应赞赏，低不批评；
+7. 比赛胜负不影响评分；
+8. 某局数据异常则不参与评分或低权重，comment 写「数据缺失，无法评价」。
+步骤三 overall_comment（≤300字，≤2个emoji）：
+1. 精准比喻/定性标签概括特点；
+2. 高光与拉胯极端对比；
+3. 细节画面感吐槽/表扬；
+4. 调侃口吻收尾建议。
+步骤四 好友点评：
+1. 覆盖全部好友，score≥50夸，<50串；
+2. 仅基于比赛数据，胜负不影响评价；缺数据保守评价。
 
-JSON Schema 定义：
-{json.dumps(_SHIQU_JSON_SCHEMA, ensure_ascii=False, indent=2)}
+[OUTPUT] 输出格式
+严格输出符合 JSON Schema 的合法 JSON 对象，禁止 markdown/代码块/注释/JSON 外文字。
+- 字符串用中文、简练；禁止英文双引号，引用用「」或『』；emoji 按上限使用。
+- result 仅可：胜、负、平、未知。
+- summary≤100字，客观数据概览。
+- match_comments：遍历 matches，每局输出一条；index 用输入 index；comment≤45字且含至少1个数字，≤1 emoji；异常写「数据缺失，无法评价」。
+- overall_comment≤300字，≤2 emoji。
+- teammate_comments：覆盖全部好友；name 用给定值，score≥50夸<50串，comment≤60字，0 emoji。
+JSON Schema：
+{json.dumps(_SHIQU_JSON_SCHEMA, ensure_ascii=False, indent=2)}"""
 
-[INPUT DATA] 输入数据
-焦点玩家的好友 ID：
-{friend_id_text}
 
-比赛数据：
+def _build_user_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) -> str:
+    """动态内容：焦点玩家、好友、压缩后的行协议比赛数据、修辞库。"""
+    match_text = "\n\n".join(_fmt_match_block(m, target_id, i + 1, db) for i, m in enumerate(matches))
+    friend_names = _compute_friend_list(matches, target_id)
+    friends_line = ", ".join(friend_names) if friend_names else "无"
+    return f"""target_id={target_id}
+
+friends={friends_line}
+
+字段说明：pos=位置 p=玩家ID（*前缀为焦点玩家） pr=消灭参与率；h=英雄 t=时长(秒) k=消灭 d=阵亡 f=最后一击 s=单独消灭 acc=命中率 cr=暴击率 heal=治疗 save=拯救；ref=同英雄参考值，字段同义。英雄行可附加该英雄特殊命中率字段（如 螺旋飞弹命中率、辅助攻击模式命中率），以中文名给出，ref 同义。胜负以焦点玩家所在阵营为准。
+
 {match_text}
-"""
+
+[修辞库]
+{_build_metaphor_text()}"""
 
 
 # ── LLM 调用（独立配置）──
 
-async def _call_llm(prompt: str) -> Optional[str]:
+async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
     cfg = get_shiqu_llm_config()
     if not (cfg.base_url and cfg.api_key and cfg.model):
         logger.error("[shiqu] LLM 配置不完整，请在 config/shiqu_config.py 中填写 SHIQU_LLM_BASE_URL / SHIQU_LLM_API_KEY / SHIQU_LLM_MODEL")
         return None
     payload = {
         "model": cfg.model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         "stream": cfg.stream,
         "response_format": {
             "type": "json_schema",
@@ -1082,14 +1094,19 @@ class ShiquModule:
             # ── 阶段二（补充）：队友多英雄 heroList 补齐（best-effort，复用 overstats 详情查询）──
             await self._enrich_teammate_details(details, customer_token)
 
-        prompt = _build_prompt(details, full_id, db=db)
+        system_prompt = _build_system_prompt()
+        user_prompt = _build_user_prompt(details, full_id, db=db)
+        _full_prompt = system_prompt + "\n\n" + user_prompt
 
         # 调试/测试用：设置环境变量 SHIQU_DUMP_PROMPT 指向文件路径，
         # 即可把本次组成的提示词落盘（不影响正常判定流程）。
         _dump_prompt_path = os.environ.get("SHIQU_DUMP_PROMPT")
         if _dump_prompt_path:
             try:
-                Path(_dump_prompt_path).expanduser().write_text(prompt, encoding="utf-8")
+                Path(_dump_prompt_path).expanduser().write_text(
+                    f"===== SYSTEM =====\n{system_prompt}\n\n===== USER =====\n{user_prompt}",
+                    encoding="utf-8",
+                )
                 logger.info(f"[shiqu] 提示词已保存到 {_dump_prompt_path}")
             except Exception as exc:  # pragma: no cover
                 logger.warning(f"[shiqu] 提示词保存失败: {exc}")
@@ -1102,10 +1119,10 @@ class ShiquModule:
                 "target_id": full_id,
                 "ok": True,
                 "prompt_only": True,
-                "prompt_bytes": len(prompt.encode("utf-8")),
+                "prompt_bytes": len(user_prompt.encode("utf-8")),
             }
 
-        if len(prompt.encode("utf-8")) < 10240:
+        if len(user_prompt.encode("utf-8")) < 10240:
             raise ModuleError(
                 error="insufficient_prompt_data",
                 message="数据抓取量异常，可能没有足够的预设/6v6 比赛对局。",
@@ -1126,7 +1143,7 @@ class ShiquModule:
         try:
             for attempt in range(1, max_attempts + 1):
                 call_count += 1
-                last_text = await _call_llm(prompt) or ""
+                last_text = await _call_llm(system_prompt, user_prompt) or ""
                 result = _parse_llm_json_result(last_text, full_id) if last_text else None
                 if result:
                     break
@@ -1150,7 +1167,7 @@ class ShiquModule:
             try:
                 await shiqu_llm_recorder.enqueue(
                     target_id=full_id,
-                    prompt=prompt,
+                    prompt=_full_prompt,
                     raw_response=last_text,
                     ok=success,
                     duration_ms=duration_ms,

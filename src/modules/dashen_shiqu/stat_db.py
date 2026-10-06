@@ -137,3 +137,60 @@ def build_broad_reference_text(
     if not parts:
         return ""
     return f"  {player_name}（{hero_name}）" + ", ".join(parts)
+
+
+def build_broad_reference_map(
+    db: Optional[IDPoolDB],
+    hero_guid: str,
+    present_guids: Optional[set] = None,
+) -> Dict[str, float]:
+    """与 build_broad_reference_text 同源，但返回结构化映射 {stat文本: 中位数}。
+
+    中位数已按 per-10min 归一化（与英雄自身归一化口径一致），可直接与英雄片段
+    的短键字段对照。仅输出 present_guids 中存在的统计项（与英雄真实数据对齐）。
+    """
+    if db is None:
+        return {}
+    name_map = load_stat_name_map()
+
+    comp = db.get_statmap_summary(hero_guid, rank_scores=list(_BROAD_REFERENCE_BUCKETS)) or {}
+    qpt = db.get_statmap_summary(hero_guid, group_by_rank=False) or {}
+
+    comp_med: Dict[str, list[float]] = {}
+    for (statmap_name, _rs), info in comp.items():
+        g = str(statmap_name)
+        if present_guids is not None and g not in present_guids:
+            continue
+        name = name_map.get(g)
+        if not name or should_skip_prompt_stat(value_guid=g, value_text=name):
+            continue
+        median = info.get("median")
+        if median is None:
+            continue
+        comp_med.setdefault(name, []).append(float(median))
+
+    qpt_med: Dict[str, float] = {}
+    for (statmap_name, _rs), info in qpt.items():
+        g = str(statmap_name)
+        if present_guids is not None and g not in present_guids:
+            continue
+        name = name_map.get(g)
+        if not name or should_skip_prompt_stat(value_guid=g, value_text=name):
+            continue
+        median = info.get("median")
+        if median is None:
+            continue
+        qpt_med[name] = float(median)
+
+    out: Dict[str, float] = {}
+    for name in set(comp_med) | set(qpt_med):
+        vals: list[float] = []
+        cv = comp_med.get(name)
+        if cv:
+            vals.append(sum(cv) / len(cv))
+        qv = qpt_med.get(name)
+        if qv is not None:
+            vals.append(qv)
+        if vals:
+            out[name] = sum(vals) / len(vals)
+    return out

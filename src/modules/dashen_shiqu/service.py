@@ -109,7 +109,7 @@ _ALLOWED_SPECIAL_BY_HERO: Dict[str, set] = {
     '美': {'冰锥命中率', '冰锥暴击率'}, '艾什': {'开镜命中率', '开镜暴击率'}, '莫伊拉': {'拯救玩家', '治疗量'},
     '莱因哈特': {'烈焰打击命中率'}, '西拉': {'追踪弹命中率'}, '西格玛': {'质量吸附命中率'},
     '路霸': {'链钩命中率'}, '金驭': set(), '雾子': {'拯救玩家', '治疗量'}, '飞天猫': {'治疗量'},
-    '骇灾': set(), '黑影': set(), '黑百合': {'开镜暴击率'},
+    '骇灾': set(), '黑影': {'拯救玩家', '治疗量'}, '血律': {'拯救玩家', '治疗量'}, '黑百合': {'开镜暴击率'},
 }
 
 _ALLOWED_COMMON_GUIDS = {_ATTR_TEXT_TO_GUID[t] for t in _ALLOWED_COMMON_TEXTS if t in _ATTR_TEXT_TO_GUID}
@@ -168,39 +168,47 @@ def _infer_hero_guid_from_stat_map(stat_map: dict, fallback_hero_guid: str = "",
     return fallback_hero_guid if allow_fallback else ""
 
 
-# 严格子集：只用 type / enum / required / properties / items，避免 strict 模式不支持的
-# minLength / minItems / minimum / maximum / additionalProperties 导致网关整段拒答（返回空）。
+# 紧凑键 + 去冗余的 strict 兼容 schema（方案 A）：
+# - 输出键全部缩短（sc=评分 sum=概览 mc=逐局 ov=综合 tm=好友 id=玩家），
+#   直接削减输出 token、缓解 max_tokens 截断；
+# - 去掉 match 项的 index（序号由数组顺序决定）与 result（胜负由输入对局 res 重算，
+#   r 仅作可选兜底，analyze 路径一律用输入重算覆盖，保证与真实胜负一致）；
+# - 字段重排：核心字段 sc/sum/mc/ov 前置，tm（好友，最不重要）置末且移出 required；
+#   id 也设为可选，缺省由 query 回填。截断时优先丢失 tm，核心判定书完整。
+# - 仍只用 strict 支持的关键字（type/enum/required/properties/items/additionalProperties）。
 _SHIQU_JSON_SCHEMA = {
     "type": "object",
-    "required": ["target_id", "score", "summary", "match_comments", "overall_comment", "teammate_comments"],
+    "additionalProperties": False,
+    "required": ["sc", "sum", "mc", "ov"],
     "properties": {
-        "target_id": {"type": "string"},
-        "score": {"type": "integer"},
-        "summary": {"type": "string"},
-        "match_comments": {
+        "id": {"type": "string"},
+        "sc": {"type": "integer"},
+        "sum": {"type": "string"},
+        "mc": {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["index", "result", "hero", "comment"],
+                "additionalProperties": False,
+                "required": ["h", "c"],
                 "properties": {
-                    "index": {"type": "integer"},
-                    "result": {"type": "string", "enum": ["胜", "负", "平", "未知"]},
-                    "hero": {"type": "string"},
-                    "comment": {"type": "string"},
+                    "h": {"type": "string"},
+                    "c": {"type": "string"},
+                    "r": {"type": "string", "enum": ["胜", "负", "平", "未知"]},
                 },
             },
         },
-        "overall_comment": {"type": "string"},
-        "teammate_comments": {
+        "ov": {"type": "string"},
+        "tm": {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["name", "games", "score", "comment"],
+                "additionalProperties": False,
+                "required": ["n", "ts", "c"],
                 "properties": {
-                    "name": {"type": "string"},
-                    "games": {"type": "integer"},
-                    "score": {"type": "integer"},
-                    "comment": {"type": "string"},
+                    "n": {"type": "string"},
+                    "ts": {"type": "integer"},
+                    "c": {"type": "string"},
+                    "g": {"type": "integer"},
                 },
             },
         },
@@ -246,51 +254,80 @@ _RESULT_ALIASES = {
 }
 
 
-def _normalize_result(data: dict, target_id: str) -> dict:
-    score = _clamp_score(data.get("score"), 0)
+def _norm_result_str(raw) -> str:
+    """把模型给出的胜负文本归一化为 胜/负/平/未知（含乱码修复）。"""
+    raw_result = str(raw or "未知").strip()
+    norm_result = _RESULT_ALIASES.get(raw_result, None)
+    if norm_result is None:
+        # 尝试修复被 Latin-1 错误编码的乱码（如 '\u00e8\u0083\u009c' -> '胜'）
+        try:
+            hexes = re.findall(r"\\u([0-9a-fA-F]{4})", raw_result)
+            if len(hexes) >= 2:
+                decoded = bytes(int(h, 16) for h in hexes).decode("utf-8", "ignore")
+                norm_result = _RESULT_ALIASES.get(decoded, None)
+        except Exception:
+            norm_result = None
+    return norm_result or "未知"
+
+
+def _match_result_for_index(matches: Optional[list], idx: int) -> Optional[str]:
+    """按序号从输入对局列表重算焦点玩家的胜负（mc 数组顺序即第 idx 局）。
+
+    返回 胜/负/平，idx 越界或无对局数据时返回 None（交由调用方回退模型值）。
+    """
+    if not matches or not isinstance(matches, list):
+        return None
+    if idx < 1 or idx > len(matches):
+        return None
+    m = matches[idx - 1]
+    detail_data = (m.get("detail", {}) or {}).get("data") or {}
+    source = m.get("source_match") or {}
+    ret = detail_data.get("matchRet", source.get("matchRet"))
+    return {1: "胜", 0: "平", -1: "负"}.get(ret)
+
+
+def _normalize_result(data: dict, target_id: str, matches: Optional[list] = None) -> dict:
+    score = _clamp_score(data.get("sc"), 0)
     result = {
-        "target_id": str(data.get("target_id") or target_id),
+        "target_id": str(data.get("id") or target_id),
         "score": score,
         "verdict": _score_rule(score)["canonical"],
-        "summary": str(data.get("summary") or "暂无数据概况。").strip(),
+        "summary": str(data.get("sum") or "暂无数据概况。").strip(),
         "match_comments": [],
-        "overall_comment": str(data.get("overall_comment") or "暂无综合评价。").strip(),
+        "overall_comment": str(data.get("ov") or "暂无综合评价。").strip(),
         "teammate_comments": [],
     }
-    for i, item in enumerate(data.get("match_comments") or [], start=1):
+    for i, item in enumerate(data.get("mc") or [], start=1):
         if not isinstance(item, dict):
             continue
-        raw_result = str(item.get("result") or "未知").strip()
-        norm_result = _RESULT_ALIASES.get(raw_result, None)
-        if norm_result is None:
-            # 尝试修复被 Latin-1 错误编码的乱码（如 '\u00e8\u0083\u009c' -> '胜'）
-            try:
-                hexes = re.findall(r"\\u([0-9a-fA-F]{4})", raw_result)
-                if len(hexes) >= 2:
-                    decoded = bytes(int(h, 16) for h in hexes).decode("utf-8", "ignore")
-                    norm_result = _RESULT_ALIASES.get(decoded, None)
-            except Exception:
-                norm_result = None
-        if norm_result is None:
-            norm_result = "未知"
+        # 跳过截断恢复产生的空对象（既无 c 也无 h 的占位项）
+        if not item.get("c") and not item.get("h"):
+            continue
+        # 胜负：analyze 路径用输入对局重算覆盖（与真实胜负一致）；否则回退模型 r / 未知
+        res = _match_result_for_index(matches, i)
+        if res is None:
+            res = _norm_result_str(item.get("r"))
         result["match_comments"].append({
-            "index": _clamp_score(item.get("index"), i),
-            "result": norm_result,
-            "hero": str(item.get("hero") or "未知英雄"),
-            "comment": str(item.get("comment") or "暂无点评。").strip(),
+            "index": i,
+            "result": res,
+            "hero": str(item.get("h") or "未知英雄"),
+            "comment": str(item.get("c") or "暂无点评。").strip(),
         })
-    for item in data.get("teammate_comments") or []:
+    for item in data.get("tm") or []:
         if not isinstance(item, dict):
             continue
-        tm_score = _clamp_score(item.get("score"), 0)
+        # 跳过截断恢复产生的空对象（无 n 的占位项）
+        if not item.get("n"):
+            continue
+        tm_score = _clamp_score(item.get("ts"), 0)
         teammate = {
-            "name": str(item.get("name") or "未知队友"),
+            "name": str(item.get("n") or "未知队友"),
             "score": tm_score,
             "verdict": _score_rule(tm_score)["canonical"],
-            "comment": str(item.get("comment") or "暂无点评。").strip(),
+            "comment": str(item.get("c") or "暂无点评。").strip(),
         }
-        if item.get("games") is not None:
-            teammate["games"] = max(1, _clamp_score(item.get("games"), 1))
+        if item.get("g") is not None:
+            teammate["games"] = max(1, _clamp_score(item.get("g"), 1))
         result["teammate_comments"].append(teammate)
     return result
 
@@ -366,6 +403,107 @@ def _fix_mojibake(text: str) -> str:
     return re.sub(r"(?:\\u[0-9a-fA-F]{4}){2,}", repl, text)
 
 
+def _find_first_balanced_object(text: str) -> Optional[str]:
+    """从首个 '{' 开始，扫描出第一个结构完整（括号配平）的 JSON 对象字符串。
+
+    用于应对「模型一次吐出多个拼接的 JSON 对象」的情况：只取最前面的
+    那个完整对象，避免把两个对象拼成一段非法 JSON 导致整段解析失败。
+    若文本被截断（首对象未闭合）则返回 None，交由截断恢复逻辑处理。
+    """
+    text = (text or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        i += 1
+    return None
+
+
+def _recover_truncated_json(text: str) -> Optional[str]:
+    """尝试修复「被截断的 JSON」：补上未闭合的字符串、空容器开括号与缺失的闭合括号。
+
+    典型场景：模型输出触顶被截断（teammate_comments 只剩半个对象、comment 字符串
+    没闭合等）。按字符扫描记录容器栈与字符串状态，到 EOF 时：
+      - 若仍在字符串内，先补一个 '"' 闭合；
+      - 若末尾是一个刚打开的空对象（前导是 ',' 或 '['），直接丢弃该开括号，避免残留 {} 空对象；
+      - 丢弃末尾多余的 ',' 与悬空的 ':'（补 null）；
+      - 按栈逆序补上缺失的 '}' / ']'。
+    修复后若仍为非法 JSON，调用方 json.loads 会失败并继续回退，不会引入回归。
+    """
+    text = (text or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    text = text[start:]
+    stack = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}":
+            if stack and stack[-1] == "{":
+                stack.pop()
+        elif ch == "]":
+            if stack and stack[-1] == "[":
+                stack.pop()
+
+    if in_string:
+        text += '"'
+
+    # 丢弃末尾刚打开的空对象（如 teammate_comments 里那个没内容的 "{"）
+    stripped = text.rstrip()
+    if stripped.endswith("{"):
+        prev = stripped[:-1].rstrip()
+        if prev and prev[-1] in (",", "["):
+            text = prev
+            if stack and stack[-1] == "{":
+                stack.pop()
+
+    text = text.rstrip()
+    if text.endswith(","):
+        text = text[:-1].rstrip()
+    if text.endswith(":"):
+        text += " null"
+
+    close_map = {"{": "}", "[": "]"}
+    while stack:
+        text += close_map[stack.pop()]
+    return text
+
+
 def _extract_json_object(text: str) -> Optional[dict]:
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
@@ -383,8 +521,16 @@ def _extract_json_object(text: str) -> Optional[dict]:
             cleaned = json.dumps(arr[0], ensure_ascii=False) if not isinstance(arr[0], dict) else cleaned
             if isinstance(arr[0], dict):
                 return arr[0]
-    attempts = [
-        cleaned,
+
+    candidates: List[str] = [cleaned]
+
+    # 拼接的多个对象：取第一个完整对象
+    first_obj = _find_first_balanced_object(cleaned)
+    if first_obj is not None:
+        candidates.append(first_obj)
+
+    # 现有修复链
+    candidates += [
         _repair_json_delimiters(cleaned),
         _repair_json(cleaned),
         _repair_json_structure(cleaned),
@@ -397,18 +543,20 @@ def _extract_json_object(text: str) -> Optional[dict]:
         _repair_json_delimiters(_repair_json_values(cleaned)),
         _repair_json(_repair_json_delimiters(_repair_json_structure(cleaned))),
     ]
-    for attempt in attempts:
-        try:
-            data = json.loads(attempt)
-            return data if isinstance(data, dict) else None
-        except Exception:
-            pass
+    # 截断恢复
+    recovered = _recover_truncated_json(cleaned)
+    if recovered:
+        candidates.append(recovered)
+
     start = cleaned.find("{")
     end = cleaned.rfind("}")
     if start >= 0 and end > start:
         snippet = _fix_mojibake(cleaned[start:end + 1])
-        attempts = [
-            snippet,
+        candidates += [snippet]
+        fobj = _find_first_balanced_object(snippet)
+        if fobj is not None:
+            candidates.append(fobj)
+        candidates += [
             _repair_json_delimiters(snippet),
             _repair_json(snippet),
             _repair_json_structure(snippet),
@@ -419,20 +567,26 @@ def _extract_json_object(text: str) -> Optional[dict]:
             _repair_json_delimiters(_repair_json_structure(snippet)),
             _repair_json_delimiters(_repair_json_values(snippet)),
         ]
-        for attempt in attempts:
-            try:
-                data = json.loads(attempt)
-                return data if isinstance(data, dict) else None
-            except Exception:
-                pass
+        rec = _recover_truncated_json(snippet)
+        if rec:
+            candidates.append(rec)
+
+    for attempt in candidates:
+        if not attempt:
+            continue
+        try:
+            data = json.loads(attempt)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            pass
     return None
 
 
-def _parse_llm_json_result(raw_text: str, target_id: str) -> Optional[dict]:
+def _parse_llm_json_result(raw_text: str, target_id: str, matches: Optional[list] = None) -> Optional[dict]:
     data = _extract_json_object(raw_text)
     if data is None:
         return None
-    return _normalize_result(data, target_id)
+    return _normalize_result(data, target_id, matches=matches)
 
 
 # ── Prompt 构建（与原始 shiqu.py 一致）──
@@ -462,6 +616,7 @@ def _segment_present_guids(entry: dict, hero_guid: str, name_map: dict) -> set:
 
 
 # ── 压缩提示词：模块级共享数据结构 ──
+
 
 def _get_role(p) -> str:
     return HERO_DICT.get(str(p.get("heroGuid", "")), {}).get("role", "unknown")
@@ -770,13 +925,12 @@ def _build_system_prompt() -> str:
 2. 仅基于比赛数据，胜负不影响评价；缺数据保守评价。
 
 [OUTPUT] 输出格式
-严格输出符合 JSON Schema 的合法 JSON 对象，禁止 markdown/代码块/注释/JSON 外文字。
+严格输出符合 JSON Schema 的合法 JSON 对象，禁止 markdown/代码块/注释/JSON 外文字。字段使用下方 schema 的短键（sc/sum/mc/ov/tm/id 等），不要使用长键名。
 - 字符串用中文、简练；禁止英文双引号，引用用「」或『』；emoji 按上限使用。
-- result 仅可：胜、负、平、未知。
-- summary≤100字，客观数据概览。
-- match_comments：遍历 matches，每局输出一条；index 用输入 index；comment≤45字且含至少1个数字，≤1 emoji；异常写「数据缺失，无法评价」。
-- overall_comment≤300字，≤2 emoji。
-- teammate_comments：覆盖全部好友；name 用给定值，score≥50夸<50串，comment≤60字，0 emoji。
+- 胜负（r）只可取：胜、负、平、未知。
+- 顶层：sc=评分(整数0-100，基准50)；sum=数据概览(≤100字，客观)；mc=逐局点评数组；ov=综合评价(≤300字，≤2 emoji)；id=玩家ID(可选，缺省用给定 target_id)；tm=好友点评数组(可选，但只要有好友就必须覆盖全部)。
+- mc 每局一条：h=英雄名(与输入对齐的英雄，多英雄用「/」分隔)；c=点评(≤45字且含至少1个数字，≤1 emoji)；序号由数组顺序决定（第1条对应第1局），不要输出 index 字段；胜负由输入对局 res 决定，不要输出 result 字段（异常局 c 写「数据缺失，无法评价」）；若仍输出 r，也仅可取 胜/负/平/未知。
+- tm 覆盖全部好友：n=好友ID(用给定值)；ts=评分(整数0-100，≥50夸<50串)；c=点评(≤60字，0 emoji)；g=同场次数(可选，整数)。
 JSON Schema：
 {json.dumps(_SHIQU_JSON_SCHEMA, ensure_ascii=False, indent=2)}"""
 
@@ -805,65 +959,79 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
     if not (cfg.base_url and cfg.api_key and cfg.model):
         logger.error("[shiqu] LLM 配置不完整，请在 config/shiqu_config.py 中填写 SHIQU_LLM_BASE_URL / SHIQU_LLM_API_KEY / SHIQU_LLM_MODEL")
         return None
-    payload = {
-        "model": cfg.model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": cfg.stream,
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {"name": "shiqu_result", "strict": False, "schema": _SHIQU_JSON_SCHEMA},
-        },
-    }
+
+    def _build_payload(strict: bool) -> dict:
+        return {
+            "model": cfg.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": cfg.stream,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "shiqu_result", "strict": strict, "schema": _SHIQU_JSON_SCHEMA},
+            },
+        }
+
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
     from ..analysis_common import build_async_client, get_analysis_proxy, LLM_SEMAPHORE
     proxy = get_analysis_proxy(cfg.base_url)
     await LLM_SEMAPHORE.acquire()  # 限制对外部 LLM 端点的并发（shiqu/court 共享 2 槽，受 AsyncRunner 单循环控制）
     try:
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
-            try:
-                if cfg.stream:
-                    parts = []
-                    async with client.stream("POST", cfg.chat_url, json=payload, headers=headers) as resp:
+
+            async def _do_request(strict: bool) -> Optional[str]:
+                payload = _build_payload(strict)
+                try:
+                    if cfg.stream:
+                        parts = []
+                        async with client.stream("POST", cfg.chat_url, json=payload, headers=headers) as resp:
+                            resp.raise_for_status()
+                            async for line in resp.aiter_lines():
+                                line = line.strip()
+                                if not line.startswith("data:"):
+                                    continue
+                                chunk = line[5:].strip()
+                                if chunk == "[DONE]":
+                                    break
+                                try:
+                                    obj = json.loads(chunk)
+                                except Exception:
+                                    continue
+                                if not isinstance(obj, dict):
+                                    continue
+                                choices = obj.get("choices")
+                                if not isinstance(choices, list) or not choices:
+                                    continue
+                                first = choices[0]
+                                if not isinstance(first, dict):
+                                    continue
+                                delta = first.get("delta") or {}
+                                if isinstance(delta, dict) and "content" in delta:
+                                    parts.append(delta["content"])
+                        return "".join(parts).strip() or None
+                    else:
+                        resp = await client.post(cfg.chat_url, json=payload, headers=headers)
                         resp.raise_for_status()
-                        async for line in resp.aiter_lines():
-                            line = line.strip()
-                            if not line.startswith("data:"):
-                                continue
-                            chunk = line[5:].strip()
-                            if chunk == "[DONE]":
-                                break
-                            try:
-                                obj = json.loads(chunk)
-                            except Exception:
-                                continue
-                            if not isinstance(obj, dict):
-                                continue
-                            choices = obj.get("choices")
-                            if not isinstance(choices, list) or not choices:
-                                continue
-                            first = choices[0]
-                            if not isinstance(first, dict):
-                                continue
-                            delta = first.get("delta") or {}
-                            if isinstance(delta, dict) and "content" in delta:
-                                parts.append(delta["content"])
-                    return "".join(parts).strip() or None
-                else:
-                    resp = await client.post(cfg.chat_url, json=payload, headers=headers)
-                    resp.raise_for_status()
-                    data = resp.json()
-                    choices = data.get("choices") if isinstance(data, dict) else None
-                    if not isinstance(choices, list) or not choices:
-                        return None
-                    msg = choices[0] if isinstance(choices[0], dict) else {}
-                    content = (msg.get("message") or {}).get("content") or ""
-                    return str(content).strip() or None
-            except Exception as e:
-                logger.error(f"[shiqu] LLM 调用异常: {e}", exc_info=True)
-                return None
+                        data = resp.json()
+                        choices = data.get("choices") if isinstance(data, dict) else None
+                        if not isinstance(choices, list) or not choices:
+                            return None
+                        msg = choices[0] if isinstance(choices[0], dict) else {}
+                        content = (msg.get("message") or {}).get("content") or ""
+                        return str(content).strip() or None
+                except Exception as e:
+                    logger.error(f"[shiqu] LLM 调用异常 (strict={strict}): {e}", exc_info=True)
+                    return None
+
+            # strict 优先；若网关不支持 strict 而拒答，自动降级重试一次 strict=False，
+            # 保证兼容性的同时尽量拿到结构化输出。
+            content = await _do_request(cfg.strict)
+            if content is None and cfg.strict:
+                logger.warning("[shiqu] strict 模式请求失败，降级重试 strict=False")
+                content = await _do_request(False)
+            return content
     finally:
         LLM_SEMAPHORE.release()
 
@@ -1144,7 +1312,7 @@ class ShiquModule:
             for attempt in range(1, max_attempts + 1):
                 call_count += 1
                 last_text = await _call_llm(system_prompt, user_prompt) or ""
-                result = _parse_llm_json_result(last_text, full_id) if last_text else None
+                result = _parse_llm_json_result(last_text, full_id, matches=details) if last_text else None
                 if result:
                     break
                 logger.warning(f"[shiqu] LLM 尝试 {attempt}/{max_attempts} 失败，准备重试")
@@ -1172,6 +1340,7 @@ class ShiquModule:
                     ok=success,
                     duration_ms=duration_ms,
                     call_count=call_count,
+                    normalized_json=json.dumps(result, ensure_ascii=False) if result else "",
                 )
             except Exception as exc:
                 logger.warning(f"[shiqu] LLM 调用记录落库失败（已忽略）: {exc}")
@@ -1200,21 +1369,35 @@ class ShiquModule:
         """
         target_id = str(query.bnet_id or f"token:{query.customer_token[:8]}")
         row = await asyncio.to_thread(shiqu_llm_recorder.db.get_latest_by_target, target_id)
-        if not row or not (row.get("raw_response") or "").strip():
-            raise ModuleError(
-                error="db_record_not_found",
-                message=f"数据库中未找到玩家 {target_id} 的判定记录，请先正常生成一次。",
-                status_code=404,
-            )
-        result = _parse_llm_json_result(row["raw_response"], target_id)
-        if not result:
-            raise ModuleError(
-                error="db_record_parse_failed",
-                message="数据库中的判定记录无法解析（raw_response 不是合法 JSON）。",
-                status_code=500,
-            )
+        raw_response = (row or {}).get("raw_response") or ""
+        normalized_json = (row or {}).get("normalized_json") or ""
+        created_at = (row or {}).get("created_at")
+
+        # use_db 模式：优先复用已落库的归一化结果（与输出 schema 解耦，渲染稳定）；
+        # 旧记录没有 normalized_json 时，回退到解析 raw_response（向后兼容）。
+        result = None
+        if normalized_json.strip():
+            try:
+                parsed = json.loads(normalized_json)
+                if isinstance(parsed, dict):
+                    result = parsed
+            except Exception:
+                result = None
+        if result is None:
+            if not raw_response.strip():
+                raise ModuleError(
+                    error="db_record_not_found",
+                    message=f"数据库中未找到玩家 {target_id} 的判定记录，请先正常生成一次。",
+                    status_code=404,
+                )
+            result = _parse_llm_json_result(raw_response, target_id)
+            if not result:
+                raise ModuleError(
+                    error="db_record_parse_failed",
+                    message="数据库中的判定记录无法解析（raw_response 不是合法 JSON）。",
+                    status_code=500,
+                )
         # use_db 模式：渲染时间取该记录的落库时间，而非当前时间。
-        created_at = row.get("created_at")
         if created_at:
             result["generated_at"] = time.strftime(
                 "%Y-%m-%d %H:%M:%S", time.localtime(int(created_at))

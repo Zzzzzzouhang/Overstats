@@ -52,6 +52,7 @@ class _ShiquLLMEvent:
     ok: bool = False
     duration_ms: int = 0
     call_count: int = 0
+    normalized_json: str = ""
 
 
 def _build_row(event: _ShiquLLMEvent) -> Tuple:
@@ -64,6 +65,7 @@ def _build_row(event: _ShiquLLMEvent) -> Tuple:
         int(event.duration_ms or 0),
         int(event.call_count or 0),
         int(time.time()),
+        str(event.normalized_json or ""),
     )
 
 
@@ -125,6 +127,19 @@ class ShiquLLMDB:
                 )
                 """
             )
+            # 归一化结果（已由 service 解析为渲染用的完整结构）。use_db 模式直接复用它，
+            # 不再依赖对 raw_response 的二次解析，从而与输出 JSON schema 解耦：
+            # 即便将来再次调整 schema，旧记录的归一化结果仍可正常渲染。
+            # 旧库无该列时用 ALTER 补列（重复加列会报错，忽略即可）。
+            try:
+                connection.execute(
+                    f"""
+                    ALTER TABLE {SHIQU_LLM_RESULT_TABLE}
+                    ADD COLUMN normalized_json TEXT NOT NULL DEFAULT ''
+                    """
+                )
+            except Exception:
+                pass
             connection.execute(
                 f"""
                 CREATE INDEX IF NOT EXISTS idx_shiqu_result_target
@@ -163,8 +178,8 @@ class ShiquLLMDB:
             cursor.execute(
                 f"""
                 INSERT INTO {SHIQU_LLM_RESULT_TABLE}
-                (target_id, ok, prompt, raw_response, duration_ms, call_count, created_at)
-                VALUES (?,?,?,?,?,?,?)
+                (target_id, ok, prompt, raw_response, duration_ms, call_count, created_at, normalized_json)
+                VALUES (?,?,?,?,?,?,?,?)
                 """,
                 _build_row(event),
             )
@@ -255,7 +270,7 @@ class ShiquLLMDB:
         try:
             row = connection.execute(
                 f"""
-                SELECT raw_response, ok, created_at
+                SELECT raw_response, ok, created_at, normalized_json
                 FROM {SHIQU_LLM_RESULT_TABLE}
                 WHERE target_id = ?
                 ORDER BY created_at DESC, id DESC
@@ -269,6 +284,7 @@ class ShiquLLMDB:
                 "raw_response": str(row[0] or ""),
                 "ok": bool(row[1]),
                 "created_at": row[2],
+                "normalized_json": str(row[3] or ""),
             }
         except Exception:
             return None
@@ -368,6 +384,7 @@ class ShiquLLMRecorder:
         ok: bool = False,
         duration_ms: int = 0,
         call_count: int = 0,
+        normalized_json: str = "",
     ) -> None:
         if not is_database_write_enabled():
             return
@@ -384,6 +401,7 @@ class ShiquLLMRecorder:
                     ok=bool(ok),
                     duration_ms=int(duration_ms or 0),
                     call_count=int(call_count or 0),
+                    normalized_json=str(normalized_json or ""),
                 )
             )
         except asyncio.QueueFull:

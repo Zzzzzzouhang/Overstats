@@ -38,6 +38,13 @@ class ShiquLLMConfig:
     # LLM 失败重试次数。0 = 仅调用 1 次（不重试）；N = 初始 1 次 + 重试 N 次。
     retry: int = 0
 
+    # 是否启用 JSON Schema 的 strict 模式（response_format.strict）。
+    # True = 强制模型输出严格符合 schema 的合法 JSON（推荐，能大幅降低解析失败）；
+    # 部分第三方/中转网关不支持 strict，会在请求阶段直接拒答，此时可设为 False。
+    # 即便为 True，本模块在 strict 请求失败时也会自动降级重试一次 strict=False，
+    # 因此即使网关不兼容也不会直接判定失败。
+    strict: bool = True
+
     @property
     def chat_url(self) -> str:
         base = str(self.base_url or "").rstrip("/")
@@ -56,6 +63,7 @@ _ENV_TO_FIELD = {
     "SHIQU_LLM_STREAM": "stream",
     "SHIQU_LLM_TIMEOUT": "timeout_seconds",
     "SHIQU_LLM_RETRY": "retry",
+    "SHIQU_LLM_STRICT": "strict",
 }
 
 
@@ -89,6 +97,7 @@ def get_shiqu_llm_config() -> ShiquLLMConfig:
         stream=_parse_bool(_get("SHIQU_LLM_STREAM", "true")),
         timeout_seconds=int(_get("SHIQU_LLM_TIMEOUT", "300") or 300),
         retry=int(_get("SHIQU_LLM_RETRY", "0") or 0),
+        strict=_parse_bool(_get("SHIQU_LLM_STRICT", "true")),
     )
 
 

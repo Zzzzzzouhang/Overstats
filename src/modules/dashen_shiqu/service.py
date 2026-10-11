@@ -168,18 +168,19 @@ def _infer_hero_guid_from_stat_map(stat_map: dict, fallback_hero_guid: str = "",
     return fallback_hero_guid if allow_fallback else ""
 
 
-# 紧凑键 + 去冗余的 strict 兼容 schema（方案 A）：
+# 紧凑键 + strict 兼容 schema（方案 A）：
 # - 输出键全部缩短（sc=评分 sum=概览 mc=逐局 ov=综合 tm=好友 id=玩家），
 #   直接削减输出 token、缓解 max_tokens 截断；
-# - 去掉 match 项的 index（序号由数组顺序决定）与 result（胜负由输入对局 res 重算，
-#   r 仅作可选兜底，analyze 路径一律用输入重算覆盖，保证与真实胜负一致）；
-# - 字段重排：核心字段 sc/sum/mc/ov 前置，tm（好友，最不重要）置末且移出 required；
-#   id 也设为可选，缺省由 query 回填。截断时优先丢失 tm，核心判定书完整。
-# - 仍只用 strict 支持的关键字（type/enum/required/properties/items/additionalProperties）。
+# - 去掉 match 项的 index（序号由数组顺序决定）；result 仍保留 r 字段作兜底
+#   （analyze 路径用输入对局 res 重算覆盖，保证与真实胜负一致）；
+# - 字段重排：核心字段 sc/sum/mc/ov 前置，tm（好友）置末。
+#   注意：strict 模式要求「每个 properties 键都必须出现在 required 中」，
+#   因此 id / tm / r / g 均为必填（无法设为可选）。截断兜底由 _recover_truncated_json 负责。
+# - 仅用 strict 支持的关键字（type/enum/required/properties/items/additionalProperties）。
 _SHIQU_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["sc", "sum", "mc", "ov"],
+    "required": ["id", "sc", "sum", "mc", "ov", "tm"],
     "properties": {
         "id": {"type": "string"},
         "sc": {"type": "integer"},
@@ -189,7 +190,7 @@ _SHIQU_JSON_SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["h", "c"],
+                "required": ["h", "c", "r"],
                 "properties": {
                     "h": {"type": "string"},
                     "c": {"type": "string"},
@@ -203,7 +204,7 @@ _SHIQU_JSON_SCHEMA = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["n", "ts", "c"],
+                "required": ["n", "ts", "c", "g"],
                 "properties": {
                     "n": {"type": "string"},
                     "ts": {"type": "integer"},
@@ -928,9 +929,9 @@ def _build_system_prompt() -> str:
 严格输出符合 JSON Schema 的合法 JSON 对象，禁止 markdown/代码块/注释/JSON 外文字。字段使用下方 schema 的短键（sc/sum/mc/ov/tm/id 等），不要使用长键名。
 - 字符串用中文、简练；禁止英文双引号，引用用「」或『』；emoji 按上限使用。
 - 胜负（r）只可取：胜、负、平、未知。
-- 顶层：sc=评分(整数0-100，基准50)；sum=数据概览(≤100字，客观)；mc=逐局点评数组；ov=综合评价(≤300字，≤2 emoji)；id=玩家ID(可选，缺省用给定 target_id)；tm=好友点评数组(可选，但只要有好友就必须覆盖全部)。
-- mc 每局一条：h=英雄名(与输入对齐的英雄，多英雄用「/」分隔)；c=点评(≤45字且含至少1个数字，≤1 emoji)；序号由数组顺序决定（第1条对应第1局），不要输出 index 字段；胜负由输入对局 res 决定，不要输出 result 字段（异常局 c 写「数据缺失，无法评价」）；若仍输出 r，也仅可取 胜/负/平/未知。
-- tm 覆盖全部好友：n=好友ID(用给定值)；ts=评分(整数0-100，≥50夸<50串)；c=点评(≤60字，0 emoji)；g=同场次数(可选，整数)。
+- 顶层：sc=评分(整数0-100，基准50)；sum=数据概览(≤100字，客观)；mc=逐局点评数组；ov=综合评价(≤300字，≤2 emoji)；id=玩家ID(必填，等于给定 target_id)；tm=好友点评数组(必填，无好友时输出空数组 [])。
+- mc 每局一条：h=英雄名(与输入对齐的英雄，多英雄用「/」分隔)；c=点评(≤45字且含至少1个数字，≤1 emoji)；序号由数组顺序决定（第1条对应第1局），不要输出 index 字段；r=胜负(必填，取 胜/负/平/未知；最终以输入对局 res 为准覆盖)；异常局 c 写「数据缺失，无法评价」。
+- tm 覆盖全部好友：n=好友ID(用给定值)；ts=评分(整数0-100，≥50夸<50串)；c=点评(≤60字，0 emoji)；g=同场次数(必填，整数)。
 JSON Schema：
 {json.dumps(_SHIQU_JSON_SCHEMA, ensure_ascii=False, indent=2)}"""
 

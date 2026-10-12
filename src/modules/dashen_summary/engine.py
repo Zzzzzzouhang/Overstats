@@ -36,7 +36,8 @@ TITLE_BY_SCOPE = {
     "yesterday": "昨日总结",
     "week": "本周总结",
 }
-DEFAULT_SUMMARY_CONCURRENCY = 2
+# 0 表示不限制并发；正整数表示同时处理的总结请求数量上限。
+DEFAULT_SUMMARY_CONCURRENCY = 0
 DEFAULT_MATCH_LOOKBACK_DAYS = 8
 DEFAULT_WEATHER_LOOKBACK_DAYS = 45
 DEFAULT_WEATHER_CACHE_TTL = 600
@@ -58,11 +59,24 @@ def _read_env_int(name: str, default: int) -> int:
         return int(default)
 
 
-SUMMARY_CONCURRENCY = max(
-    1,
-    _read_env_int("OVERSTATS_SUMMARY_CONCURRENCY", DEFAULT_SUMMARY_CONCURRENCY),
-)
-SUMMARY_SEMAPHORE = asyncio.Semaphore(SUMMARY_CONCURRENCY)
+class _UnlimitedSemaphore:
+    """不限制并发的异步上下文管理器，等价于无限信号量。"""
+    async def __aenter__(self) -> "_UnlimitedSemaphore":
+        return self
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+_raw_summary_concurrency = _read_env_int("OVERSTATS_SUMMARY_CONCURRENCY", DEFAULT_SUMMARY_CONCURRENCY)
+if _raw_summary_concurrency and _raw_summary_concurrency > 0:
+    SUMMARY_CONCURRENCY = _raw_summary_concurrency
+    SUMMARY_SEMAPHORE = asyncio.Semaphore(SUMMARY_CONCURRENCY)
+    SUMMARY_LIMITED = True
+else:
+    # 0 或负数：不限制并发，所有请求正常处理，不再返回 summary_busy。
+    SUMMARY_CONCURRENCY = 0
+    SUMMARY_SEMAPHORE = _UnlimitedSemaphore()
+    SUMMARY_LIMITED = False
 SUMMARY_MATCH_FETCH_LOOKBACK_DAYS = max(
     8,
     _read_env_int("OVERSTATS_SUMMARY_MATCH_LOOKBACK_DAYS", DEFAULT_MATCH_LOOKBACK_DAYS),
@@ -576,7 +590,7 @@ async def render_summary_payload(query: Any) -> Dict[str, Any]:
     title_text = title_for_scope(scope)
     timer = StageTimer()
     timer.mark("REQUEST_START")
-    if SUMMARY_SEMAPHORE.locked():
+    if SUMMARY_LIMITED and SUMMARY_SEMAPHORE.locked():
         timer.mark("MODULE_BUSY", f"summary_concurrency={SUMMARY_CONCURRENCY}")
         raise ModuleError(
             error="summary_busy",

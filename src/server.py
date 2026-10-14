@@ -263,9 +263,13 @@ def _build_ow_hero_perk_query(payload: Dict[str, object]) -> OWHeroPerkQuery:
 
 
 def _build_dashen_hero_treemap_query(payload: Dict[str, object]) -> DashenHeroTreemapQuery:
+    try:
+        from overstats.src.modules.dashen_hero_treemap.mini_program import get_hero_module_mode
+    except ModuleNotFoundError:
+        from src.modules.dashen_hero_treemap.mini_program import get_hero_module_mode
     raw_mode = str(payload.get("mode") or "").strip()
     try:
-        mode = normalize_treemap_mode(raw_mode)
+        mode = normalize_treemap_mode(raw_mode, allow_stadium=get_hero_module_mode() == 1)
     except ValueError as exc:
         raise ModuleError(
             error="invalid_treemap_query",
@@ -274,8 +278,9 @@ def _build_dashen_hero_treemap_query(payload: Dict[str, object]) -> DashenHeroTr
             details={"mode": raw_mode},
         ) from exc
     return DashenHeroTreemapQuery(
-        bnet_id=str(payload.get("bnet_id") or payload.get("bnetId") or "").strip(),
+        bnet_id=str(payload.get("bnet_id") or payload.get("bnetId") or payload.get("bnetID") or payload.get("battle_tag") or payload.get("bnet_name") or "").strip(),
         customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
+        xcxtoken=str(payload.get("xcxtoken") or payload.get("xcxToken") or "").strip(),
         season=_coerce_optional_int(payload, "season", "season_c"),
         include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
         mode=mode,
@@ -473,6 +478,25 @@ class OverstatsCoreService:
             "blizzard_profile_image",
             lambda: self._handle_blizzard_profile_image(payload),
         )
+
+    async def handle_career_compare(self, payload, *, render=False):
+        from .modules.career_compare import CareerCompareQuery, career_compare_module
+
+        if payload.get("season") not in (None, "", "total"):
+            raise ModuleError(error="unsupported_career_season", message="生涯对比仅支持累计数据，请省略 season。", status_code=400)
+        query = CareerCompareQuery(
+            player1=str(payload.get("player1") or ""),
+            player2=str(payload.get("player2") or ""),
+            hero=str(payload.get("hero") or ""),
+            mode=str(payload.get("mode") or "quick"),
+            xcxtoken=str(payload.get("xcxtoken") or payload.get("xcxToken") or ""),
+        )
+
+        async def run():
+            result = await career_compare_module.query_compare(query, render=render)
+            return result.image.content if render else result.to_dict()
+
+        return await self.dashen_request_queue.run("career_compare", run)
 
     async def handle_dashen_hero_compare(self, payload, *, render=False):
         async def run():
@@ -773,6 +797,8 @@ class OverstatsCoreService:
             "/api/v2/dashen-quick-strength/image": lambda: self.handle_dashen_quick_strength_image(selection.payload),
             "/api/v2/dashen-competitive-strength/image": lambda: self.handle_dashen_competitive_strength_image(selection.payload),
             "/api/v2/dashen-hero-compare/image": lambda: self.handle_dashen_hero_compare_image(selection.payload),
+            "/api/v2/career-compare/image": lambda: self.handle_career_compare(
+                {**selection.payload, "xcxtoken": payload.get("xcxtoken") or payload.get("xcxToken") or ""}, render=True),
             "/api/v2/dashen-hero-treemap/image": lambda: self.handle_dashen_hero_treemap_image(selection.payload),
             "/api/v2/ow-hero-perk/image": lambda: self.handle_ow_hero_perk_image(selection.payload),
             "/api/v2/ow_hero_wiki/image": lambda: self.handle_ow_hero_wiki_image(selection.payload),
@@ -893,11 +919,11 @@ class OverstatsCoreService:
         return result.image.content, result.image.media_type
 
     async def handle_ow_esports(self, payload: Dict[str, object]) -> Dict[str, object]:
-        result = await ow_esports_module.query_ow_esports(render=False)
+        result = await ow_esports_module.query_ow_esports(render=False, region=payload.get("region", "china"))
         return result.to_dict()
 
     async def handle_ow_esports_image(self, payload: Dict[str, object]) -> bytes:
-        result = await ow_esports_module.query_ow_esports(render=True)
+        result = await ow_esports_module.query_ow_esports(render=True, region=payload.get("region", "china"))
         if not result.image:
             raise ModuleError(
                 error="render_failed",
@@ -2130,6 +2156,9 @@ class AsyncRunner:
 
 
 def create_server(config: APIConfig) -> ThreadingHTTPServer:
+    # Purge legacy identity storage even when database writes are disabled.
+    from .db.privacy import purge_player_storage
+    purge_player_storage()
     query_tool_config = load_query_tool()
     asset_status = ensure_query_tool_assets(query_tool_config)
     print(
@@ -2160,7 +2189,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     match_detail_recorder = MatchDetailRecorder() if config.enable_database_write else None
     if match_detail_recorder is not None:
         async_runner.run(match_detail_recorder.start())
-    player_identity_recorder = PlayerIdentityRecorder() if config.enable_database_write else None
+    player_identity_recorder = None
     if player_identity_recorder is not None:
         async_runner.run(player_identity_recorder.start())
     match_list_recorder = MatchListRecorder() if config.enable_database_write else None
@@ -2390,6 +2419,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 self._handle_dashen_profile_post()
                 return
 
+            if path in {"/api/v2/career-compare", "/api/v2/career-compare/image"}:
+                self._handle_career_compare_post(render=path.endswith("/image"))
+                return
             if path == "/api/v2/dashen-hero-compare/image":
                 self._handle_dashen_hero_compare_image_post()
                 return
@@ -3908,6 +3940,25 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return
 
             self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
+        def _handle_career_compare_post(self, *, render=False) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json", "message": "请求体必须是 JSON 对象。"})
+                return
+            try:
+                result = async_runner.run(service.handle_career_compare(payload, render=render))
+            except ModuleError as exc:
+                self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message})
+                return
+            except Exception:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "career_compare_failed", "message": "生涯对比暂不可用，请稍后重试。"})
+                return
+            if render:
+                self._send_binary(HTTPStatus.OK, result, "image/png")
+            else:
+                self._send_json(HTTPStatus.OK, result)
 
         def _handle_dashen_hero_compare_post(self) -> None:
             try:

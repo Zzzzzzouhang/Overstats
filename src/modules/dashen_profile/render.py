@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..dashen_promo import append_dashen_promo
+
 from dataclasses import dataclass
 from io import BytesIO
 import math
@@ -156,7 +158,10 @@ def render_profile_summary(context: ProfileRenderContext) -> RenderedImage:
     )
     _draw_recent_match_timeline(image, config, context.recent_matches, fonts)
 
-    return RenderedImage(content=finalize_rendered_image(image, gc_collect=True))
+    output = BytesIO()
+    image = append_dashen_promo(image, compact=True)
+    image.save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _draw_name_block(

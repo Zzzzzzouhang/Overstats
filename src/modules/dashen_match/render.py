@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..dashen_promo import append_dashen_promo
+
 from dataclasses import dataclass
 from io import BytesIO
 import json
@@ -146,7 +148,10 @@ def render_match_list(
             font=font_sm,
         )
 
-    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
+    output = BytesIO()
+    img = append_dashen_promo(img)
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _draw_title_with_risk_statuses(
@@ -332,7 +337,10 @@ def _render_scoreboard_match_detail(
         query_customer_token=query_customer_token,
     )
 
-    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
+    output = BytesIO()
+    img = append_dashen_promo(img)
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _extract_match_detail_data(payload: Any) -> Dict[str, Any]:
@@ -624,7 +632,10 @@ def _render_fight_match_detail(
             row_y += row_h
         y += round_h + round_gap
 
-    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
+    output = BytesIO()
+    img = append_dashen_promo(img)
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _draw_match_row(draw: Any, img: Any, config: Dict[str, Any], match: Dict[str, Any], index: int, y: int, font: Any, font_sm: Any) -> None:

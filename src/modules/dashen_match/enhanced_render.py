@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from ..dashen_promo import append_dashen_promo
+
 from collections import defaultdict
 from io import BytesIO
 
@@ -84,8 +86,12 @@ HIGHLIGHT_COLORS = {
 }
 
 
-def _pil_to_rendered(image: Any) -> RenderedImage:
-    return RenderedImage(content=finalize_rendered_image(image))
+def _pil_to_rendered(image: Any, *, add_promo: bool = True) -> RenderedImage:
+    output = BytesIO()
+    if add_promo:
+        image = append_dashen_promo(image)
+    image.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _open_rendered(rendered: RenderedImage) -> Any:
@@ -254,7 +260,8 @@ def decorate_rendered_image_header(
             bnet_id=bnet_id,
             subtitle=subtitle,
             risk_status=risk_status,
-        )
+        ),
+        add_promo=False,  # The input render already contains its footer.
     )
 
 

@@ -261,20 +261,8 @@ async def fetch_paginated_match_entries(
         cached_memory_payload = _get_memory_page_cache(key) if report_hit else _peek_memory_page_cache(key)
         if cached_memory_payload is not None:
             return cached_memory_payload
-        cached_page = db_adapter.get_match_list_page_cache(
-            source_kind=str(source_kind or "normal"),
-            customer_token=owner_key,
-            game_mode=str(game_mode or ""),
-            season_key=season_key(season),
-            page=int(page_num),
-            max_age_sec=MATCH_LIST_PAGE_CACHE_TTL,
-        )
-        if cached_page is not None and isinstance(cached_page.get("payload"), dict):
-            if report_hit:
-                _report_cache_hit("db")
-            payload = cached_page.get("payload")
-            _set_memory_page_cache(key, payload)
-            return payload
+        # DB-backed page cache was retired with the anonymous-only schema; memory
+        # cache + singleflight below remain the optimization surface.
         return None
 
     def payload_match_ids(payload: Any) -> List[str]:
@@ -394,7 +382,6 @@ async def fetch_match_list_page_cached(
     dashen-profile can keep their original page-count and boundary behavior.
     """
 
-    db_adapter = db or IDPoolDB()
     owner_key = cache_owner_key(customer_token=customer_token, bnet_id=bnet_id)
     normalized_page = max(1, int(page or 1))
     key = (
@@ -411,19 +398,6 @@ async def fetch_match_list_page_cached(
         cached_payload = _get_memory_page_cache(key)
         if cached_payload is not None:
             return cached_payload
-        cached_page = db_adapter.get_match_list_page_cache(
-            source_kind=str(source_kind or "normal"),
-            customer_token=owner_key,
-            game_mode=str(game_mode or ""),
-            season_key=season_key(season),
-            page=normalized_page,
-            max_age_sec=MATCH_LIST_PAGE_CACHE_TTL,
-        )
-        if cached_page is not None and isinstance(cached_page.get("payload"), dict):
-            _report_cache_hit("db")
-            payload = cached_page.get("payload")
-            _set_memory_page_cache(key, payload)
-            return payload
 
     payload = await list_page_singleflight.do(key, lambda: fetch_page(normalized_page))
     _set_memory_page_cache(key, payload)

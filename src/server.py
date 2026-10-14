@@ -18,11 +18,7 @@ logger = logging.getLogger("overstats.server")
 try:
     from overstats.config import APIConfig
     from overstats.src.client.apiclient import dashen_api_client, _upstream_acc_var, _UpstreamAcc
-    from overstats.src.db.match_detail_recorder import (
-        CountInfoRecorder,
-        MatchDetailRecorder,
-        MatchListRecorder,
-    )
+    from overstats.src.db.match_detail_recorder import MatchDetailRecorder
     from overstats.src.db.player_identity import PlayerIdentityRecorder
     from overstats.src.db.request_metrics import (
         RequestMetricsRecorder,
@@ -94,11 +90,7 @@ try:
 except ModuleNotFoundError:
     from config import APIConfig
     from src.client.apiclient import dashen_api_client, _upstream_acc_var, _UpstreamAcc
-    from src.db.match_detail_recorder import (
-        CountInfoRecorder,
-        MatchDetailRecorder,
-        MatchListRecorder,
-    )
+    from src.db.match_detail_recorder import MatchDetailRecorder
     from src.db.player_identity import PlayerIdentityRecorder
     from src.db.request_metrics import (
         RequestMetricsRecorder,
@@ -2192,12 +2184,6 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     player_identity_recorder = None
     if player_identity_recorder is not None:
         async_runner.run(player_identity_recorder.start())
-    match_list_recorder = MatchListRecorder() if config.enable_database_write else None
-    if match_list_recorder is not None:
-        async_runner.run(match_list_recorder.start())
-    count_info_recorder = CountInfoRecorder() if config.enable_database_write else None
-    if count_info_recorder is not None:
-        async_runner.run(count_info_recorder.start())
     if config.enable_database_write:  # shiqu_llm_recorder.start() 在开关关闭时自动 no-op
         async_runner.run(shiqu_llm_recorder.start())
         async_runner.run(court_llm_recorder.start())
@@ -2216,13 +2202,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     previous_match_detail_recorder = dashen_api_client.match_detail_recorder
     previous_player_identity_recorder = dashen_api_client.player_identity_recorder
     previous_request_metrics_recorder = dashen_api_client.request_metrics_recorder
-    previous_match_list_recorder = dashen_api_client.match_list_recorder
-    previous_count_info_recorder = dashen_api_client.count_info_recorder
     dashen_api_client.match_detail_recorder = match_detail_recorder
     dashen_api_client.player_identity_recorder = player_identity_recorder
     dashen_api_client.request_metrics_recorder = request_metrics_recorder
-    dashen_api_client.match_list_recorder = match_list_recorder
-    dashen_api_client.count_info_recorder = count_info_recorder
 
     class OverstatsRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -5234,17 +5216,11 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         dashen_api_client.match_detail_recorder = previous_match_detail_recorder
         dashen_api_client.player_identity_recorder = previous_player_identity_recorder
         dashen_api_client.request_metrics_recorder = previous_request_metrics_recorder
-        dashen_api_client.match_list_recorder = previous_match_list_recorder
-        dashen_api_client.count_info_recorder = previous_count_info_recorder
         async_runner.run(ow_hero_leaderboard_sync_service.close())
         if player_identity_recorder is not None:
             async_runner.run(player_identity_recorder.close())
         if match_detail_recorder is not None:
             async_runner.run(match_detail_recorder.close())
-        if match_list_recorder is not None:
-            async_runner.run(match_list_recorder.close())
-        if count_info_recorder is not None:
-            async_runner.run(count_info_recorder.close())
         if request_metrics_recorder is not None:
             async_runner.run(request_metrics_recorder.close())
         if endpoint_perf_recorder is not None:

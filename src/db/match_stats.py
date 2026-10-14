@@ -1354,6 +1354,12 @@ class IDPoolDB:
     def get_all_entries_ds2(self) -> List[Dict[str, Any]]:
         return []
 
+    def get_match_meta(self, match_ids: Any, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        # Retired with the anonymous-only schema: per-match metadata is no longer
+        # stored. Return an empty mapping (its native {id: meta} shape) so DB-first
+        # callers see "no row" and fall through to the live upstream API.
+        return {}
+
     def __getattr__(self, name: str) -> Any:
         def _noop(*args: Any, **kwargs: Any) -> Any:
             if name == "get_entry_ds_exact_ci_one":

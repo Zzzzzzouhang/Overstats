@@ -13,7 +13,6 @@ import time
 from collections import Counter, OrderedDict, defaultdict
 from functools import partial
 from math import ceil
-from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -164,26 +163,13 @@ async def _ensure_resolved_target_risk_status(resolved_target):
 
 def _summary_png_b64(image):
     image = append_dashen_promo(image, compact=False)
-    out = BytesIO()
-    try:
-        image.convert("RGB").save(
-            out,
-            format="JPEG",
-            quality=SUMMARY_IMAGE_JPEG_QUALITY,
-            optimize=False,
-            progressive=False,
-            subsampling=1,
-        )
-    except OSError:
-        image.convert("RGB").save(
-            out,
-            format="JPEG",
-            quality=max(65, SUMMARY_IMAGE_JPEG_QUALITY - 6),
-            optimize=False,
-            progressive=False,
-            subsampling=1,
-        )
-    return "base64://" + base64.b64encode(out.getvalue()).decode("utf-8")
+    data = finalize_rendered_image(
+        image,
+        format="JPEG",
+        jpeg_quality=SUMMARY_IMAGE_JPEG_QUALITY,
+        gc_collect=True,
+    )
+    return "base64://" + base64.b64encode(data).decode("utf-8")
 
 
 def _base64_payload_kb(image_b64):

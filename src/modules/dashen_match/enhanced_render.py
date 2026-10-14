@@ -87,11 +87,9 @@ HIGHLIGHT_COLORS = {
 
 
 def _pil_to_rendered(image: Any, *, add_promo: bool = True) -> RenderedImage:
-    output = BytesIO()
     if add_promo:
         image = append_dashen_promo(image)
-    image.convert("RGB").save(output, format="PNG", optimize=True)
-    return RenderedImage(content=output.getvalue())
+    return RenderedImage(content=finalize_rendered_image(image, gc_collect=True))
 
 
 def _open_rendered(rendered: RenderedImage) -> Any:

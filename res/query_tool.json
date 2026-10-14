@@ -90,7 +90,7 @@
       "prodUrl": "https://support.battlenet.com.cn/ld5/question/detail?template=ajfk_cht_ow_negative_ds"
     }
   ],
-  "noticeMessage": "",
+  "noticeMessage": "战绩工具新赛季适配中,预计8号完成",
   "pcNoticeMessage": {
     "sport": "",
     "leisure": "",
@@ -1601,7 +1601,7 @@
     {
       "id": "0x02E000000000012E",
       "heroGuid": "207165582859043118",
-      "roleGuid": "972777519512029262",
+      "roleGuid": "972777519512029265",
       "roleType": "healer",
       "name": "黑影",
       "icon": "https://img.166.net/gameyw-misc/opd/squash/20250318/163456-1rzmlhfd6e.png",
@@ -1945,7 +1945,7 @@
       "icon": "https://img.166.net/gameyw-misc/opd/squash/20260210/154928-n04kb6dpzt.png",
       "smallIconUrl": "https://img.166.net/gameyw-misc/opd/squash/20260210/154930-kt97nez3cm.png",
       "destinyHeroBanner": "https://img.166.net/gameyw-misc/opd/squash/20260410/095001-wbe54jhf86.png",
-      "cover": "https://img.166.net/gameyw-misc/opd/squash/20260211/105113-4zjs0q5thc.png",
+      "cover": "https://img.166.net/gameyw-misc/opd/squash/20261010/131416-zjeui52pnd.png",
       "ddHeroIcon": "https://img.166.net/gameyw-misc/opd/squash/20260509/142620-wstuzoeqia.png"
     },
     {
@@ -1969,7 +1969,7 @@
       "name": "西拉",
       "icon": "https://img.166.net/gameyw-misc/opd/squash/20260409/093913-tiza8w2vmd.png",
       "smallIconUrl": "https://img.166.net/gameyw-misc/opd/squash/20260409/093806-jsn02kgu8a.png",
-      "cover": "",
+      "cover": "https://img.166.net/gameyw-misc/opd/squash/20261010/131822-6cik0py3lg.png",
       "destinyHeroBanner": "https://img.166.net/gameyw-misc/opd/squash/20260811/131421-z4j5o8wu31.png",
       "ddHeroIcon": "https://img.166.net/gameyw-misc/opd/squash/20260509/142317-5vpiksb4hf.png"
     },
@@ -1981,7 +1981,7 @@
       "name": "死怨",
       "icon": "https://img.166.net/gameyw-misc/opd/squash/20260617/103249-5seylwhsvc.png",
       "smallIconUrl": "https://img.166.net/gameyw-misc/opd/squash/20260617/103249-y40i5fglj9.png",
-      "cover": "",
+      "cover": "https://img.166.net/gameyw-misc/opd/squash/20261010/131330-0vtaywc6ru.png",
       "destinyHeroBanner": "https://img.166.net/gameyw-misc/opd/squash/20260811/131236-6p9avmoh2u.png",
       "ddHeroIcon": ""
     },
@@ -1993,7 +1993,7 @@
       "name": "血律",
       "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/2492a15c575c12314907d0d77501ec337b4d56796bc7f03e5dfb50d415612bae.png",
       "smallIconUrl": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/534fea21e25537daa24a40b68384f2cd0c4d22bac5f4cd58cbb8b4aa38b16f3e.png",
-      "cover": "",
+      "cover": "https://img.166.net/gameyw-misc/opd/squash/20261010/131330-wtfbl0d4h9.png",
       "destinyHeroBanner": "",
       "ddHeroIcon": ""
     },
@@ -2005,8 +2005,8 @@
       "name": "D.Mon",
       "icon": "https://img.166.net/gameyw-misc/opd/squash/20260811/221615-1ycb8irolk.png",
       "smallIconUrl": "https://img.166.net/gameyw-misc/opd/squash/20260812/030234-bekicjoms2.png",
-      "cover": "",
-      "destinyHeroBanner": "",
+      "cover": "https://img.166.net/gameyw-misc/opd/squash/20261010/131330-ms1n87zi03.png",
+      "destinyHeroBanner": "https://img.166.net/gameyw-misc/opd/squash/20261008/203449-9yz8nktqvj.png",
       "ddHeroIcon": ""
     }
   ],
@@ -2821,6 +2821,13 @@
       "id": "0x080000000000120E",
       "icon": "https://img.166.net/gameyw-misc/opd/squash/20250311/163645-l5p8ymkcj9.jpg",
       "name": "监测站：直布罗陀",
+      "mode": "运载目标"
+    },
+    {
+      "guid": "576460752303428538",
+      "id": "0x08000000000013BA",
+      "icon": "https://img.166.net/gameyw-misc/opd/squash/20261010/135126-6o973twz4c.png",
+      "name": "格里姆火山",
       "mode": "运载目标"
     },
     {
@@ -19912,6 +19919,34 @@
     {
       "heroGuid": "207165582859044208",
       "heroName": "血律",
+      "valueGuid": "603482350067650476",
+      "valueText": "灌注永生权杖治疗量",
+      "valueType": "特色数据"
+    },
+    {
+      "heroGuid": "207165582859044208",
+      "heroName": "血律",
+      "valueGuid": "603482350067650528",
+      "valueText": "救赎恩典过量生命值生成量",
+      "valueType": "特色数据"
+    },
+    {
+      "heroGuid": "207165582859044208",
+      "heroName": "血律",
+      "valueGuid": "603482350067650479",
+      "valueText": "灌注永生权杖伤害",
+      "valueType": "特色数据"
+    },
+    {
+      "heroGuid": "207165582859044208",
+      "heroName": "血律",
+      "valueGuid": "603482350067650522",
+      "valueText": "救赎恩典生命值限制次数",
+      "valueType": "特色数据"
+    },
+    {
+      "heroGuid": "207165582859044208",
+      "heroName": "血律",
       "valueGuid": "603482350067647671",
       "valueText": "对英雄伤害量",
       "valueType": "通用数据"
@@ -20313,6 +20348,12 @@
       },
       {
         "heroId": "0x02E0000000000040",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/4b0364924157ffcb8dc2673e4e1daf86c8e3651b664bc9c1cc494a281dfaabba.png",
+        "id": "0x0CC8000000002A13",
+        "name": "小猪快来<br />鸡飞狗跳期间，链钩的冷却时间缩短80%"
+      },
+      {
+        "heroId": "0x02E0000000000040",
         "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/d48d0b264d765e3732abda784e986595f7a6c5ad0e56f1929c008ffc0492a39d.png",
         "id": "0x0CC80000000026F7",
         "name": "弹片迸射枪<br />爆裂枪辅助攻击模式的射程扩大50%，炸裂扩散降低25%"
@@ -20527,6 +20568,24 @@
       },
       {
         "heroId": "0x02E000000000012E",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/34e108b70ea2d33e67e973b4e3d62d8c6587a0ea3eea3a9645630f469f3321ae.png",
+        "id": "0x0CC8000000002AF0",
+        "name": "黑你血条<br />电磁脉冲会为附近的所有盟友施加在线修复"
+      },
+      {
+        "heroId": "0x02E000000000012E",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/87fec003fc9753ad1d6233bc54f163ef280684396101f9088727e886f15b24fd.png",
+        "id": "0x0CC8000000002AE9",
+        "name": "数据包<br />使用在线修复侵入急救包可使其主要冷却时间缩短4秒"
+      },
+      {
+        "heroId": "0x02E000000000012E",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/34e108b70ea2d33e67e973b4e3d62d8c6587a0ea3eea3a9645630f469f3321ae.png",
+        "id": "0x0CC8000000002AEE",
+        "name": "生存本能<br />机动闪避过量生命值的持续时间延长1秒"
+      },
+      {
+        "heroId": "0x02E000000000012E",
         "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/282c6799d179564162500a2baff9dd78add8c67aab0142ae4164f7da39a95acb.png",
         "id": "0x0CC80000000025E3",
         "name": "加密上传<br />黑客入侵可在隐身时使用，成功侵入会使隐秘潜行的持续时间延长3秒"
@@ -20567,9 +20626,9 @@
     "0x02E000000000013B": [
       {
         "heroId": "0x02E000000000013B",
-        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/261f0fabdaf55159b9e13103abd465cfe3bf50a3906f97b1a47e9c2dc961905b.png",
-        "id": "0x0CC800000000254C",
-        "name": "头晕目眩<br />敌人从麻醉镖效果中苏醒后的2秒内会减速并受到50点持续伤害"
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/ae02fae670005f987ff17803a469c958a1281c236aa2817fd1b8a03e119ad77d.png",
+        "id": "0x0CC8000000002AB5",
+        "name": "局部麻醉<br />麻醉镖击中时爆炸，在3秒内使敌人减速并造成45点伤害"
       },
       {
         "heroId": "0x02E000000000013B",
@@ -20752,6 +20811,12 @@
         "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/47a96fff39ffc551e830cd5cb3f3baf424563e9fd263a2779e01eb1bd5a7d8a4.png",
         "id": "0x0CC8000000002569",
         "name": "炸弹齐射<br />黏性炸弹额外发射2发炸弹"
+      },
+      {
+        "heroId": "0x02E0000000000206",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/63cadc2da0d3063b10f9add1480a6ebff8c87963de15a9fdfdb22e9356429c07.png",
+        "id": "0x0CC8000000002AD8",
+        "name": "空战火力<br />飞行持续期间，“回声”具有无限弹药"
       },
       {
         "heroId": "0x02E0000000000206",
@@ -21084,6 +21149,32 @@
         "name": "飞上新高<br />火星套靴现在可以三段跳"
       }
     ],
+    "0x02E0000000000570": [
+      {
+        "heroId": "0x02E0000000000570",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/d4231c031993e68b5cd6359ca35be5f1bac7571f0619ada25cd30f48e9091e5a.png",
+        "id": "0x0CC8000000002A19",
+        "name": "活力传输<br />造成伤害或治疗会缩短灌注的冷却时间"
+      },
+      {
+        "heroId": "0x02E0000000000570",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/32ffd184fd6bf247ca7539d2d3175659acb8bec2be892a2008c2e281c5f5468f.png",
+        "id": "0x0CC8000000002AAD",
+        "name": "猩红汲取<br />用灌注永生权杖造成伤害会获得50%治疗"
+      },
+      {
+        "heroId": "0x02E0000000000570",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/65d3986853fa5e6fb01fae33f5b50e75956080770eb077149a3fc6438f78f10c.png",
+        "id": "0x0CC8000000002AF1",
+        "name": "救赎恩赐<br />施加焕生无人机时治疗40点生命值"
+      },
+      {
+        "heroId": "0x02E0000000000570",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/1f60c2577f3709fe41fbf494432e7539b4a942374b301b06a97ed7c0bb11017f.png",
+        "id": "0x0CC8000000002AF2",
+        "name": "生命代价<br />牺牲25点最大生命值。永生权杖的治疗量提高20%"
+      }
+    ],
     "0x02E00000000003C3": [
       {
         "heroId": "0x02E00000000003C3",
@@ -21272,6 +21363,12 @@
         "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/acd4b58fc4607cf4471de067547d9dd1fd1760fbf55d67217f0574567aa0e98b.png",
         "id": "0x0CC8000000002833",
         "name": "带盾运输<br />运输其他英雄时获得最多50点额外护盾生命值"
+      },
+      {
+        "heroId": "0x02E0000000000516",
+        "icon": "https://d15f34w2p8l1cc.cloudfront.net/overwatch/7b90c625a71b1ab6709796db494907b934637e3f793895d4729f0387fadbc35f.png",
+        "id": "0x0CC8000000002AD7",
+        "name": "呼噜连天<br />呼噜噜的每次脉冲造成3波效果"
       },
       {
         "heroId": "0x02E0000000000516",

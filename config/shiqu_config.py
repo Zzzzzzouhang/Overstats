@@ -35,15 +35,6 @@ class ShiquLLMConfig:
     # 单次 LLM 请求超时（秒）。判定书 Prompt 较长，默认 300（5 分钟）。
     timeout_seconds: int = 300
 
-    # 单次 LLM 回复的最大输出 token 数。
-    # 默认直接给到 300000（300k），即「不设实质上限」，彻底避免逐局点评写不完被截断
-    # （finish_reason=length）。服务端会自行收敛到该模型真实的输出上限。
-    # 设为 0 则改为自适应：由 dashen_shiqu.service._estimate_max_tokens 按
-    # 「对局数 + 好友数」估算并加冗余（约束在 2048~8192），适合按量计费、想压成本的网关。
-    # 注：部分网关会因 max_tokens 超过模型输出上限直接拒答（HTTP 400），
-    # service 侧已内置「去掉该字段自动重试一次」的兜底，不会因此整体失败。
-    max_tokens: int = 300000
-
     # LLM 失败重试次数。0 = 仅调用 1 次（不重试）；N = 初始 1 次 + 重试 N 次。
     retry: int = 0
 
@@ -73,7 +64,6 @@ _ENV_TO_FIELD = {
     "SHIQU_LLM_TIMEOUT": "timeout_seconds",
     "SHIQU_LLM_RETRY": "retry",
     "SHIQU_LLM_STRICT": "strict",
-    "SHIQU_LLM_MAX_TOKENS": "max_tokens",
 }
 
 
@@ -108,7 +98,6 @@ def get_shiqu_llm_config() -> ShiquLLMConfig:
         timeout_seconds=int(_get("SHIQU_LLM_TIMEOUT", "300") or 300),
         retry=int(_get("SHIQU_LLM_RETRY", "0") or 0),
         strict=_parse_bool(_get("SHIQU_LLM_STRICT", "true")),
-        max_tokens=int(_get("SHIQU_LLM_MAX_TOKENS", "0") or 0),
     )
 
 

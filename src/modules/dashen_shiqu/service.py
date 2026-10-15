@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -404,17 +405,8 @@ def _fix_mojibake(text: str) -> str:
     return re.sub(r"(?:\\u[0-9a-fA-F]{4}){2,}", repl, text)
 
 
-def _find_first_balanced_object(text: str) -> Optional[str]:
-    """从首个 '{' 开始，扫描出第一个结构完整（括号配平）的 JSON 对象字符串。
-
-    用于应对「模型一次吐出多个拼接的 JSON 对象」的情况：只取最前面的
-    那个完整对象，避免把两个对象拼成一段非法 JSON 导致整段解析失败。
-    若文本被截断（首对象未闭合）则返回 None，交由截断恢复逻辑处理。
-    """
-    text = (text or "").strip()
-    start = text.find("{")
-    if start < 0:
-        return None
+def _balanced_from(text: str, start: int) -> Optional[str]:
+    """从 start 处的 '{' 开始扫描，返回第一个结构完整的 JSON 对象字符串。"""
     depth = 0
     in_string = False
     escape = False
@@ -439,6 +431,37 @@ def _find_first_balanced_object(text: str) -> Optional[str]:
                 if depth == 0:
                     return text[start:i + 1]
         i += 1
+    return None
+
+
+def _find_first_balanced_object(text: str) -> Optional[str]:
+    """从首个 '{' 开始，扫描出第一个结构完整（括号配平）的 JSON 对象字符串。
+
+    用于应对「模型一次吐出多个拼接的 JSON 对象」的情况：只取最前面的
+    那个完整对象，避免把两个对象拼成一段非法 JSON 导致整段解析失败。
+    若文本被截断（首对象未闭合）则返回 None，交由截断恢复逻辑处理。
+    """
+    text = (text or "").strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    return _balanced_from(text, start)
+
+
+def _find_subsequent_balanced_object(text: str) -> Optional[str]:
+    """首个 '{' 无法配平时，从后续每个 '{' 再依次尝试。
+
+    适用场景：响应前半段是被截断的残片，后面又跟着一个完整对象。此时若直接
+    按整段做截断补全，会把残片的半个字符串与后面的对象强行缝合，解析出内容
+    错位的 mc；这里优先挑出后面的完整对象，保证拿到的是模型真正写完的结果。
+    """
+    text = (text or "").strip()
+    i = text.find("{")
+    while i >= 0:
+        obj = _balanced_from(text, i)
+        if obj is not None:
+            return obj
+        i = text.find("{", i + 1)
     return None
 
 
@@ -529,6 +552,12 @@ def _extract_json_object(text: str) -> Optional[dict]:
     first_obj = _find_first_balanced_object(cleaned)
     if first_obj is not None:
         candidates.append(first_obj)
+    else:
+        # 首对象是残片（前一个输出被截断）时，优先取后面那个写完整的对象，
+        # 避免把残片强行补全成内容错位的 JSON。
+        later_obj = _find_subsequent_balanced_object(cleaned)
+        if later_obj is not None:
+            candidates.append(later_obj)
 
     # 现有修复链
     candidates += [
@@ -955,14 +984,47 @@ friends={friends_line}
 
 # ── LLM 调用（独立配置）──
 
-async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
+def _estimate_max_tokens(match_count: int, friend_count: int) -> int:
+    """按本次输出规模估算 max_tokens，避免 JSON 写到一半被触顶截断。
+
+    估算口径（含余量）：逐局点评约 110 token/局、好友点评约 70 token/人、
+    概览 + 综合评价 + 键名框架约 800 token，再留 25% 冗余，最后收敛到
+    [2048, 8192]：下限保证够写完整轮输出，上限避免超过多数网关/模型的
+    输出上限而被拒答（需要更大额度时用 OVERSTATS_SHIQU_LLM_MAX_TOKENS 显式指定）。
+    """
+    raw = max(1, match_count) * 110 + max(0, friend_count) * 70 + 800
+    return max(2048, min(8192, int(raw * 1.25)))
+
+
+@dataclass
+class _LLMCallResult:
+    """LLM 单次调用的返回内容 + 诊断信息。"""
+    text: str = ""
+    # finish_reason == "length"：输出达到 max_tokens 上限，JSON 被写断。
+    truncated: bool = False
+    finish_reason: str = ""
+    # 本次实际下发的 max_tokens（0 = 未下发）
+    max_tokens: int = 0
+    # 网关不支持 max_tokens 参数（常见为 400），需要去掉该字段重试。
+    max_tokens_rejected: bool = False
+
+
+async def _call_llm(
+    system_prompt: str,
+    user_prompt: str,
+    match_count: int = 0,
+    friend_count: int = 0,
+) -> Optional[_LLMCallResult]:
     cfg = get_shiqu_llm_config()
     if not (cfg.base_url and cfg.api_key and cfg.model):
         logger.error("[shiqu] LLM 配置不完整，请在 config/shiqu_config.py 中填写 SHIQU_LLM_BASE_URL / SHIQU_LLM_API_KEY / SHIQU_LLM_MODEL")
         return None
 
-    def _build_payload(strict: bool) -> dict:
-        return {
+    # max_tokens：显式配置优先，否则按输出规模自适应估算。
+    max_tokens = cfg.max_tokens if cfg.max_tokens > 0 else _estimate_max_tokens(match_count, friend_count)
+
+    def _build_payload(strict: bool, max_tokens: int) -> dict:
+        payload = {
             "model": cfg.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -974,6 +1036,11 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
                 "json_schema": {"name": "shiqu_result", "strict": strict, "schema": _SHIQU_JSON_SCHEMA},
             },
         }
+        # 显式声明输出上限：不传时由服务端默认决定（很多网关只有 1024/2048），
+        # 容易导致逐局点评没写完就被截断（finish_reason=length）。
+        if max_tokens and max_tokens > 0:
+            payload["max_tokens"] = int(max_tokens)
+        return payload
 
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
     from ..analysis_common import build_async_client, get_analysis_proxy, LLM_SEMAPHORE
@@ -982,11 +1049,12 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
     try:
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
 
-            async def _do_request(strict: bool) -> Optional[str]:
-                payload = _build_payload(strict)
+            async def _do_request(strict: bool, max_tokens: int) -> Optional[_LLMCallResult]:
+                payload = _build_payload(strict, max_tokens)
                 try:
                     if cfg.stream:
                         parts = []
+                        finish_reason = ""
                         async with client.stream("POST", cfg.chat_url, json=payload, headers=headers) as resp:
                             resp.raise_for_status()
                             async for line in resp.aiter_lines():
@@ -1008,10 +1076,21 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
                                 first = choices[0]
                                 if not isinstance(first, dict):
                                     continue
+                                fr = first.get("finish_reason")
+                                if isinstance(fr, str) and fr:
+                                    finish_reason = fr
                                 delta = first.get("delta") or {}
                                 if isinstance(delta, dict) and "content" in delta:
                                     parts.append(delta["content"])
-                        return "".join(parts).strip() or None
+                        text = "".join(parts).strip()
+                        if not text:
+                            return None
+                        return _LLMCallResult(
+                            text=text,
+                            truncated=finish_reason == "length",
+                            finish_reason=finish_reason,
+                            max_tokens=payload.get("max_tokens", 0),
+                        )
                     else:
                         resp = await client.post(cfg.chat_url, json=payload, headers=headers)
                         resp.raise_for_status()
@@ -1021,18 +1100,47 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
                             return None
                         msg = choices[0] if isinstance(choices[0], dict) else {}
                         content = (msg.get("message") or {}).get("content") or ""
-                        return str(content).strip() or None
+                        text = str(content).strip()
+                        if not text:
+                            return None
+                        finish_reason = str(msg.get("finish_reason") or "")
+                        return _LLMCallResult(
+                            text=text,
+                            truncated=finish_reason == "length",
+                            finish_reason=finish_reason,
+                            max_tokens=payload.get("max_tokens", 0),
+                        )
                 except Exception as e:
+                    # 部分网关/中转不支持 max_tokens 或超出模型输出上限时会直接拒答
+                    # （常见 400）。此时去掉该字段重试一次，避免整套请求因此失败。
+                    status = getattr(getattr(e, "response", None), "status_code", None)
+                    if payload.get("max_tokens") and status in (400, 404, 413, 422):
+                        logger.warning(
+                            f"[shiqu] 网关拒答 max_tokens={payload.get('max_tokens')}（HTTP {status}），将去掉该字段重试"
+                        )
+                        return _LLMCallResult(max_tokens_rejected=True, max_tokens=payload.get("max_tokens", 0))
                     logger.error(f"[shiqu] LLM 调用异常 (strict={strict}): {e}", exc_info=True)
                     return None
 
             # strict 优先；若网关不支持 strict 而拒答，自动降级重试一次 strict=False，
             # 保证兼容性的同时尽量拿到结构化输出。
-            content = await _do_request(cfg.strict)
-            if content is None and cfg.strict:
+            out = await _do_request(cfg.strict, max_tokens)
+            if out is None and cfg.strict:
                 logger.warning("[shiqu] strict 模式请求失败，降级重试 strict=False")
-                content = await _do_request(False)
-            return content
+                out = await _do_request(False, max_tokens)
+            if out is not None and out.max_tokens_rejected:
+                logger.warning("[shiqu] 网关不接受 max_tokens，改为不限制输出长度重试")
+                fallback = await _do_request(cfg.strict, 0)
+                if fallback is None and cfg.strict:
+                    fallback = await _do_request(False, 0)
+                if fallback is not None and not fallback.max_tokens_rejected:
+                    return fallback
+            if out is not None and out.truncated:
+                logger.warning(
+                    f"[shiqu] LLM 输出被截断（finish_reason=length, max_tokens={out.max_tokens}），"
+                    f"可上调 OVERSTATS_SHIQU_LLM_MAX_TOKENS 或减少 SHIQU_MATCH_COUNT"
+                )
+            return out if (out is None or out.text or out.max_tokens_rejected) else None
     finally:
         LLM_SEMAPHORE.release()
 
@@ -1306,17 +1414,46 @@ class ShiquModule:
         # 模型恢复等待交给单次调用的超时（默认 600s）承担：若上游在连接内切换模型并回传内容，
         # 第一次调用即直接拿到结果并退出，不会进入重试。
         max_attempts = 1 + (cfg.retry or 0)
+        # 输出被截断（finish_reason=length / 逐局点评条数不足）属于偶发抖动：
+        # 即使 retry=0 也再给一次补救机会，避免这种「半截 JSON」直接落到最终输出。
+        _TRUNCATED_RETRY = 1
+        expected_matches = len(details)
+        friend_count = len(_compute_friend_list(details, full_id))
         _t0 = time.perf_counter()
         shiqu_llm_status.mark_call_start(full_id)
         success = False
+        truncated = False
         try:
-            for attempt in range(1, max_attempts + 1):
+            attempt = 0
+            budget = max_attempts
+            while attempt < budget:
+                attempt += 1
                 call_count += 1
-                last_text = await _call_llm(system_prompt, user_prompt) or ""
+                call_result = await _call_llm(
+                    system_prompt, user_prompt, expected_matches, friend_count
+                )
+                last_text = (call_result.text if call_result else "") or ""
+                hit_length_limit = bool(call_result and call_result.truncated)
                 result = _parse_llm_json_result(last_text, full_id, matches=details) if last_text else None
-                if result:
+                got = len((result or {}).get("match_comments") or [])
+                # 判定「没写完」：被 max_tokens 触顶截断，或恢复出的逐局点评少于输入对局数
+                truncated = hit_length_limit or (result is not None and got < expected_matches)
+                if result and not truncated:
                     break
-                logger.warning(f"[shiqu] LLM 尝试 {attempt}/{max_attempts} 失败，准备重试")
+                if truncated:
+                    logger.warning(
+                        f"[shiqu] LLM 输出未写完：逐局点评 {got}/{expected_matches} 条"
+                        f"（finish_reason={(call_result.finish_reason if call_result else '') or '未知'}，"
+                        f"max_tokens={(call_result.max_tokens if call_result else 0) or '未下发'}），"
+                        f"第 {attempt}/{max_attempts} 次尝试"
+                    )
+                    if budget < max_attempts + _TRUNCATED_RETRY:
+                        budget += 1  # 仅截断场景追加一次补救，普通失败仍受 retry 控制
+                else:
+                    logger.warning(f"[shiqu] LLM 尝试 {attempt}/{max_attempts} 失败，准备重试")
+            if result and truncated:
+                # 补救仍未拿到完整结果：保留已解析部分并标记，便于调用方/排查感知。
+                result["truncated"] = True
             success = bool(result)
             if not result:
                 raise ModuleError(
@@ -1326,9 +1463,13 @@ class ShiquModule:
                 )
         finally:
             duration_ms = int((time.perf_counter() - _t0) * 1000)
-            shiqu_llm_status.mark_call_done(
-                success, "" if success else "LLM 返回为空或 JSON 解析失败"
-            )
+            if success and truncated:
+                fail_msg = "LLM 输出被截断（max_tokens），结果可能不完整"
+            elif success:
+                fail_msg = ""
+            else:
+                fail_msg = "LLM 返回为空或 JSON 解析失败"
+            shiqu_llm_status.mark_call_done(success, fail_msg)
             # ── 阶段四：LLM 调用遥测落库（异步、best-effort，不阻塞主流程）──
             # 必须放在 finally 内：无论成功还是 raise 失败都落库，否则失败调用既不记录
             # 错误也不记录 prompt，无法排查。只存提示词 / 原始返回 / 调用诊断；

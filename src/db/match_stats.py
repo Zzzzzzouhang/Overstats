@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-MATCH_STATS_DB_PATH = Path(__file__).resolve().parent / "match_stats.sqlite3"
+from ._paths import resolve_db_path
+
+MATCH_STATS_DB_PATH = resolve_db_path("match_stats.sqlite3")
 PLAYER_IDENTITY_TABLE = "player_identity_map"
 HERO_MATCH_DETAIL_TABLE = "hero_match_detail"
 COMP_DATA_TABLE = "comp_data"

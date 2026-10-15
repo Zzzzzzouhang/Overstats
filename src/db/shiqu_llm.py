@@ -35,7 +35,9 @@ except ModuleNotFoundError:  # pragma: no cover
     from config import is_database_write_enabled
 
 
-SHIQU_LLM_DB_PATH = Path(__file__).resolve().parent / "shiqu_llm.sqlite3"
+from ._paths import resolve_db_path
+
+SHIQU_LLM_DB_PATH = resolve_db_path("shiqu_llm.sqlite3")
 SHIQU_LLM_RESULT_TABLE = "shiqu_llm_result"
 SHIQU_LLM_CACHE_TABLE = "shiqu_llm_prompt_cache"
 

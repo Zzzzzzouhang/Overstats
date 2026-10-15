@@ -168,53 +168,12 @@ def _infer_hero_guid_from_stat_map(stat_map: dict, fallback_hero_guid: str = "",
     return fallback_hero_guid if allow_fallback else ""
 
 
-# 紧凑键 + strict 兼容 schema（方案 A）：
-# - 输出键全部缩短（sc=评分 sum=概览 mc=逐局 ov=综合 tm=好友 id=玩家），
-#   直接削减输出 token、缓解 max_tokens 截断；
-# - 去掉 match 项的 index（序号由数组顺序决定）；result 仍保留 r 字段作兜底
-#   （analyze 路径用输入对局 res 重算覆盖，保证与真实胜负一致）；
-# - 字段重排：核心字段 sc/sum/mc/ov 前置，tm（好友）置末。
-#   注意：strict 模式要求「每个 properties 键都必须出现在 required 中」，
-#   因此 id / tm / r / g 均为必填（无法设为可选）。截断兜底由 _recover_truncated_json 负责。
-# - 仅用 strict 支持的关键字（type/enum/required/properties/items/additionalProperties）。
-_SHIQU_JSON_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["id", "sc", "sum", "mc", "ov", "tm"],
-    "properties": {
-        "id": {"type": "string"},
-        "sc": {"type": "integer"},
-        "sum": {"type": "string"},
-        "mc": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["h", "c", "r"],
-                "properties": {
-                    "h": {"type": "string"},
-                    "c": {"type": "string"},
-                    "r": {"type": "string", "enum": ["胜", "负", "平", "未知"]},
-                },
-            },
-        },
-        "ov": {"type": "string"},
-        "tm": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["n", "ts", "c", "g"],
-                "properties": {
-                    "n": {"type": "string"},
-                    "ts": {"type": "integer"},
-                    "c": {"type": "string"},
-                    "g": {"type": "integer"},
-                },
-            },
-        },
-    },
-}
+# 最小 JSON 结构：模型只负责产出「评分 + 点评」，其余（英雄名、胜负、好友名、同场次数）
+# 全部由本地数据填充，避免模型编造/漏填这些本可确定计算的事实字段。
+# 不再使用 response_format / strict —— 只靠 prompt 约束模型输出纯 JSON，解析失败由
+# _extract_json_object 的修复链兜底。键保持短键以压缩输出 token、降低截断概率。
+#   sc=总分(整数0-100)  sum=数据概况(≤100字)  mc=逐局点评数组(每局一条纯文本)
+#   ov=综合评价(≤300字)  tm=好友点评数组(每项 {ts=评分(整数), c=点评})
 
 _VERDICT_RULES = [
     {"score_min": 83, "labels": ("你是职业吗？",), "canonical": "你是职业吗？", "emoji": "😱", "class": "god"},
@@ -247,30 +206,6 @@ def _score_rule(score: int) -> dict:
     return _VERDICT_RULES[-1]
 
 
-_RESULT_ALIASES = {
-    "胜": "胜", "赢": "胜", "胜利": "胜", "w": "胜", "win": "胜",
-    "负": "负", "输": "负", "败": "负", "失败": "负", "l": "负", "lose": "负", "loss": "负",
-    "平": "平", "平局": "平", "d": "平", "draw": "平",
-    "未知": "未知", "": "未知", "none": "未知", "null": "未知",
-}
-
-
-def _norm_result_str(raw) -> str:
-    """把模型给出的胜负文本归一化为 胜/负/平/未知（含乱码修复）。"""
-    raw_result = str(raw or "未知").strip()
-    norm_result = _RESULT_ALIASES.get(raw_result, None)
-    if norm_result is None:
-        # 尝试修复被 Latin-1 错误编码的乱码（如 '\u00e8\u0083\u009c' -> '胜'）
-        try:
-            hexes = re.findall(r"\\u([0-9a-fA-F]{4})", raw_result)
-            if len(hexes) >= 2:
-                decoded = bytes(int(h, 16) for h in hexes).decode("utf-8", "ignore")
-                norm_result = _RESULT_ALIASES.get(decoded, None)
-        except Exception:
-            norm_result = None
-    return norm_result or "未知"
-
-
 def _match_result_for_index(matches: Optional[list], idx: int) -> Optional[str]:
     """按序号从输入对局列表重算焦点玩家的胜负（mc 数组顺序即第 idx 局）。
 
@@ -288,49 +223,63 @@ def _match_result_for_index(matches: Optional[list], idx: int) -> Optional[str]:
 
 
 def _normalize_result(data: dict, target_id: str, matches: Optional[list] = None) -> dict:
+    """把模型返回的「最小 JSON」（仅评分+点评）与本地可确定的事实字段合并。
+
+    模型只回：sc=总评  sum=概况  mc=逐局点评文本数组  ov=综合评价
+              tm=好友数组（每项为 {ts=评分, c=点评}）。
+    本地填充：英雄名、胜负、好友名与同场次数——这些都是可由对局数据确定的事实，
+    不应让模型编造/漏填，从而大幅降低 JSON 解析失败与事实性错误的风险。
+    """
     score = _clamp_score(data.get("sc"), 0)
-    result = {
-        "target_id": str(data.get("id") or target_id),
+    friends = _compute_friend_list_with_counts(matches or [], target_id)
+    # 类型兜底：模型偶尔会把数组误输出成字符串/其它类型，这里统一降级为空数组，
+    # 缺项由「暂无点评。」/「未知」等默认值补齐，避免逐字符错位或崩溃。
+    mc_raw = data.get("mc")
+    tm_raw = data.get("tm")
+    if not isinstance(mc_raw, list):
+        mc_raw = []
+    if not isinstance(tm_raw, list):
+        tm_raw = []
+
+    match_comments = []
+    for i, m in enumerate(matches or [], start=1):
+        raw = mc_raw[i - 1] if i - 1 < len(mc_raw) else None
+        # 容错：mc 项可能是纯文本字符串，也可能是 {"c": "..."} 字典
+        comment = raw.get("c") if isinstance(raw, dict) else raw
+        res = _match_result_for_index(matches, i) or "未知"
+        hero = _focus_heroes_for_match(m, target_id) or "未知英雄"
+        match_comments.append({
+            "index": i,
+            "result": res,
+            "hero": hero,
+            "comment": str(comment or "暂无点评。").strip(),
+        })
+
+    teammate_comments = []
+    for (name, cnt), raw in zip(friends, tm_raw):
+        # 容错：tm 项可能是 {"ts":..,"c":..} 字典，也可能退化成纯文本
+        if isinstance(raw, dict):
+            ts, c = raw.get("ts"), raw.get("c")
+        else:
+            ts, c = None, raw
+        tm_score = _clamp_score(ts, 0)
+        teammate_comments.append({
+            "name": name,
+            "score": tm_score,
+            "verdict": _score_rule(tm_score)["canonical"],
+            "comment": str(c or "暂无点评。").strip(),
+            "games": max(1, int(cnt)),
+        })
+
+    return {
+        "target_id": str(target_id),
         "score": score,
         "verdict": _score_rule(score)["canonical"],
         "summary": str(data.get("sum") or "暂无数据概况。").strip(),
-        "match_comments": [],
+        "match_comments": match_comments,
         "overall_comment": str(data.get("ov") or "暂无综合评价。").strip(),
-        "teammate_comments": [],
+        "teammate_comments": teammate_comments,
     }
-    for i, item in enumerate(data.get("mc") or [], start=1):
-        if not isinstance(item, dict):
-            continue
-        # 跳过截断恢复产生的空对象（既无 c 也无 h 的占位项）
-        if not item.get("c") and not item.get("h"):
-            continue
-        # 胜负：analyze 路径用输入对局重算覆盖（与真实胜负一致）；否则回退模型 r / 未知
-        res = _match_result_for_index(matches, i)
-        if res is None:
-            res = _norm_result_str(item.get("r"))
-        result["match_comments"].append({
-            "index": i,
-            "result": res,
-            "hero": str(item.get("h") or "未知英雄"),
-            "comment": str(item.get("c") or "暂无点评。").strip(),
-        })
-    for item in data.get("tm") or []:
-        if not isinstance(item, dict):
-            continue
-        # 跳过截断恢复产生的空对象（无 n 的占位项）
-        if not item.get("n"):
-            continue
-        tm_score = _clamp_score(item.get("ts"), 0)
-        teammate = {
-            "name": str(item.get("n") or "未知队友"),
-            "score": tm_score,
-            "verdict": _score_rule(tm_score)["canonical"],
-            "comment": str(item.get("c") or "暂无点评。").strip(),
-        }
-        if item.get("g") is not None:
-            teammate["games"] = max(1, _clamp_score(item.get("g"), 1))
-        result["teammate_comments"].append(teammate)
-    return result
 
 
 def _repair_json(text: str) -> str:
@@ -851,7 +800,16 @@ def _fmt_match_block(m: dict, target_id: str, idx: int, db) -> str:
 
 
 def _compute_friend_list(matches: list, target_id: str) -> List[str]:
-    """统计好友出现场次，出现≥3局视为好友，返回好友 ID 列表（仅 ID，games 不再预计算）。"""
+    """统计好友出现场次，出现≥3局视为好友，返回好友 ID 列表（仅 ID）。"""
+    return [name for name, _ in _compute_friend_list_with_counts(matches, target_id)]
+
+
+def _compute_friend_list_with_counts(matches: list, target_id: str) -> List[tuple]:
+    """返回好友 (name, 同场次数) 列表，出现≥3局视为好友；按 (出现次数降序, 名字) 稳定排序。
+
+    好友顺序与 prompt 中 friends 列表、模型返回的 tm 数组顺序一一对应，
+    供 _normalize_result 把模型给的评分/点评回填到正确的好友上。
+    """
     teammate_counts: dict = {}
     for m in matches:
         detail_data = (m.get("detail", {}) or {}).get("data") or {}
@@ -864,7 +822,42 @@ def _compute_friend_list(matches: list, target_id: str) -> List[str]:
                 continue
             seen.add(name)
             teammate_counts[name] = teammate_counts.get(name, 0) + 1
-    return [name for name, cnt in sorted(teammate_counts.items()) if cnt >= 3]
+    friends = [(name, cnt) for name, cnt in teammate_counts.items() if cnt >= 3]
+    friends.sort(key=lambda x: (-x[1], x[0]))
+    return friends
+
+
+def _focus_heroes_for_match(match: dict, target_id: str) -> str:
+    """从单局对局详情里取焦点玩家（target_id）使用的英雄名，多英雄用「/」连接。
+
+    英雄名是可由数据确定的事实字段，本地填充即可，不依赖模型返回。
+    """
+    detail_data = (match.get("detail", {}) or {}).get("data") or {}
+    focus = None
+    for p in detail_data.get("teammateList", []) or []:
+        if isinstance(p, dict) and str(p.get("name", "")) == target_id:
+            focus = p
+            break
+    if focus is None:
+        return ""
+    heroes: List[str] = []
+    hl = focus.get("_heroList")
+    if isinstance(hl, list):
+        for e in hl:
+            if not isinstance(e, dict):
+                continue
+            hg = str(e.get("heroId") or e.get("heroGuid") or "")
+            hn = HERO_DICT.get(hg, {}).get("name")
+            if hn and hn not in heroes:
+                heroes.append(hn)
+    if not heroes:
+        hg = str(focus.get("heroGuid") or "")
+        hn = HERO_DICT.get(hg, {}).get("name")
+        if hn:
+            heroes.append(hn)
+        elif focus.get("heroName"):
+            heroes.append(str(focus.get("heroName")))
+    return "/".join(heroes)
 
 
 _METAPHOR_CATEGORIES = [
@@ -896,7 +889,7 @@ def _build_system_prompt() -> str:
 守望先锋段位：青铜、白银、黄金、白金、钻石、大师、宗师、英杰。
 
 [OBJECTIVE] 任务
-严格基于提供的原始对局数据，对焦点玩家及其好友复盘点评，输出符合指定 JSON Schema 的合法 JSON 对象。
+严格基于提供的原始对局数据，对焦点玩家及其好友复盘点评，只输出一个纯 JSON 对象（禁止 markdown / 代码块 / 注释 / JSON 外任何文字）。英雄名、胜负、好友名、同场次数等本可由数据确定的字段不要输出，由系统本地填充；你只需给出评分与点评。
 
 [CONSTRAINTS] 硬约束
 1. 只评游戏数据，不评外貌/私生活/人品；不引战、不歧视、不聊外挂代练；不编造数据；不跨职责/跨英雄比较；高光必夸，差局调侃；胜负不影响评分。
@@ -907,7 +900,7 @@ def _build_system_prompt() -> str:
 坦克参考 单独消灭、最后一击、(伤害减受疗)、阵亡、消灭参与率；
 输出参考 单独消灭、最后一击、伤害、阵亡、消灭参与率；
 辅助参考 最后一击、阵亡、拯救、单独消灭、伤害、治疗、消灭参与率。
-步骤二 对比与评分（score 整数 0-100，基准线50）：
+步骤二 对比与评分（score 整数 0-100，基准线55）：
 1. 与同英雄 ref 对比，低于参考扣分，禁止跨英雄比较；
 2. 同一局多英雄，时长<3分钟片段低权重；
 3. 最后一击、单独消灭额外加分；频繁阵亡且贡献低加重扣分；
@@ -916,24 +909,25 @@ def _build_system_prompt() -> str:
 6. 单独消灭高应赞赏，低不批评；
 7. 比赛胜负不影响评分；
 8. 某局数据异常则不参与评分或低权重，comment 写「数据缺失，无法评价」。
-步骤三 overall_comment（≤300字，≤2个emoji）：
+步骤三 overall_comment：
 1. 精准比喻/定性标签概括特点；
 2. 高光与拉胯极端对比；
 3. 细节画面感吐槽/表扬；
 4. 调侃口吻收尾建议。
 步骤四 好友点评：
-1. 覆盖全部好友，score≥50夸，<50串；
+1. 覆盖全部好友，score≥50夸，<50调侃；
 2. 仅基于比赛数据，胜负不影响评价；缺数据保守评价。
 
 [OUTPUT] 输出格式
-严格输出符合 JSON Schema 的合法 JSON 对象，禁止 markdown/代码块/注释/JSON 外文字。字段使用下方 schema 的短键（sc/sum/mc/ov/tm/id 等），不要使用长键名。
-- 字符串用中文、简练；禁止英文双引号，引用用「」或『』；emoji 按上限使用。
-- 胜负（r）只可取：胜、负、平、未知。
-- 顶层：sc=评分(整数0-100，基准50)；sum=数据概览(≤100字，客观)；mc=逐局点评数组；ov=综合评价(≤300字，≤2 emoji)；id=玩家ID(必填，等于给定 target_id)；tm=好友点评数组(必填，无好友时输出空数组 [])。
-- mc 每局一条：h=英雄名(与输入对齐的英雄，多英雄用「/」分隔)；c=点评(≤45字且含至少1个数字，≤1 emoji)；序号由数组顺序决定（第1条对应第1局），不要输出 index 字段；r=胜负(必填，取 胜/负/平/未知；最终以输入对局 res 为准覆盖)；异常局 c 写「数据缺失，无法评价」。
-- tm 覆盖全部好友：n=好友ID(用给定值)；ts=评分(整数0-100，≥50夸<50串)；c=点评(≤60字，0 emoji)；g=同场次数(必填，整数)。
-JSON Schema：
-{json.dumps(_SHIQU_JSON_SCHEMA, ensure_ascii=False, indent=2)}"""
+只输出一个 JSON 对象，禁止 markdown、代码块、注释与 JSON 外的任何文字。字段一律用下方短键（不要长键名）。字符串用中文、简练；禁止英文双引号，引用一律用「」或『』；emoji 按上限使用。不要输出尾随逗号，字符串内的双引号请转义为 \\"。
+顶层对象（全部必填）：
+- "sc": 整数 0-100（基准 55），焦点玩家总评分
+- "sum": 字符串，数据概况（≥200 字，客观详尽，覆盖段位/职责/整体数据走向）
+- "mc": 数组，逐局点评，第 1 条对应第 1 局、依次排列；每项是该局纯文本点评（≥80 字；异常局写「数据缺失，无法评价」）；长度必须等于对局数
+- "ov": 字符串，综合评价（≥400 字，精准比喻 + 高光与拉胯极端对比 + 细节画面感 + 调侃收尾）
+- "tm": 数组，好友点评，第 1 项对应 friends 列表第 1 位、依次排列；长度必须等于好友数（无好友时输出空数组 []）；每项为 {{"ts": 整数 0-100（≥50 夸、<50 调侃）, "c": 点评（≥60 字）}}
+示例（仅格式参考，内容必须按真实数据填写，切勿照抄示例文本）：
+{{"sc":72,"sum":"...","mc":["第1局点评","第2局点评"],"ov":"...","tm":[{{"ts":60,"c":"..."}}]}}"""
 
 
 def _build_user_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) -> str:
@@ -961,18 +955,17 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
         logger.error("[shiqu] LLM 配置不完整，请在 config/shiqu_config.py 中填写 SHIQU_LLM_BASE_URL / SHIQU_LLM_API_KEY / SHIQU_LLM_MODEL")
         return None
 
-    def _build_payload(strict: bool) -> dict:
+    def _build_payload() -> dict:
         return {
             "model": cfg.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            # 输出较长（概况≥200 + 综合≥400 + 逐局/好友点评），给足上限避免被截断到
+            # 半截 JSON 导致解析失败；4096 在多数模型（含 Nemotron 3.5 Lightning 免费版）输出上限内。
+            "max_tokens": 128000,
             "stream": cfg.stream,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "shiqu_result", "strict": strict, "schema": _SHIQU_JSON_SCHEMA},
-            },
         }
 
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
@@ -982,8 +975,8 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
     try:
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
 
-            async def _do_request(strict: bool) -> Optional[str]:
-                payload = _build_payload(strict)
+            async def _do_request() -> Optional[str]:
+                payload = _build_payload()
                 try:
                     if cfg.stream:
                         parts = []
@@ -1023,15 +1016,13 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
                         content = (msg.get("message") or {}).get("content") or ""
                         return str(content).strip() or None
                 except Exception as e:
-                    logger.error(f"[shiqu] LLM 调用异常 (strict={strict}): {e}", exc_info=True)
+                    logger.error(f"[shiqu] LLM 调用异常: {e}", exc_info=True)
                     return None
 
-            # strict 优先；若网关不支持 strict 而拒答，自动降级重试一次 strict=False，
-            # 保证兼容性的同时尽量拿到结构化输出。
-            content = await _do_request(cfg.strict)
-            if content is None and cfg.strict:
-                logger.warning("[shiqu] strict 模式请求失败，降级重试 strict=False")
-                content = await _do_request(False)
+            # 不再依赖 response_format / strict：仅凭 prompt 约束模型输出纯 JSON，
+            # 解析失败由 _extract_json_object 的修复链兜底（与 dashen_match 锐评一致）。
+            # 兼容任何不支持 structured outputs 的模型（如 Nemotron 3.5 Lightning 免费版）。
+            content = await _do_request()
             return content
     finally:
         LLM_SEMAPHORE.release()

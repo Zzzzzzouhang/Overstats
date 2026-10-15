@@ -16,7 +16,9 @@ except ModuleNotFoundError:
     from config import is_database_write_enabled
 
 
-REQUEST_METRICS_DB_PATH = Path(__file__).resolve().parent / "request_metrics.sqlite3"
+from ._paths import resolve_db_path
+
+REQUEST_METRICS_DB_PATH = resolve_db_path("request_metrics.sqlite3")
 REQUEST_METRICS_TABLE = "request_url_stats"
 REQUEST_SOURCE_MODULE = "module"
 REQUEST_SOURCE_UPSTREAM = "upstream"

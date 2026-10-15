@@ -7,7 +7,9 @@ import sqlite3
 from typing import Any, Iterable, Mapping, Optional
 
 
-OW_HERO_LEADERBOARD_DB_PATH = Path(__file__).resolve().parent / "ow_hero_leaderboard.sqlite3"
+from ._paths import resolve_db_path
+
+OW_HERO_LEADERBOARD_DB_PATH = resolve_db_path("ow_hero_leaderboard.sqlite3")
 HERO_LEADERBOARD_CN_TABLE = "hero_leaderboard_cn"
 HERO_LEADERBOARD_GLOBAL_TABLE = "hero_leaderboard_global"
 _VALID_TABLES = {HERO_LEADERBOARD_CN_TABLE, HERO_LEADERBOARD_GLOBAL_TABLE}

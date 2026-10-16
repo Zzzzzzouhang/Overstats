@@ -323,6 +323,90 @@ def _repair_json_values(text: str) -> str:
     return text
 
 
+def _repair_unclosed_array(text: str) -> str:
+    """修复「数组忘了用 ] 闭合就接着写下一个键值对」的高频错误。
+
+    典型形态（本次线上复现的全部失败样本均为此模式）：
+        "mc":["第1局...","第2局...",...,"第12局...","ov":"...","tm":[...]}
+                                                  ^ 缺 ]
+    即：mc 数组的最后一项之后没有 ]，直接以 ,"ov":... 继续，导致数组内部
+    出现 "key": value 这一非法结构，json.loads 必然失败。
+
+    做法：逐字符扫描维护容器栈与字符串状态；每当一个字符串刚结束、其后紧跟
+    ':'（构成键）且当前栈顶为 '['（说明正处在数组元素位置）时，在该位置补一个
+    ']' 并弹出栈顶的 '['。对象内部的键（栈顶为 '{'）不受影响，因此
+    [{"ts":52,"c":"..."}] 这类合法结构不会被误改。
+    """
+    text = text or ""
+    stack: list = []
+    # 需要补 ']' 的位置：即那个「越界的键」字符串的起始下标（']' 插在它前面）
+    insert_at: list = []
+    i, n = 0, len(text)
+    in_string = False
+    escape = False
+    str_start = -1
+    while i < n:
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+                j = i + 1
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                if j < n and text[j] == ":" and stack and stack[-1] == "[":
+                    insert_at.append(str_start)
+                    stack.pop()
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+            str_start = i
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+        i += 1
+    if not insert_at:
+        return text
+    parts: list = []
+    prev = 0
+    for pos in insert_at:
+        # ']' 要插在前一个元素之后、分隔逗号之前（...,"x"],"key":... 而非 ...,"x",]"key":...）
+        j = pos - 1
+        while j >= 0 and text[j] in " \t\r\n":
+            j -= 1
+        if j >= 0 and text[j] == ",":
+            pos = j
+        parts.append(text[prev:pos])
+        parts.append("]")
+        prev = pos
+    parts.append(text[prev:])
+    return "".join(parts)
+
+
+def _unclosed_array_candidates(text: str) -> List[str]:
+    """基于 _repair_unclosed_array 派生的一组解析候选（含与其它修复器的组合）。"""
+    fixed = _repair_unclosed_array(text)
+    if not fixed or fixed == text:
+        return []
+    structured = _repair_json_structure(fixed)
+    delimited = _repair_json_delimiters(fixed)
+    return [
+        fixed,
+        _repair_json(fixed),
+        structured,
+        _repair_json(structured),
+        delimited,
+        _repair_json(delimited),
+        _repair_json_structure(_repair_json(fixed)),
+    ]
+
+
 def _repair_json_delimiters(text: str) -> str:
     """补全模型输出中缺失的 JSON 分隔符（逗号/冒号）。
 
@@ -493,6 +577,8 @@ def _extract_json_object(text: str) -> Optional[dict]:
         _repair_json_delimiters(_repair_json_values(cleaned)),
         _repair_json(_repair_json_delimiters(_repair_json_structure(cleaned))),
     ]
+    # 数组漏闭合（mc/tm 数组缺 ] 就写下一个键）
+    candidates += _unclosed_array_candidates(cleaned)
     # 截断恢复
     recovered = _recover_truncated_json(cleaned)
     if recovered:
@@ -517,6 +603,7 @@ def _extract_json_object(text: str) -> Optional[dict]:
             _repair_json_delimiters(_repair_json_structure(snippet)),
             _repair_json_delimiters(_repair_json_values(snippet)),
         ]
+        candidates += _unclosed_array_candidates(snippet)
         rec = _recover_truncated_json(snippet)
         if rec:
             candidates.append(rec)
@@ -926,6 +1013,7 @@ def _build_system_prompt() -> str:
 - "mc": 数组，逐局点评，第 1 条对应第 1 局、依次排列；每项是该局纯文本点评（≥80 字；异常局写「数据缺失，无法评价」）；长度必须等于对局数
 - "ov": 字符串，综合评价（≥400 字，精准比喻 + 高光与拉胯极端对比 + 细节画面感 + 调侃收尾）
 - "tm": 数组，好友点评，第 1 项对应 friends 列表第 1 位、依次排列；长度必须等于好友数（无好友时输出空数组 []）；每项为 {{"ts": 整数 0-100（≥50 夸、<50 调侃）, "c": 点评（≥60 字）}}
+括号必须配平：mc 与 tm 数组写完最后一项后，先用 ] 闭合数组，再写后面的字段（例如 mc 闭合后才写 ov、tm）。切勿在数组内部直接写 "ov"、"tm" 这类键值对。
 示例（仅格式参考，内容必须按真实数据填写，切勿照抄示例文本）：
 {{"sc":72,"sum":"...","mc":["第1局点评","第2局点评"],"ov":"...","tm":[{{"ts":60,"c":"..."}}]}}"""
 

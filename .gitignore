@@ -50,6 +50,7 @@ api_test_data.json
 !/test/test_personal_data_percentile.py
 !/test/test_font_resolver.py
 !/test/test_dashen_profile_render.py
+!/test/test_shiqu_json_repair.py
 src/db/match_stats.sqlite3.old
 .vibe/review_diff.txt
 C:/Users/Documorial/AppData/Local/Temp/season_diff.txt

@@ -1143,17 +1143,18 @@ def _shiqu_fetch_semaphore() -> "asyncio.Semaphore":
 SHIQU_FETCH_PHASE_CONCURRENCY = int(
     os.getenv("OVERSTATS_SHIQU_FETCH_PHASE_CONCURRENCY", "1")
 )
-_shiqu_fetch_phase_semaphore: "Optional[asyncio.Semaphore]" = None
+# 注意：全局变量用大写、函数用小写，避免 def 重新绑定把变量 shadow 成函数对象。
+_SHIQU_FETCH_PHASE_SEMAPHORE: "Optional[asyncio.Semaphore]" = None
 
 
 def _shiqu_fetch_phase_semaphore() -> "asyncio.Semaphore":
     """懒加载抓取轮次信号量，绑定到运行中的事件循环，避免启动期创建。"""
-    global _shiqu_fetch_phase_semaphore
-    if _shiqu_fetch_phase_semaphore is None:
-        _shiqu_fetch_phase_semaphore = asyncio.Semaphore(
+    global _SHIQU_FETCH_PHASE_SEMAPHORE
+    if _SHIQU_FETCH_PHASE_SEMAPHORE is None:
+        _SHIQU_FETCH_PHASE_SEMAPHORE = asyncio.Semaphore(
             max(1, SHIQU_FETCH_PHASE_CONCURRENCY)
         )
-    return _shiqu_fetch_phase_semaphore
+    return _SHIQU_FETCH_PHASE_SEMAPHORE
 
 
 @asynccontextmanager

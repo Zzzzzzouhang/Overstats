@@ -12,8 +12,10 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 try:
     from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.modules.errors import ModuleError
+    from src.modules.render_base import run_render
 
 from .render import MAX_RENDER_BYTES, RenderedImage, render_ow_shop
 from .requests import OWShopRequests, OWShopSection, SHOP_SECTION_SOURCES
@@ -144,7 +146,12 @@ class OWShopModule:
         ]
         asset_paths = await self.requests.cache_images(image_urls, self.image_asset_dir)
         try:
-            rendered = self.renderer(sections=sections, generated_at=generated_at, asset_paths=asset_paths)
+            rendered = await run_render(
+                self.renderer,
+                sections=sections,
+                generated_at=generated_at,
+                asset_paths=asset_paths,
+            )
         except RuntimeError as exc:
             raise ModuleError(
                 error="render_dependency_missing",

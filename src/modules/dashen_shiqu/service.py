@@ -18,8 +18,10 @@ import os
 import random
 import re
 import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 try:
     from overstats.config.shiqu_config import (
@@ -1133,6 +1135,56 @@ def _shiqu_fetch_semaphore() -> "asyncio.Semaphore":
     return _SHIQU_FETCH_SEMAPHORE
 
 
+# ── 抓取阶段轮次闸 ──
+# 跨请求共享，保证任意时刻最多 1 个 shiqu 请求处于抓取阶段（默认，可用
+# OVERSTATS_SHIQU_FETCH_PHASE_CONCURRENCY 调整）。抓取阶段才真正请求大神
+# 上游，把它压到 1 个并发，意味着 shiqu 最多占用 1 个 dashen_request_queue
+# 槽位，其余槽位留给其它端点；而 LLM 阶段不占队列槽，可与之重叠并行。
+SHIQU_FETCH_PHASE_CONCURRENCY = int(
+    os.getenv("OVERSTATS_SHIQU_FETCH_PHASE_CONCURRENCY", "1")
+)
+_shiqu_fetch_phase_semaphore: "Optional[asyncio.Semaphore]" = None
+
+
+def _shiqu_fetch_phase_semaphore() -> "asyncio.Semaphore":
+    """懒加载抓取轮次信号量，绑定到运行中的事件循环，避免启动期创建。"""
+    global _shiqu_fetch_phase_semaphore
+    if _shiqu_fetch_phase_semaphore is None:
+        _shiqu_fetch_phase_semaphore = asyncio.Semaphore(
+            max(1, SHIQU_FETCH_PHASE_CONCURRENCY)
+        )
+    return _shiqu_fetch_phase_semaphore
+
+
+@asynccontextmanager
+async def shiqu_fetch_gate():
+    """抓取阶段轮次闸。
+
+    必须在 dashen_request_queue **之外**获取：等待轮次时不占用队列槽，
+    避免排队期间把共享槽位卡住（进而把其它端点挤到 429）。
+    进入后再由调用方申请队列槽执行 collect_data。
+    """
+    sem = _shiqu_fetch_phase_semaphore()
+    await sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+@dataclass
+class _PreparedShiqu:
+    """抓取阶段产物：LLM 阶段（generate_verdict）的输入。"""
+
+    query: "ShiquQuery"
+    full_id: str
+    details: List[dict]
+    system_prompt: str
+    user_prompt: str
+    list_key: str
+    cache_hit: bool
+
+
 class ShiquModule:
     def __init__(self) -> None:
         self.match_module = dashen_match_module
@@ -1249,29 +1301,37 @@ class ShiquModule:
         """
         return "|".join(sorted(str(mid) for mid in preset_ids))
 
-    async def analyze(self, query, *, db: Optional[IDPoolDB] = None) -> dict:
-        """业务主入口：抓取对局 → 构建 Prompt → 调用独立 LLM → 解析结构化结果。
+    async def collect_data(self, query, *, db: Optional[IDPoolDB] = None) -> "_PreparedShiqu":
+        """抓取阶段（会实际请求大神上游，必须置于 dashen_request_queue 之内）：
+        对局列表 → 详情 → 队友补齐 → 组 Prompt。
 
-        数据查询阶段严格复用 overstats 的 dashen_match 模块：
+        数据查询严格复用 overstats 的 dashen_match 模块：
         1. DashenMatchModule.query_match_list —— 完成 bnet_id → customer_token 解析与最近对局列表（含缓存）；
         2. DashenMatchModule.query_match_detail —— 逐条拉取对局详情（自动区分 fight/normal）；
         3. render._extract_match_detail_data —— 提取与原始 shiqu.py 一致的根数据结构。
         仅保留预设/6v6 对局，不足则重试一次（对齐原版网络抖动重试）。
 
+        调用方约定：先在 dashen_request_queue **之外**进入 shiqu_fetch_gate()
+        （抓取轮次闸，等待时不占队列槽），再在队列槽内调用本方法。
+        两者配合保证任意时刻最多 1 个 shiqu 请求占用 1 个队列槽位。
+        use_db 模式不走本方法（直接用 analyze_from_db）。
+
         Args:
-            query: ShiquQuery
+            query: ShiquQuery（use_db 必须为 False）
             db: 可选 IDPoolDB 实例（用于分段参考）；为 None 时不附加参考数据。
         Returns:
-            归一化后的判定结果 dict（含 score / verdict / summary / match_comments / overall_comment / teammate_comments）。
+            _PreparedShiqu（Prompt + 抓取上下文，供 generate_verdict 使用）。
         Raises:
-            ModuleError: 解析失败 / 数据不足 / LLM 未配置。
+            ModuleError: 参数缺失 / 模式非法 / LLM 未配置 / 数据不足。
         """
         if not query.bnet_id and not query.customer_token:
             raise ModuleError(error="missing_target", message="bnet_id 或 customer_token 不能为空。", status_code=400)
-
-        # ── use_db 模式：跳过上游抓取与 LLM 调用，直接复用数据库里最近一次判定 ──
         if query.use_db:
-            return await self._analyze_from_db(query)
+            raise ModuleError(
+                error="invalid_mode",
+                message="use_db 模式请使用 analyze / analyze_from_db，不要走抓取阶段。",
+                status_code=400,
+            )
 
         if not is_shiqu_llm_configured():
             raise ModuleError(
@@ -1344,7 +1404,6 @@ class ShiquModule:
 
         system_prompt = _build_system_prompt()
         user_prompt = _build_user_prompt(details, full_id, db=db)
-        _full_prompt = system_prompt + "\n\n" + user_prompt
 
         # 调试/测试用：设置环境变量 SHIQU_DUMP_PROMPT 指向文件路径，
         # 即可把本次组成的提示词落盘（不影响正常判定流程）。
@@ -1359,6 +1418,48 @@ class ShiquModule:
             except Exception as exc:  # pragma: no cover
                 logger.warning(f"[shiqu] 提示词保存失败: {exc}")
 
+        if len(user_prompt.encode("utf-8")) < 10240:
+            raise ModuleError(
+                error="insufficient_prompt_data",
+                message="数据抓取量异常，可能没有足够的预设/6v6 比赛对局。",
+                status_code=404,
+            )
+
+        return _PreparedShiqu(
+            query=query,
+            full_id=full_id,
+            details=details,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            list_key=list_key,
+            cache_hit=cache_hit,
+        )
+
+    async def generate_verdict(self, prepared: "_PreparedShiqu") -> dict:
+        """LLM 阶段（不占用 dashen_request_queue 槽位）：
+        调用独立 LLM → 解析结构化结果 → 遥测落库 → 详情缓存写回。
+
+        与抓取阶段分离后，多个请求可同时处于本阶段并行发送，
+        并发上限见 analysis_common.LLM_SEMAPHORE（默认 4，可用
+        OVERSTATS_LLM_MAX_CONCURRENT 调整）。
+
+        Args:
+            prepared: collect_data 的产物。
+        Returns:
+            归一化后的判定结果 dict（含 score / verdict / summary /
+            match_comments / overall_comment / teammate_comments）。
+        Raises:
+            ModuleError: LLM 调用失败 / 返回内容不是合法 JSON。
+        """
+        query = prepared.query
+        full_id = prepared.full_id
+        details = prepared.details
+        system_prompt = prepared.system_prompt
+        user_prompt = prepared.user_prompt
+        list_key = prepared.list_key
+        cache_hit = prepared.cache_hit
+        _full_prompt = system_prompt + "\n\n" + user_prompt
+
         # 调试/测试用：设置环境变量 SHIQU_PROMPT_ONLY=1 即只生成提示词、跳过 LLM 调用，
         # 直接返回占位结果（不影响生产：不设该变量则完全无副作用）。
         if os.environ.get("SHIQU_PROMPT_ONLY"):
@@ -1369,13 +1470,6 @@ class ShiquModule:
                 "prompt_only": True,
                 "prompt_bytes": len(user_prompt.encode("utf-8")),
             }
-
-        if len(user_prompt.encode("utf-8")) < 10240:
-            raise ModuleError(
-                error="insufficient_prompt_data",
-                message="数据抓取量异常，可能没有足够的预设/6v6 比赛对局。",
-                status_code=404,
-            )
 
         result = None
         last_text = ""
@@ -1442,10 +1536,33 @@ class ShiquModule:
             result["target_id"] = full_id
         return result
 
-    async def _analyze_from_db(self, query: ShiquQuery) -> Dict[str, Any]:
+    async def analyze(self, query, *, db: Optional[IDPoolDB] = None) -> dict:
+        """一步到位入口（抓取 + LLM 连续执行）：供直接调用与测试使用。
+
+        注意：HTTP 处理器不要用本方法——它会把耗时最长的 LLM 等待
+        一起关在 dashen_request_queue 槽位里。请改用拆分形式：
+            async with shiqu_fetch_gate():
+                prepared = await queue.run(
+                    "shiqu_fetch",
+                    lambda: shiqu_module.collect_data(query, db=db),
+                )
+            result = await shiqu_module.generate_verdict(prepared)
+        """
+        if not query.bnet_id and not query.customer_token:
+            raise ModuleError(error="missing_target", message="bnet_id 或 customer_token 不能为空。", status_code=400)
+
+        # ── use_db 模式：跳过上游抓取与 LLM 调用，直接复用数据库里最近一次判定 ──
+        if query.use_db:
+            return await self.analyze_from_db(query)
+
+        prepared = await self.collect_data(query, db=db)
+        return await self.generate_verdict(prepared)
+
+    async def analyze_from_db(self, query: ShiquQuery) -> Dict[str, Any]:
         """use_db 模式：从 shiqu_llm 数据库读取该玩家最近一次判定并解析成渲染用结构。
 
         跳过上游对局抓取与 LLM 调用；数据库中无记录则报错。
+        不占用 dashen_request_queue 槽位，也不调用 LLM。
         """
         target_id = str(query.bnet_id or f"token:{query.customer_token[:8]}")
         row = await asyncio.to_thread(shiqu_llm_recorder.db.get_latest_by_target, target_id)
@@ -1483,6 +1600,10 @@ class ShiquModule:
                 "%Y-%m-%d %H:%M:%S", time.localtime(int(created_at))
             )
         return result
+
+    async def _analyze_from_db(self, query: ShiquQuery) -> Dict[str, Any]:
+        """兼容旧名的别名（历史内部调用方使用）。"""
+        return await self.analyze_from_db(query)
 
 
 shiqu_module = ShiquModule()

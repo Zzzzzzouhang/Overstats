@@ -12,10 +12,12 @@ try:
     from overstats.src.constants import CHARA_NAME, iter_hero_alias_pairs
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.query_tool import load_query_tool
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.constants import CHARA_NAME, iter_hero_alias_pairs
     from src.modules.errors import ModuleError
     from src.modules.query_tool import load_query_tool
+    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_hero_wiki_overview
 from .retrieval import retrieve, evidence_context, extractive_answer
@@ -373,7 +375,8 @@ class OWHeroWikiModule:
         render_cache_key = self._build_render_cache_key(output, structured_payload=structured_payload)
         cached_image = self._load_rendered_image(render_cache_key)
         if cached_image is None:
-            image = render_hero_wiki_overview(
+            image = await run_render(
+                render_hero_wiki_overview,
                 output.to_dict(),
                 accent_color=output.accent_color,
                 icon_url=output.icon_url,

@@ -28,6 +28,7 @@ try:
     )
     from overstats.src.modules.dashen_match.requests import get_recent_dashen_seasons, iter_dashen_season_request_values
     from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
 except ModuleNotFoundError:
     from src.modules.dashen_match import DashenMatchQuery, DashenMatchRequests, dashen_match_module
@@ -48,6 +49,7 @@ except ModuleNotFoundError:
     )
     from src.modules.dashen_match.requests import get_recent_dashen_seasons, iter_dashen_season_request_values
     from src.modules.errors import ModuleError
+    from src.modules.render_base import run_render
     from src.modules.risk_status import RiskStatus, parse_risk_status
 
 
@@ -280,7 +282,7 @@ class DashenSameplayModule:
                     (player1.display_name, player1.risk_status),
                     (player2.display_name, player2.risk_status),
                 ]
-            image = render_match_list(visible_matches, **render_kwargs)
+            image = await run_render(render_match_list, visible_matches, **render_kwargs)
         return DashenSameplayListOutput(
             player1=player1,
             player2=player2,
@@ -354,7 +356,8 @@ class DashenSameplayModule:
 
         main_image = None
         if render:
-            main_image = render_match_detail(
+            main_image = await run_render(
+                render_match_detail,
                 detail_root,
                 source_match=source_match,
                 query_full_id=player1.full_id,
@@ -394,7 +397,8 @@ class DashenSameplayModule:
                 query_customer_token=focus_player.customer_token,
             )
             if all_player_details:
-                waterfall_image = render_all_players_waterfall(
+                waterfall_image = await run_render(
+                    render_all_players_waterfall,
                     all_player_details,
                     match_game_time_sec=detail_root.get("gameTimeSec"),
                 )
@@ -426,7 +430,8 @@ class DashenSameplayModule:
                             ),
                             {},
                         )
-                        analysis_image = render_analysis_report(
+                        analysis_image = await run_render(
+                            render_analysis_report,
                             json_data,
                             target_hero_images=build_target_hero_icons(focus_detail.get("heroList") or [], size=40),
                             map_name=map_name_for_match(detail_root),
@@ -915,7 +920,8 @@ class DashenSameplayModule:
 
         image = None
         if render:
-            image = render_player_hero_detail(
+            image = await run_render(
+                render_player_hero_detail,
                 player.display_name,
                 focus_detail,
                 match_game_time_sec=detail_root.get("gameTimeSec"),

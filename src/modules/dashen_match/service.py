@@ -19,6 +19,7 @@ try:
     from overstats.src.constants.ranks import get_rank_score
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
 except ModuleNotFoundError:
     from config import config as app_config
@@ -26,6 +27,7 @@ except ModuleNotFoundError:
     from src.constants.ranks import get_rank_score
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from src.modules.errors import ModuleError
+    from src.modules.render_base import run_render
     from src.modules.risk_status import RiskStatus, parse_risk_status
 from ..analysis_common import build_async_client as build_analysis_async_client
 from ..analysis_common import get_analysis_proxy
@@ -247,7 +249,7 @@ class DashenMatchModule:
             render_kwargs: Dict[str, Any] = {"full_id": full_id}
             if risk_status is not None:
                 render_kwargs["risk_status"] = risk_status
-            image = render_match_list(matches, **render_kwargs)
+            image = await run_render(render_match_list, matches, **render_kwargs)
         self._store_reply_context(query, resolved_bnet, matches)
         return DashenMatchListOutput(
             matches=matches,
@@ -293,7 +295,8 @@ class DashenMatchModule:
             enriched_detail = await self._hydrate_match_detail_risk_statuses(detail.payload)
             safe_query_full_id = _safe_display_identity(query_full_id) or UNKNOWN_PLAYER_LABEL
             safe_query_bnet_id = _safe_display_identity(query_bnet_id)
-            image = render_match_detail(
+            image = await run_render(
+                render_match_detail,
                 enriched_detail,
                 source_match=detail.source_match,
                 query_full_id=safe_query_full_id,
@@ -323,7 +326,8 @@ class DashenMatchModule:
         image = None
         if render:
             enriched_detail = await self._hydrate_match_detail_risk_statuses(detail.payload)
-            image = render_match_detail(
+            image = await run_render(
+                render_match_detail,
                 enriched_detail,
                 source_match=detail.source_match,
                 query_full_id=resolved_bnet.full_id if resolved_bnet else query.bnet_id,
@@ -406,7 +410,8 @@ class DashenMatchModule:
             detail.payload,
             known_risk_statuses={customer_token: target_risk_status},
         )
-        main_image = render_match_detail(
+        main_image = await run_render(
+            render_match_detail,
             detail_root,
             source_match=detail.source_match or source_match,
             query_full_id=query_full_id,
@@ -480,7 +485,8 @@ class DashenMatchModule:
                 if analysis_result.get("json") is not None:
                     json_data = dict(analysis_result["json"])
                     json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.localtime())
-                    analysis_image = render_analysis_report(
+                    analysis_image = await run_render(
+                        render_analysis_report,
                         json_data,
                         target_hero_images=build_target_hero_icons(focus_detail["heroList"], size=40),
                         risk_status=target_risk_status,
@@ -493,7 +499,8 @@ class DashenMatchModule:
                 else:
                     replies.append(_text_reply(analysis_result.get("fallback_text") or "AI锐评暂不可用。"))
         else:
-            detail_image = render_player_hero_detail(
+            detail_image = await run_render(
+                render_player_hero_detail,
                 query_full_id,
                 focus_detail,
                 match_game_time_sec=detail_root.get("gameTimeSec"),

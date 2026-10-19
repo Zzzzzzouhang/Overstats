@@ -8,6 +8,7 @@ try:
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.query_tool import load_query_tool
+    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
     from overstats.src.modules.dashen_quick_strength.render import (
         COMPETITIVE_STRENGTH_THEME,
@@ -19,6 +20,7 @@ except ModuleNotFoundError:
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from src.modules.errors import ModuleError
     from src.modules.query_tool import load_query_tool
+    from src.modules.render_base import run_render
     from src.modules.risk_status import RiskStatus, parse_risk_status
     from src.modules.dashen_quick_strength.render import (
         COMPETITIVE_STRENGTH_THEME,
@@ -189,7 +191,8 @@ class DashenCompetitiveStrengthModule:
                 query.customer_token,
             )
             try:
-                image = render_quick_strength(
+                image = await run_render(
+                    render_quick_strength,
                     player_name=full_id,
                     bnet_id=bnet_id,
                     summary=summary.to_dict(),

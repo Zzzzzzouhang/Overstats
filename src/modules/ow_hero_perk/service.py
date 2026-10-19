@@ -9,11 +9,13 @@ try:
     from overstats.src.db import IDPoolDB
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.query_tool import load_query_tool
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.constants import iter_hero_alias_pairs
     from src.db import IDPoolDB
     from src.modules.errors import ModuleError
     from src.modules.query_tool import load_query_tool
+    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_hero_perk_overview
 from .requests import MAJOR_PERK_LEVEL, MINOR_PERK_LEVEL, OWHeroPerkQuery, normalize_hero_query
@@ -150,7 +152,8 @@ class OWHeroPerkModule:
         if not render:
             return output
 
-        image = render_hero_perk_overview(
+        image = await run_render(
+            render_hero_perk_overview,
             hero=output.hero.to_dict(),
             minor=output.minor.to_dict(),
             major=output.major.to_dict(),

@@ -18,6 +18,7 @@ try:
     from overstats.src.modules.dashen_profile.render import RenderedImage, render_profile_summary
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.query_tool import cache_query_tool_asset_bytes, get_cached_asset_path
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient, dashen_api_client
     from src.modules.blizzard_player_search import (
@@ -32,6 +33,7 @@ except ModuleNotFoundError:
     from src.modules.dashen_profile.render import RenderedImage, render_profile_summary
     from src.modules.errors import ModuleError
     from src.modules.query_tool import cache_query_tool_asset_bytes, get_cached_asset_path
+    from src.modules.render_base import run_render
 
 from .parser import (
     BLIZZARD_PROFILE_FETCH_LOCALE,
@@ -149,7 +151,7 @@ class BlizzardProfileModule:
             try:
                 context = build_blizzard_render_context(parsed, resolved_player_label=resolved_player_id)
                 context = replace(context, avatar_bytes=avatar_bytes)
-                image = render_profile_summary(context)
+                image = await run_render(render_profile_summary, context)
             except RuntimeError as exc:
                 raise ModuleError(
                     error="render_dependency_missing",

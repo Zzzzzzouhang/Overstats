@@ -12,6 +12,7 @@ try:
         strength_score_to_rank,
     )
     from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.constants.ranks import (
         RANK_LABELS_CN,
@@ -21,6 +22,7 @@ except ModuleNotFoundError:
         strength_score_to_rank,
     )
     from src.modules.errors import ModuleError
+    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_rank_leaderboard
 from .requests import DashenRankLeaderboardQuery, DashenRankLeaderboardRequests, ROLE_LABELS, normalize_role
@@ -149,7 +151,8 @@ class DashenRankLeaderboardModule:
         if not render:
             return output
 
-        image = render_rank_leaderboard(
+        image = await run_render(
+            render_rank_leaderboard,
             province=output.province,
             role_label=output.role_label,
             entry_count=output.entry_count,

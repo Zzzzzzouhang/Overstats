@@ -11,8 +11,10 @@ from typing import Any, Callable, Dict, Mapping, Optional
 
 try:
     from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.modules.errors import ModuleError
+    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_patch_fallback, render_patch_notes
 from .requests import (
@@ -175,14 +177,14 @@ class PatchNotesModule:
         use_proxy = str(candidate.get("source") or "") == "en"
         try:
             asset_paths = await self.requests.cache_images(self._collect_asset_urls(candidate), self.asset_dir, use_proxy=use_proxy)
-            return self.renderer(candidate, summary_text=summary_text, asset_paths=asset_paths)
+            return await run_render(self.renderer, candidate, summary_text=summary_text, asset_paths=asset_paths)
         except RuntimeError as exc:
             print(f"[overstats] patch_notes structured render unavailable: {type(exc).__name__}: {exc}")
         except Exception as exc:
             print(f"[overstats] patch_notes structured render failed: {type(exc).__name__}: {exc}")
 
         try:
-            return self.fallback_renderer(candidate, summary_text=summary_text)
+            return await run_render(self.fallback_renderer, candidate, summary_text=summary_text)
         except RuntimeError as exc:
             raise ModuleError(
                 error="render_dependency_missing",

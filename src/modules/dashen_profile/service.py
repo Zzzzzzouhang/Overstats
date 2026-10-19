@@ -7,10 +7,12 @@ try:
     from overstats.src.client.apiclient import DashenAPIClient
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient
     from src.modules.errors import ModuleError
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
+    from src.modules.render_base import run_render
 
 from .engine import DashenProfileEngine
 from .render import RenderedImage, render_profile_summary
@@ -67,7 +69,7 @@ class DashenProfileModule:
                     avatar_bytes=avatar_bytes,
                     render_mode=render_mode,
                 )
-                image = render_profile_summary(context)
+                image = await run_render(render_profile_summary, context)
             except RuntimeError as exc:
                 raise ModuleError(
                     error="render_dependency_missing",

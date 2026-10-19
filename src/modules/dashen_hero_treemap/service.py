@@ -8,10 +8,12 @@ try:
     from overstats.src.client.apiclient import DashenAPIClient
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient
     from src.modules.errors import ModuleError
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
+    from src.modules.render_base import run_render
 
 from .engine import DashenHeroTreemapEngine, DashenHeroTreemapHero, DashenHeroTreemapPlayer, DashenHeroTreemapSeason
 from .engine import cloud_summary
@@ -106,7 +108,8 @@ class DashenHeroTreemapModule:
     async def _render_output(self, output: DashenHeroTreemapOutput) -> DashenHeroTreemapOutput:
 
         await _prefetch_hero_icons(output.heroes)
-        image = render_hero_treemap(
+        image = await run_render(
+            render_hero_treemap,
             player=output.player.to_dict(),
             season=output.season.to_dict(),
             mode=output.mode,

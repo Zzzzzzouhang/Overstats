@@ -5,8 +5,10 @@ from typing import Any, Optional
 
 try:
     from overstats.src.client.apiclient import DashenAPIClient
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient
+    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_bnet_search_result
 from .requests import BnetSearchRequests, BnetSearchResult
@@ -34,7 +36,7 @@ class BnetSearchModule:
             card_data = card_payload.get("data") if isinstance(card_payload, dict) else None
             if isinstance(card_data, dict) and isinstance(card_data.get("riskStatus"), dict):
                 risk_status = dict(card_data["riskStatus"])
-        image = render_bnet_search_result(result, risk_status=risk_status) if render else None
+        image = await run_render(render_bnet_search_result, result, risk_status=risk_status) if render else None
         return BnetSearchOutput(result=result, risk_status=risk_status, image=image)
 
     async def resolve_customer_token(self, bnet_id: str) -> str:

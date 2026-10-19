@@ -13,6 +13,7 @@ from ..dashen_hero_treemap.mini_program import (
 )
 from ..dashen_hero_treemap.requests import normalize_treemap_mode
 from ..errors import ModuleError
+from ..render_base import run_render
 from .metrics import collect_metrics, compare_radar, hero_hours, radar_dimensions, rows
 
 
@@ -163,7 +164,7 @@ class CareerCompareModule:
             await _prefetch_hero_icons([SimpleNamespace(icon_url=h["icon_url"], recent_perks=()) for section in sections
                                        for h in section["players"] if h and h["icon_url"]])
             from .render import render_career_compare
-            image = render_career_compare(data)
+            image = await run_render(render_career_compare, data)
         return CareerCompareOutput(data, image)
 
 

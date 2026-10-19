@@ -10,6 +10,7 @@ try:
     from overstats.src.modules.dashen_profile import get_live_dashen_season
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
+    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.season_config import get_dashen_history_start_season
 except ModuleNotFoundError:
     from src.constants.ranks import get_rank_score, get_rank_sub_tier, raw_rank_score_to_icon_level
@@ -18,6 +19,7 @@ except ModuleNotFoundError:
     from src.modules.dashen_profile import get_live_dashen_season
     from src.modules.errors import ModuleError
     from src.modules.risk_status import RiskStatus, parse_risk_status
+    from src.modules.render_base import run_render
     from src.modules.season_config import get_dashen_history_start_season
 
 from .render import HISTORY_SUBTITLE, RenderedImage, collect_missing_assets, render_rank_history
@@ -96,7 +98,8 @@ class DashenRankHistoryModule:
                     risk_status = parse_risk_status(card_data)
                     full_id = str(card_data.get("name") or full_id).strip()
                     bnet_id = str(card_data.get("bnetId") or bnet_id).strip()
-                image = render_rank_history(
+                image = await run_render(
+                    render_rank_history,
                     player_name=full_id or bnet_id or query.bnet_id or "Unknown",
                     subtitle=HISTORY_SUBTITLE,
                     seasons=seasons,

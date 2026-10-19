@@ -7,10 +7,12 @@ try:
     from overstats.src.constants import iter_hero_alias_pairs
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.query_tool import load_query_tool
+    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.constants import iter_hero_alias_pairs
     from src.modules.errors import ModuleError
     from src.modules.query_tool import load_query_tool
+    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_hero_leaderboard
 from .requests import (
@@ -185,7 +187,8 @@ class DashenHeroLeaderboardModule:
         if not render:
             return output
 
-        image = render_hero_leaderboard(
+        image = await run_render(
+            render_hero_leaderboard,
             province=output.province,
             hero=output.hero.to_dict(),
             mode_label=output.mode_label,

@@ -49,7 +49,11 @@ try:
         DashenCompetitiveStrengthQuery,
         dashen_competitive_strength_module,
     )
-    from overstats.src.modules.dashen_shiqu import ShiquQuery, shiqu_module
+    from overstats.src.modules.dashen_shiqu import (
+        ShiquQuery,
+        shiqu_fetch_gate,
+        shiqu_module,
+    )
     from overstats.src.modules.dashen_court import CourtQuery, court_module
     from overstats.src.db.court_llm import court_llm_recorder
     from overstats.src.db.shiqu_llm import shiqu_llm_recorder
@@ -121,7 +125,11 @@ except ModuleNotFoundError:
         DashenCompetitiveStrengthQuery,
         dashen_competitive_strength_module,
     )
-    from src.modules.dashen_shiqu import ShiquQuery, shiqu_module
+    from src.modules.dashen_shiqu import (
+        ShiquQuery,
+        shiqu_fetch_gate,
+        shiqu_module,
+    )
     from src.modules.dashen_court import CourtQuery, court_module
     from src.db.court_llm import court_llm_recorder
     from src.db.shiqu_llm import shiqu_llm_recorder
@@ -1923,10 +1931,9 @@ class OverstatsCoreService:
         return result.image.content
 
     async def handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "shiqu",
-            lambda: self._handle_shiqu(payload),
-        )
+        # 注意：不再整体包进 dashen_request_queue —— 仅抓取阶段占用队列槽
+        # （见 _handle_shiqu），LLM 阶段在槽外执行，可多请求并行发送。
+        return await self._handle_shiqu(payload)
 
     async def _handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -1940,15 +1947,24 @@ class OverstatsCoreService:
                 status_code=400,
                 hint='Example: {"bnet_id":"Player#12345"}',
             )
-        result = await shiqu_module.analyze(
-            ShiquQuery(
-                bnet_id=bnet_id,
-                customer_token=customer_token,
-                match_count=match_count,
-                use_db=use_db,
-            ),
-            db=_get_shiqu_ref_db(),
+        query = ShiquQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            match_count=match_count,
+            use_db=use_db,
         )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await shiqu_module.analyze_from_db(query)
+        else:
+            # 抓取阶段：先在队列外等抓取轮次闸（最多 1 个并发，等待时不占槽），
+            # 再占用 1 个 dashen 队列槽执行抓取；LLM 阶段在槽外执行。
+            async with shiqu_fetch_gate():
+                prepared = await self.dashen_request_queue.run(
+                    "shiqu_fetch",
+                    lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+                )
+            result = await shiqu_module.generate_verdict(prepared)
         result["ok"] = True
         return result
 
@@ -1956,10 +1972,8 @@ class OverstatsCoreService:
         # use_db=true 模式：不占用 dashen 并发槽位，直接 DB 读取 + 渲染
         if _coerce_bool(payload.get("use_db"), False):
             return await self._handle_shiqu_image(payload)
-        return await self.dashen_request_queue.run(
-            "shiqu_image",
-            lambda: self._handle_shiqu_image(payload),
-        )
+        # 与 handle_shiqu 相同：仅抓取阶段进队列槽，LLM 与渲染在槽外执行。
+        return await self._handle_shiqu_image(payload)
 
     async def _handle_shiqu_image(self, payload: Dict[str, object]) -> bytes:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -1973,23 +1987,32 @@ class OverstatsCoreService:
                 status_code=400,
                 hint='Example: {"bnet_id":"Player#12345"}',
             )
-        result = await shiqu_module.analyze(
-            ShiquQuery(
-                bnet_id=bnet_id,
-                customer_token=customer_token,
-                match_count=match_count,
-                use_db=use_db,
-            ),
-            db=_get_shiqu_ref_db(),
+        query = ShiquQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            match_count=match_count,
+            use_db=use_db,
         )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await shiqu_module.analyze_from_db(query)
+        else:
+            async with shiqu_fetch_gate():
+                prepared = await self.dashen_request_queue.run(
+                    "shiqu_fetch",
+                    lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+                )
+            result = await shiqu_module.generate_verdict(prepared)
         try:
             from overstats.src.modules.dashen_shiqu.render import render_shiqu_image
+            from overstats.src.modules.render_base import run_render
         except ModuleNotFoundError:
             from src.modules.dashen_shiqu.render import render_shiqu_image
+            from src.modules.render_base import run_render
         generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime()
         )
-        rendered = await asyncio.to_thread(render_shiqu_image, result, generated_at)
+        rendered = await run_render(render_shiqu_image, result, generated_at)
         if not rendered or not rendered.content:
             raise ModuleError(
                 error="render_failed",
@@ -2060,12 +2083,14 @@ class OverstatsCoreService:
         )
         try:
             from overstats.src.modules.dashen_court.render import render_court_image
+            from overstats.src.modules.render_base import run_render
         except ModuleNotFoundError:
             from src.modules.dashen_court.render import render_court_image
+            from src.modules.render_base import run_render
         generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime()
         )
-        rendered = await asyncio.to_thread(render_court_image, result, generated_at)
+        rendered = await run_render(render_court_image, result, generated_at)
         if not rendered or not rendered.content:
             raise ModuleError(
                 error="render_failed",
@@ -5167,6 +5192,19 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self._record_json_metric(status, payload)
 
         def _send_binary(self, status: HTTPStatus, body: bytes, content_type: str) -> None:
+            # 空 body 守卫：历史上渲染异常曾产出 200 + 0 字节响应，插件会把空文件
+            # 当图片上传 QQ 富媒体接口，触发上传返回 None + 5×30s 重试风暴。
+            # 这里统一拦截：空内容一律按 500 JSON 错误返回，让上游得到可读的错误。
+            if not body:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "empty_binary_response",
+                        "message": "Generated binary payload was empty.",
+                    },
+                )
+                return
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))

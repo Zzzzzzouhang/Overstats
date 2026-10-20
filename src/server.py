@@ -40,10 +40,12 @@ try:
         dashen_hero_treemap_module,
         normalize_treemap_mode,
     )
-    from overstats.src.modules.query_tool import ensure_query_tool_assets, load_query_tool
+    from overstats.src.modules.query_tool import start_query_tool_asset_warmup, load_query_tool
     from overstats.src.modules.dashen_match import DashenMatchQuery, dashen_match_module
     from overstats.src.modules.dashen_sameplay import DashenSameplayQuery, dashen_sameplay_module
     from overstats.src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
+    from overstats.src.modules.dashen_team_overview import team_overview_module
+    from overstats.src.modules.dashen_team_overview.render import render_overview
     from overstats.src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
     from overstats.src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
@@ -120,10 +122,12 @@ except ModuleNotFoundError:
         dashen_hero_treemap_module,
         normalize_treemap_mode,
     )
-    from src.modules.query_tool import ensure_query_tool_assets, load_query_tool
+    from src.modules.query_tool import start_query_tool_asset_warmup, load_query_tool
     from src.modules.dashen_match import DashenMatchQuery, dashen_match_module
     from src.modules.dashen_sameplay import DashenSameplayQuery, dashen_sameplay_module
     from src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
+    from src.modules.dashen_team_overview import team_overview_module
+    from src.modules.dashen_team_overview.render import render_overview
     from src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
     from src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
@@ -860,6 +864,7 @@ class OverstatsCoreService:
             "/api/v2/dashen-summary/today/image": lambda: self.handle_dashen_summary_image(selection.payload, scope="today"),
             "/api/v2/dashen-summary/yesterday/image": lambda: self.handle_dashen_summary_image(selection.payload, scope="yesterday"),
             "/api/v2/dashen-summary/week/image": lambda: self.handle_dashen_summary_image(selection.payload, scope="week"),
+            "/api/v2/dashen-team-overview/image": lambda: self.handle_dashen_team_overview_image(selection.payload),
             "/api/v2/dashen-rank-history/image": lambda: self.handle_dashen_rank_history_image(selection.payload),
             "/api/v2/dashen-quick-strength/image": lambda: self.handle_dashen_quick_strength_image(selection.payload),
             "/api/v2/dashen-competitive-strength/image": lambda: self.handle_dashen_competitive_strength_image(selection.payload),
@@ -881,6 +886,7 @@ class OverstatsCoreService:
             "/api/v2/dashen-summary/today": lambda: self.handle_dashen_summary(selection.payload, scope="today"),
             "/api/v2/dashen-summary/yesterday": lambda: self.handle_dashen_summary(selection.payload, scope="yesterday"),
             "/api/v2/dashen-summary/week": lambda: self.handle_dashen_summary(selection.payload, scope="week"),
+            "/api/v2/dashen-team-overview": lambda: self.handle_dashen_team_overview(selection.payload),
             "/api/v2/dashen-rank-history": lambda: self.handle_dashen_rank_history(selection.payload),
             "/api/v2/dashen-quick-strength": lambda: self.handle_dashen_quick_strength(selection.payload),
             "/api/v2/dashen-competitive-strength": lambda: self.handle_dashen_competitive_strength(selection.payload),
@@ -1160,6 +1166,7 @@ class OverstatsCoreService:
 
         result = await dashen_match_module.query_match_list(
             DashenMatchQuery(
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
                 bnet_id=bnet_id,
                 target_count=target_count,
@@ -1195,6 +1202,7 @@ class OverstatsCoreService:
 
         result = await dashen_match_module.query_match_list_replies(
             DashenMatchQuery(
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
                 bnet_id=bnet_id,
                 target_count=int(payload.get("target_count") or payload.get("limit") or 20),
@@ -1237,6 +1245,7 @@ class OverstatsCoreService:
 
         result = await dashen_match_module.query_match_list(
             DashenMatchQuery(
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
                 bnet_id=bnet_id,
                 target_count=target_count,
@@ -1515,6 +1524,7 @@ class OverstatsCoreService:
             include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
             result = await dashen_match_module.query_match_detail_by_index(
                 DashenMatchQuery(
+                    filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
                     customer_token=customer_token,
                     bnet_id=bnet_id,
                     target_count=target_count,
@@ -1581,6 +1591,7 @@ class OverstatsCoreService:
                     hint='Example: {"bnet_id":"Player#12345","index":0}',
                 )
             query = DashenMatchQuery(
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
                 bnet_id=bnet_id,
                 target_count=int(payload.get("target_count") or payload.get("limit") or 20),
@@ -1644,6 +1655,7 @@ class OverstatsCoreService:
         include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
         result = await dashen_match_module.query_match_detail_by_index(
             DashenMatchQuery(
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
                 bnet_id=bnet_id,
                 target_count=target_count,
@@ -1736,6 +1748,15 @@ class OverstatsCoreService:
                 break
         self._last_summary_render_ms = render_ms
         return result.image_bytes, result.image_media_type
+
+    async def handle_dashen_team_overview(self, payload: Dict[str, object]) -> Dict[str, object]:
+        return await self.dashen_request_queue.run(
+            "team_overview", lambda: team_overview_module.query(payload.get("base64")))
+
+    async def handle_dashen_team_overview_image(self, payload: Dict[str, object]) -> bytes:
+        result = await self.dashen_request_queue.run(
+            "team_overview_image", lambda: team_overview_module.query(payload.get("base64"), include_avatars=True))
+        return await asyncio.to_thread(render_overview, result)
 
     async def handle_dashen_rank_history(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -2262,15 +2283,6 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     from .db.privacy import purge_player_storage
     purge_player_storage()
     query_tool_config = load_query_tool()
-    asset_status = ensure_query_tool_assets(query_tool_config)
-    print(
-        "[overstats] query_tool assets "
-        f"checked={asset_status['checked']} "
-        f"cached={asset_status.get('cached', 0)} "
-        f"downloaded={asset_status['downloaded']} "
-        f"failed={asset_status['failed']} "
-        f"dir={asset_status['asset_dir']}"
-    )
     service = OverstatsCoreService(
         dashen_max_concurrent_requests=config.dashen_max_concurrent_requests,
         dashen_max_accepted_requests=config.dashen_max_accepted_requests,
@@ -2529,6 +2541,13 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
             if path == "/api/v2/dashen-hero-treemap":
                 self._handle_dashen_hero_treemap_post()
+                return
+
+            if path == "/api/v2/dashen-team-overview/image":
+                self._handle_dashen_team_overview_image_post()
+                return
+            if path == "/api/v2/dashen-team-overview":
+                self._handle_dashen_team_overview_post()
                 return
 
             if path == "/api/v2/dashen-rank-history/image":
@@ -4235,6 +4254,96 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
 
             self._send_binary(HTTPStatus.OK, image_body, "image/png")
 
+        def _handle_dashen_team_overview_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                result = async_runner.run(service.handle_dashen_team_overview(payload))
+            except ModuleError as exc:
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_json(HTTPStatus.OK, result)
+
+        def _handle_dashen_team_overview_image_post(self) -> None:
+            try:
+                payload = self._read_json_body()
+            except ValueError as exc:
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {
+                        "ok": False,
+                        "error": "invalid_json",
+                        "message": str(exc),
+                    },
+                )
+                return
+
+            try:
+                image_body = async_runner.run(service.handle_dashen_team_overview_image(payload))
+            except ModuleError as exc:
+                self._send_json(
+                    HTTPStatus(exc.status_code),
+                    {
+                        "ok": False,
+                        "error": exc.error,
+                        "message": exc.message,
+                        "hint": exc.hint,
+                        "details": exc.details,
+                    },
+                )
+                return
+            except Exception as exc:
+                self._send_json(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    {
+                        "ok": False,
+                        "error": "internal_error",
+                        "message": "Internal server error. See details.",
+                        "details": {
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    },
+                )
+                return
+
+            self._send_binary(HTTPStatus.OK, image_body, "image/png")
+
         def _handle_dashen_rank_history_post(self) -> None:
             try:
                 payload = self._read_json_body()
@@ -5336,9 +5445,11 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self.wfile.flush()
 
     server = ThreadingHTTPServer((config.host, config.port), OverstatsRequestHandler)
+    asset_warmup_stop = start_query_tool_asset_warmup(query_tool_config)
     original_server_close = server.server_close
 
     def server_close() -> None:
+        asset_warmup_stop.set()
         dashen_api_client.match_detail_recorder = previous_match_detail_recorder
         dashen_api_client.player_identity_recorder = previous_player_identity_recorder
         dashen_api_client.request_metrics_recorder = previous_request_metrics_recorder

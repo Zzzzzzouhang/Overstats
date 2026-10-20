@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from ..map_modes import draw_map_mode_icon
+
+from ..subroles import draw_subrole_badge, get_subrole
+
 from ..dashen_promo import append_dashen_promo
 
 from collections import defaultdict
@@ -515,6 +519,7 @@ def render_player_hero_detail(
         icon = _load_icon_rgba(_hero_icon_url(hero_info, hero), size=(54, 54))
         if icon is not None:
             image.paste(icon, (box[0] + 20, box[1] + 12), icon)
+        draw_subrole_badge(image, hero_info, box[0]+54, box[1]+46, 22)
         role_icon = _load_role_icon_asset(role_type, size=(30, 30))
         hero_text_x = box[0] + 178
         if role_icon is not None:
@@ -1470,6 +1475,7 @@ def render_analysis_report(
 
     draw.text((padding, 18), ">> AI锐评", font=font_title, fill=(255, 255, 255, 255))
     header_text = f"{map_name or '本场对局'} - {match_result or '总览'}"
+    draw_map_mode_icon(image, map_name, width - padding - measure(header_text, _font_chinese(22)) - 32, 27, 24)
     draw.text((width - padding - measure(header_text, _font_chinese(22)), 27), header_text, font=_font_chinese(22), fill=(255, 255, 255, 220))
 
     score_colors = {

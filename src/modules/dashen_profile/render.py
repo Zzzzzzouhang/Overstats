@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from ..map_modes import draw_map_mode_icon
+
+from ..subroles import draw_subrole_badge, get_subrole
+
 from ..dashen_promo import append_dashen_promo
 
 from dataclasses import dataclass
@@ -688,6 +692,7 @@ def _draw_top_heroes(
             icon = _resize_image(crop_to_circle(icon, 15, ring_color), (128, 128))
             icon = _add_outer_circle_ring(icon, ring_width=7, ring_color=(82, 90, 108, 118))
             image.paste(icon, (slot_x - 7, 441), icon)
+            draw_subrole_badge(image, hero_info, slot_x+99, 547, 28)
 
         tier_icon = _load_level_tier_icon(_hero_level_tier(row.hero_level)) if row.hero_level > 0 else None
         if tier_icon is not None:
@@ -760,6 +765,7 @@ def _draw_hero_usage_block(
         if icon is not None:
             icon = _resize_image(icon, (40, 40))
             image.paste(icon, (60, y))
+            draw_subrole_badge(image, hero_info, 81, y+21, 18)
 
         hero_level = max(0, _safe_int(row.hero_level))
         tier_icon = _load_level_tier_icon(_hero_level_tier(hero_level)) if hero_level > 0 else None
@@ -1049,6 +1055,7 @@ def _draw_recent_match_timeline(image: Any, config: Dict[str, Any], matches: Seq
         hero_name = str(hero_info.get("name") or item.get("heroName") or hero_guid)
         hero_icon_url = str(hero_info.get("icon") or "")
 
+        draw_map_mode_icon(bg, map_info, 16, 6, 22)
         map_name = _truncate_text_to_width(bgdraw, map_name, 210, fonts["font_cn_small"])
         _draw_mixed_text(bgdraw, 44, 6, map_name, label_font=fonts["font_cn_small"], number_font=fonts["font_cn_small"], fill="white")
         _draw_mixed_text_with_shadow(

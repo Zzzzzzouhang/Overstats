@@ -22,7 +22,7 @@ except ModuleNotFoundError:
     from src.modules.render_base import run_render
     from src.modules.season_config import get_dashen_history_start_season
 
-from .render import HISTORY_SUBTITLE, RenderedImage, collect_missing_assets, render_rank_history
+from .render import HISTORY_SUBTITLE, RenderedImage, collect_missing_assets, render_rank_history, ensure_season_banners
 from .requests import (
     DashenRankHistoryQuery,
     DashenRankHistoryRequests,
@@ -74,6 +74,8 @@ class DashenRankHistoryModule:
             end_season=end_season,
         )
         seasons = self._build_season_summaries(raw_seasons)
+        if render:
+            await ensure_season_banners(seasons)
         missing_assets = collect_missing_assets(seasons)
 
         full_id = ""

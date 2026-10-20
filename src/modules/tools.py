@@ -168,3 +168,9 @@ register_module(
     "电竞法庭判决书生成：基于单局详情，调用独立 LLM 输出毒舌判决书，并渲染 PIL 图片。",
 )
 register_module("dashen_hero_compare", "overstats.src.modules.dashen_hero_compare", "Compare two players hero statistics with three-season fallback.")
+
+register_module(
+    "dashen_team_overview",
+    "overstats.src.modules.dashen_team_overview",
+    "Decode team Base64 and render teammate/opponent profile overview.",
+)

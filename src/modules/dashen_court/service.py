@@ -13,8 +13,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from ..dashen_match.render import _extract_match_detail_data
@@ -622,6 +625,49 @@ async def _call_llm(prompt: str) -> Optional[str]:
 
 # ── 主流程 ──
 
+# ── 抓取阶段轮次闸 ──
+# 与 shiqu 一致：跨请求共享，保证任意时刻最多 1 个 court 请求处于抓取阶段，
+# 从而最多占用 1 个 dashen_request_queue 槽位；LLM 阶段不占队列槽，可并行发送。
+COURT_FETCH_PHASE_CONCURRENCY = int(
+    os.getenv("OVERSTATS_COURT_FETCH_PHASE_CONCURRENCY", "1")
+)
+# 注意：全局变量用大写、函数用小写，避免 def 重新绑定把变量 shadow 成函数对象。
+_COURT_FETCH_PHASE_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+
+def _court_fetch_phase_semaphore() -> asyncio.Semaphore:
+    """懒加载抓取轮次信号量，绑定到运行中的事件循环，避免启动期创建。"""
+    global _COURT_FETCH_PHASE_SEMAPHORE
+    if _COURT_FETCH_PHASE_SEMAPHORE is None:
+        _COURT_FETCH_PHASE_SEMAPHORE = asyncio.Semaphore(
+            max(1, COURT_FETCH_PHASE_CONCURRENCY)
+        )
+    return _COURT_FETCH_PHASE_SEMAPHORE
+
+
+@asynccontextmanager
+async def court_fetch_gate():
+    """抓取阶段轮次闸（在 dashen_request_queue 之外获取，等待时不占队列槽）。"""
+    sem = _court_fetch_phase_semaphore()
+    await sem.acquire()
+    try:
+        yield
+    finally:
+        sem.release()
+
+
+@dataclass
+class _PreparedCourt:
+    """抓取阶段产物：LLM 阶段（generate_verdict）的输入。"""
+
+    query: CourtQuery
+    full_id: str
+    index: int
+    prompt: str
+    map_name: str
+    game_mode: str
+
+
 class CourtModule:
     def __init__(self) -> None:
         self.match_module = dashen_match_module
@@ -650,28 +696,35 @@ class CourtModule:
             except Exception as exc:
                 logger.warning(f"[court] 队友 {p.get('name')} 详情拉取失败: {exc}")
 
-    async def analyze(
+    async def collect_data(
         self,
         query: CourtQuery,
         *,
         db: Optional[IDPoolDB] = None,
-    ) -> Dict[str, Any]:
-        """业务主入口：解析目标 → 拉取单局详情 → 补齐队友英雄 → 构建 Prompt → 调用 LLM → 落库。
+    ) -> "_PreparedCourt":
+        """抓取阶段（会实际请求大神上游，必须置于 dashen_request_queue 之内）：
+        解析目标 → 拉取单局详情 → 补齐队友英雄 → 构建 Prompt。
+
+        调用方约定：先在 dashen_request_queue **之外**进入 court_fetch_gate()
+        （抓取轮次闸，等待时不占队列槽），再在队列槽内以 heavy=True 调用本方法
+        （轻指令高峰期间让行）。use_db 模式不走本方法（直接用 analyze_from_db）。
 
         Args:
-            query: CourtQuery（bnet_id / customer_token / index）
+            query: CourtQuery（bnet_id / customer_token / index；use_db 必须为 False）
             db: 可选 IDPoolDB 实例（用于分段参考）
         Returns:
-            {"target_id", "index", "raw_text", "map_name", "game_mode", "match_index"}
+            _PreparedCourt（Prompt + 渲染元数据，供 generate_verdict 使用）。
         Raises:
-            ModuleError: 数据不足 / LLM 未配置 / LLM 失败
+            ModuleError: 参数缺失 / 模式非法 / LLM 未配置 / 对局不存在
         """
         if not query.bnet_id and not query.customer_token:
             raise ModuleError(error="missing_target", message="bnet_id 或 customer_token 不能为空。", status_code=400)
-
-        # ── use_db 模式：跳过上游抓取与 LLM 调用，直接复用数据库里最近一次判决书 ──
         if query.use_db:
-            return await self._analyze_from_db(query)
+            raise ModuleError(
+                error="invalid_mode",
+                message="use_db 模式请使用 analyze / analyze_from_db，不要走抓取阶段。",
+                status_code=400,
+            )
 
         if not is_shiqu_llm_configured():
             raise ModuleError(
@@ -746,6 +799,30 @@ class CourtModule:
             db=db,
         ).replace("{index_hint}", str(index + 1)).replace("{target_player}", focus_display_name)
 
+        return _PreparedCourt(
+            query=query,
+            full_id=full_id,
+            index=index,
+            prompt=prompt,
+            map_name=map_name,
+            game_mode=game_mode,
+        )
+
+    async def generate_verdict(self, prepared: "_PreparedCourt") -> Dict[str, Any]:
+        """LLM 阶段（不占用 dashen_request_queue 槽位）：
+        调用独立 LLM → 校验 JSON → 落库 → 返回判决书结构。
+
+        与抓取阶段分离后，多个请求可同时处于本阶段并行发送，
+        并发上限见 analysis_common.LLM_SEMAPHORE（默认 4，可用
+        OVERSTATS_LLM_MAX_CONCURRENT 调整）。
+        """
+        query = prepared.query
+        full_id = prepared.full_id
+        index = prepared.index
+        prompt = prepared.prompt
+        map_name = prepared.map_name
+        game_mode = prepared.game_mode
+
         # ── LLM 调用（retry=0 → 仅 1 次；retry=N → 初始 1 次 + 重试 N 次，恢复等待交由单次调用超时承担）──
         last_text = ""
         result = None
@@ -804,10 +881,36 @@ class CourtModule:
             "match_index": index,
         }
 
-    async def _analyze_from_db(self, query: CourtQuery) -> Dict[str, Any]:
+    async def analyze(
+        self,
+        query: CourtQuery,
+        *,
+        db: Optional[IDPoolDB] = None,
+    ) -> Dict[str, Any]:
+        """一步到位入口（抓取 + LLM 连续执行）：供直接调用与测试使用。
+
+        注意：HTTP 处理器不要用本方法——LLM 等待会一起关在
+        dashen_request_queue 槽位里。请改用拆分形式：
+            async with court_fetch_gate():
+                prepared = await queue.run(
+                    "court_fetch",
+                    lambda: court_module.collect_data(query, db=db),
+                    heavy=True,
+                )
+            result = await court_module.generate_verdict(prepared)
+        """
+        if not query.bnet_id and not query.customer_token:
+            raise ModuleError(error="missing_target", message="bnet_id 或 customer_token 不能为空。", status_code=400)
+        if query.use_db:
+            return await self.analyze_from_db(query)
+        prepared = await self.collect_data(query, db=db)
+        return await self.generate_verdict(prepared)
+
+    async def analyze_from_db(self, query: CourtQuery) -> Dict[str, Any]:
         """use_db 模式：从 court_llm 数据库读取该玩家最近一次判决书与渲染元数据。
 
         use_db 模式下忽略 index，直接取该玩家最新一条记录（无论第几局）。
+        不占用 dashen_request_queue 槽位，也不调用 LLM。
         """
         target_id = str(query.bnet_id or f"token:{query.customer_token[:8]}")
         row = await asyncio.to_thread(
@@ -836,6 +939,10 @@ class CourtModule:
             "match_index": int(row.get("match_index", index)),
             "generated_at": generated_at,
         }
+
+    async def _analyze_from_db(self, query: CourtQuery) -> Dict[str, Any]:
+        """兼容旧名的别名（历史内部调用方使用）。"""
+        return await self.analyze_from_db(query)
 
 
 court_module = CourtModule()

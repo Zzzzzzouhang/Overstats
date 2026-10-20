@@ -77,6 +77,7 @@ class APIConfig:
     enable_database_write: bool
     dashen_max_concurrent_requests: int
     dashen_max_accepted_requests: int = 4
+    dashen_light_load_threshold: int = 4
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,13 @@ def get_api_config() -> APIConfig:
                     "DASHEN_MAX_ACCEPTED_REQUESTS",
                     _default_dashen_max_accepted_requests(),
                 ),
+            ),
+        ),
+        dashen_light_load_threshold=max(
+            0,
+            _read_int_env(
+                "OVERSTATS_DASHEN_LIGHT_LOAD_THRESHOLD",
+                getattr(config, "DASHEN_LIGHT_LOAD_THRESHOLD", 4),
             ),
         ),
     )

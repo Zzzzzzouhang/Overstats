@@ -54,7 +54,11 @@ try:
         shiqu_fetch_gate,
         shiqu_module,
     )
-    from overstats.src.modules.dashen_court import CourtQuery, court_module
+    from overstats.src.modules.dashen_court import (
+        CourtQuery,
+        court_fetch_gate,
+        court_module,
+    )
     from overstats.src.db.court_llm import court_llm_recorder
     from overstats.src.db.shiqu_llm import shiqu_llm_recorder
     from overstats.src.modules.llm_call_status import (
@@ -130,7 +134,11 @@ except ModuleNotFoundError:
         shiqu_fetch_gate,
         shiqu_module,
     )
-    from src.modules.dashen_court import CourtQuery, court_module
+    from src.modules.dashen_court import (
+        CourtQuery,
+        court_fetch_gate,
+        court_module,
+    )
     from src.db.court_llm import court_llm_recorder
     from src.db.shiqu_llm import shiqu_llm_recorder
     from src.modules.llm_call_status import (
@@ -367,10 +375,21 @@ _T = TypeVar("_T")
 
 
 class DashenRequestQueue:
-    def __init__(self, max_concurrent_requests: int, max_accepted_requests: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        max_concurrent_requests: int,
+        max_accepted_requests: Optional[int] = None,
+        *,
+        light_load_threshold: int = 4,
+    ) -> None:
         self.max_concurrent_requests = max(1, int(max_concurrent_requests or 1))
         accepted_limit = self.max_concurrent_requests if max_accepted_requests is None else int(max_accepted_requests)
         self.max_accepted_requests = max(1, accepted_limit)
+        # 轻指令负载让行阈值：轻指令（除 shiqu/court 外的队列请求）pending 超过该值时，
+        # 重指令（heavy=True）在队列槽外等待，把槽位让给轻指令，提升高峰期轻指令响应速度。
+        # 重指令的 LLM 阶段不走本队列，不受让行影响。
+        self.light_load_threshold = max(0, int(light_load_threshold))
+        self._light_pending = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._active_requests = 0
         self._queued_requests = 0
@@ -383,13 +402,52 @@ class DashenRequestQueue:
     def _pending_requests(self) -> int:
         return self._active_requests + self._queued_requests
 
-    async def run(self, label: str, factory: Callable[[], Awaitable[_T]]) -> _T:
+    async def _yield_to_light_load(self, label: str) -> None:
+        """重指令让行：轻指令高峰期间在队列槽外轮询等待。
+
+        等待条件（满足其一即继续等）：
+        1. 轻指令 pending 超过 light_load_threshold；
+        2. 队列 pending 已达准入上限（继续等而不是直接 429，让行期间轻指令优先消化）。
+        等待期间不占用队列槽、不计入 pending/active，因此既不会阻塞轻指令，
+        也不会把后续请求挤到 429；LLM 阶段不走本队列，不受影响。
+        """
+        announced = False
+        while True:
+            light_pending = self._light_pending
+            pending_requests = self._pending_requests()
+            if (
+                light_pending <= self.light_load_threshold
+                and pending_requests < self.max_accepted_requests
+            ):
+                return
+            if not announced:
+                announced = True
+                print(
+                    "[overstats] dashen heavy request yielding to light load "
+                    f"label={label} light_pending={light_pending} "
+                    f"threshold={self.light_load_threshold} "
+                    f"pending={pending_requests} max_accepted={self.max_accepted_requests}"
+                )
+            await asyncio.sleep(0.1)
+
+    async def run(
+        self,
+        label: str,
+        factory: Callable[[], Awaitable[_T]],
+        *,
+        heavy: bool = False,
+    ) -> _T:
+        # 重指令（shiqu/court 抓取阶段）：先在队列外向轻指令让行
+        if heavy:
+            await self._yield_to_light_load(label)
+
         pending_requests = self._pending_requests()
         if pending_requests >= self.max_accepted_requests:
             print(
                 "[overstats] dashen request rejected "
                 f"label={label} pending={pending_requests} active={self._active_requests} "
-                f"queued={self._queued_requests} max_accepted={self.max_accepted_requests}"
+                f"queued={self._queued_requests} light_pending={self._light_pending} "
+                f"max_accepted={self.max_accepted_requests}"
             )
             raise ModuleError(
                 error="too_many_requests",
@@ -400,33 +458,40 @@ class DashenRequestQueue:
                     "active_requests": self._active_requests,
                     "queued_requests": self._queued_requests,
                     "pending_requests": pending_requests,
+                    "light_pending_requests": self._light_pending,
                     "max_accepted_requests": self.max_accepted_requests,
                 },
             )
 
-        semaphore = self._get_semaphore()
-        self._queued_requests += 1
-        _q_t0 = time.monotonic()
+        if not heavy:
+            self._light_pending += 1
         try:
-            await semaphore.acquire()
-        finally:
-            self._queued_requests -= 1
-        _qw = int((time.monotonic() - _q_t0) * 1000)
-        _qw_acc = _queue_wait_acc_var.get()
-        if _qw_acc is not None:
-            _qw_acc.add(_qw)
+            semaphore = self._get_semaphore()
+            self._queued_requests += 1
+            _q_t0 = time.monotonic()
+            try:
+                await semaphore.acquire()
+            finally:
+                self._queued_requests -= 1
+            _qw = int((time.monotonic() - _q_t0) * 1000)
+            _qw_acc = _queue_wait_acc_var.get()
+            if _qw_acc is not None:
+                _qw_acc.add(_qw)
 
-        self._active_requests += 1
-        if self._queued_requests > 0:
-            print(
-                "[overstats] dashen request dequeued "
-                f"label={label} active={self._active_requests} queued={self._queued_requests}"
-            )
-        try:
-            return await factory()
+            self._active_requests += 1
+            if self._queued_requests > 0:
+                print(
+                    "[overstats] dashen request dequeued "
+                    f"label={label} active={self._active_requests} queued={self._queued_requests}"
+                )
+            try:
+                return await factory()
+            finally:
+                self._active_requests -= 1
+                semaphore.release()
         finally:
-            self._active_requests -= 1
-            semaphore.release()
+            if not heavy:
+                self._light_pending -= 1
 
 
 class OverstatsCoreService:
@@ -436,10 +501,12 @@ class OverstatsCoreService:
         self,
         dashen_max_concurrent_requests: int = 2,
         dashen_max_accepted_requests: Optional[int] = None,
+        dashen_light_load_threshold: int = 4,
     ) -> None:
         self.dashen_request_queue = DashenRequestQueue(
             dashen_max_concurrent_requests,
             max_accepted_requests=dashen_max_accepted_requests,
+            light_load_threshold=dashen_light_load_threshold,
         )
 
     async def handle_internal_rank_distribution_image(self, payload: Dict[str, object]) -> bytes:
@@ -1963,6 +2030,7 @@ class OverstatsCoreService:
                 prepared = await self.dashen_request_queue.run(
                     "shiqu_fetch",
                     lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+                    heavy=True,
                 )
             result = await shiqu_module.generate_verdict(prepared)
         result["ok"] = True
@@ -2001,6 +2069,7 @@ class OverstatsCoreService:
                 prepared = await self.dashen_request_queue.run(
                     "shiqu_fetch",
                     lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+                    heavy=True,
                 )
             result = await shiqu_module.generate_verdict(prepared)
         try:
@@ -2022,10 +2091,9 @@ class OverstatsCoreService:
         return rendered.content
 
     async def handle_court(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "court",
-            lambda: self._handle_court(payload),
-        )
+        # 注意：不再整体包进 dashen_request_queue —— 仅抓取阶段占用队列槽
+        # （见 _handle_court），LLM 阶段在槽外执行，可多请求并行发送。
+        return await self._handle_court(payload)
 
     async def _handle_court(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -2039,15 +2107,26 @@ class OverstatsCoreService:
                 status_code=400,
                 hint='Example: {"bnet_id":"Player#12345","index":0}',
             )
-        result = await court_module.analyze(
-            CourtQuery(
-                bnet_id=bnet_id,
-                customer_token=customer_token,
-                index=index,
-                use_db=use_db,
-            ),
-            db=_get_shiqu_ref_db(),
+        query = CourtQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            index=index,
+            use_db=use_db,
         )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await court_module.analyze_from_db(query)
+        else:
+            # 抓取阶段：先在队列外等抓取轮次闸（最多 1 个并发，等待时不占槽），
+            # 再以 heavy=True 占用 1 个 dashen 队列槽执行抓取（轻指令高峰期间让行）；
+            # LLM 阶段在槽外执行，不受让行影响。
+            async with court_fetch_gate():
+                prepared = await self.dashen_request_queue.run(
+                    "court_fetch",
+                    lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
+                    heavy=True,
+                )
+            result = await court_module.generate_verdict(prepared)
         result["ok"] = True
         return result
 
@@ -2055,10 +2134,8 @@ class OverstatsCoreService:
         # use_db=true 模式：不占用 dashen 并发槽位，直接 DB 读取 + 渲染
         if _coerce_bool(payload.get("use_db"), False):
             return await self._handle_court_image(payload)
-        return await self.dashen_request_queue.run(
-            "court_image",
-            lambda: self._handle_court_image(payload),
-        )
+        # 与 handle_court 相同：仅抓取阶段进队列槽，LLM 与渲染在槽外执行。
+        return await self._handle_court_image(payload)
 
     async def _handle_court_image(self, payload: Dict[str, object]) -> bytes:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -2072,15 +2149,23 @@ class OverstatsCoreService:
                 status_code=400,
                 hint='Example: {"bnet_id":"Player#12345","index":0}',
             )
-        result = await court_module.analyze(
-            CourtQuery(
-                bnet_id=bnet_id,
-                customer_token=customer_token,
-                index=index,
-                use_db=use_db,
-            ),
-            db=_get_shiqu_ref_db(),
+        query = CourtQuery(
+            bnet_id=bnet_id,
+            customer_token=customer_token,
+            index=index,
+            use_db=use_db,
         )
+        if use_db:
+            # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
+            result = await court_module.analyze_from_db(query)
+        else:
+            async with court_fetch_gate():
+                prepared = await self.dashen_request_queue.run(
+                    "court_fetch",
+                    lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
+                    heavy=True,
+                )
+            result = await court_module.generate_verdict(prepared)
         try:
             from overstats.src.modules.dashen_court.render import render_court_image
             from overstats.src.modules.render_base import run_render
@@ -2189,11 +2274,13 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     service = OverstatsCoreService(
         dashen_max_concurrent_requests=config.dashen_max_concurrent_requests,
         dashen_max_accepted_requests=config.dashen_max_accepted_requests,
+        dashen_light_load_threshold=config.dashen_light_load_threshold,
     )
     print(
         "[overstats] dashen request queue enabled "
         f"max_concurrent={config.dashen_max_concurrent_requests} "
-        f"max_accepted={config.dashen_max_accepted_requests}"
+        f"max_accepted={config.dashen_max_accepted_requests} "
+        f"light_load_threshold={config.dashen_light_load_threshold}"
     )
     print(f"[overstats] database writes enabled={config.enable_database_write}")
     async_runner = AsyncRunner()
@@ -2264,6 +2351,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                         "default_stream": config.use_stream_response,
                         "dashen_max_concurrent_requests": config.dashen_max_concurrent_requests,
                         "dashen_max_accepted_requests": config.dashen_max_accepted_requests,
+                        "dashen_light_load_threshold": config.dashen_light_load_threshold,
                     },
                 )
                 return

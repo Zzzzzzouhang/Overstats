@@ -66,12 +66,13 @@ class DashenHeroTreemapModule:
         self.engine = engine or DashenHeroTreemapEngine()
         self.search_module = search_module or bnet_search_module
 
-    async def query_treemap(
+    async def fetch_treemap(
         self,
         query: DashenHeroTreemapQuery,
         *,
-        render: bool = False,
+        for_render: bool = False,
     ) -> DashenHeroTreemapOutput:
+        """抓取阶段：解析 + 英雄树数据（+ 渲染所需图标）。只含上游请求。"""
         from .mini_program import get_hero_module_mode, MiniProgramHeroTreemap
         if get_hero_module_mode() == 1:
             player, season, heroes, mode = await MiniProgramHeroTreemap(search_module=self.search_module).query(query)
@@ -80,7 +81,9 @@ class DashenHeroTreemapModule:
                 total_game_time_sec=sum(item.game_time_sec for item in heroes),
                 heroes=heroes, data_source="mini_program",
             )
-            return await self._render_output(output) if render else output
+            if for_render:
+                await _prefetch_hero_icons(output.heroes)
+            return output
         if str(query.mode).startswith("stadium_"):
             raise ModuleError(error="unsupported_treemap_mode", message="角斗领域仅支持小程序数据源。", status_code=400)
         resolved_query, resolved_bnet = await self._resolve_query(query)
@@ -100,14 +103,12 @@ class DashenHeroTreemapModule:
             total_game_time_sec=sum(item.game_time_sec for item in heroes),
             heroes=heroes,
         )
-        if not render:
-            return output
+        if for_render:
+            await _prefetch_hero_icons(output.heroes)
+        return output
 
-        return await self._render_output(output)
-
-    async def _render_output(self, output: DashenHeroTreemapOutput) -> DashenHeroTreemapOutput:
-
-        await _prefetch_hero_icons(output.heroes)
+    async def render_treemap(self, output: DashenHeroTreemapOutput) -> DashenHeroTreemapOutput:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
         image = await run_render(
             render_hero_treemap,
             player=output.player.to_dict(),
@@ -128,6 +129,21 @@ class DashenHeroTreemapModule:
             image=image,
             data_source=output.data_source,
         )
+
+    async def query_treemap(
+        self,
+        query: DashenHeroTreemapQuery,
+        *,
+        render: bool = False,
+    ) -> DashenHeroTreemapOutput:
+        output = await self.fetch_treemap(query, for_render=render)
+        if render:
+            output = await self.render_treemap(output)
+        return output
+
+    async def _render_output(self, output: DashenHeroTreemapOutput) -> DashenHeroTreemapOutput:
+        # 兼容入口：等价于 render_treemap（图标预热已由 fetch 阶段负责）。
+        return await self.render_treemap(output)
 
     async def _resolve_query(
         self,

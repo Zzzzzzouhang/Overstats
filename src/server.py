@@ -46,6 +46,7 @@ try:
     from overstats.src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
     from overstats.src.modules.dashen_team_overview import team_overview_module
     from overstats.src.modules.dashen_team_overview.render import render_overview
+    from overstats.src.modules.render_base import configure_stage_gate, get_stage_limit, run_render
     from overstats.src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
     from overstats.src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
@@ -53,12 +54,10 @@ try:
     )
     from overstats.src.modules.dashen_shiqu import (
         ShiquQuery,
-        shiqu_fetch_gate,
         shiqu_module,
     )
     from overstats.src.modules.dashen_court import (
         CourtQuery,
-        court_fetch_gate,
         court_module,
     )
     from overstats.src.db.court_llm import court_llm_recorder
@@ -128,6 +127,7 @@ except ModuleNotFoundError:
     from src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
     from src.modules.dashen_team_overview import team_overview_module
     from src.modules.dashen_team_overview.render import render_overview
+    from src.modules.render_base import configure_stage_gate, get_stage_limit, run_render
     from src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
     from src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
@@ -135,12 +135,10 @@ except ModuleNotFoundError:
     )
     from src.modules.dashen_shiqu import (
         ShiquQuery,
-        shiqu_fetch_gate,
         shiqu_module,
     )
     from src.modules.dashen_court import (
         CourtQuery,
-        court_fetch_gate,
         court_module,
     )
     from src.db.court_llm import court_llm_recorder
@@ -389,11 +387,12 @@ class DashenRequestQueue:
         self.max_concurrent_requests = max(1, int(max_concurrent_requests or 1))
         accepted_limit = self.max_concurrent_requests if max_accepted_requests is None else int(max_accepted_requests)
         self.max_accepted_requests = max(1, accepted_limit)
-        # 轻指令负载让行阈值：轻指令（除 shiqu/court 外的队列请求）pending 达到该值时
-        #（大于等于，默认 2），重指令（heavy=True）在队列槽外等待，把槽位让给轻指令，
-        # 提升高峰期轻指令响应速度。正在抓取的重指令不受影响（跑完本次抓取即暂停，
-        # 后续请求才让行）；重指令的 LLM 阶段不走本队列，始终不受让行影响。
-        # 设为 0 可完全暂停重指令抓取（应急开关）。
+        # 轻指令负载让行阈值：轻指令（所有普通队列请求）pending 达到该值时
+        #（大于等于，默认 2），标注 heavy=True 的请求在队列槽外等待，把槽位让给
+        # 轻指令，提升高峰期轻指令响应速度。正在抓取的重指令不受影响（跑完本次
+        # 抓取即暂停，后续请求才让行）。设为 0 可完全暂停 heavy 请求抓取（应急开关）。
+        # 注意：shiqu/court 已与其他指令一致（不使用 heavy），本机制目前无调用方，
+        # 作为队列能力保留，供将来确需让行的重指令使用。
         self.light_load_threshold = max(0, int(light_load_threshold))
         self._light_pending = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
@@ -444,7 +443,7 @@ class DashenRequestQueue:
         *,
         heavy: bool = False,
     ) -> _T:
-        # 重指令（shiqu/court 抓取阶段）：先在队列外向轻指令让行
+        # heavy 请求：先在队列外向轻指令让行
         if heavy:
             await self._yield_to_light_load(label)
 
@@ -536,10 +535,48 @@ class OverstatsCoreService:
         )
 
     async def handle_dashen_profile_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "profile_image",
-            lambda: self._handle_dashen_profile_image(payload),
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        season_value = payload.get("season")
+        if season_value is None:
+            season_value = payload.get("season_c")
+
+        season = None
+        if season_value not in (None, "", 0, "0", "auto", "AUTO", "Auto"):
+            try:
+                season = int(season_value)
+            except (TypeError, ValueError) as exc:
+                raise ModuleError(
+                    error="invalid_season",
+                    message="season must be an integer when provided.",
+                    status_code=400,
+                    hint='Example: {"bnet_id":"Player#12345","season":22}',
+                    details={"season": season_value},
+                ) from exc
+
+        include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
+        render_mode = _coerce_profile_render_mode(payload)
+        query = DashenProfileQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            season=season,
+            include_previous_season=include_previous_season,
         )
+
+        # 抓取阶段：占用 dashen 队列槽（含头像抓取）
+        output = await self.dashen_request_queue.run(
+            "profile_image",
+            lambda: dashen_profile_module.fetch_profile(query, for_render=True, render_mode=render_mode),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_profile_module.render_profile(output, render_mode=render_mode)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen profile image was not generated.",
+                status_code=500,
+            )
+        return image.content
 
     async def handle_blizzard_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -548,10 +585,21 @@ class OverstatsCoreService:
         )
 
     async def handle_blizzard_profile_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
+        query = _build_blizzard_profile_query(payload)
+        # 抓取阶段：占用 dashen 队列槽（含头像/英雄图标抓取）
+        output = await self.dashen_request_queue.run(
             "blizzard_profile_image",
-            lambda: self._handle_blizzard_profile_image(payload),
+            lambda: blizzard_profile_module.fetch_profile(query, for_render=True),
         )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await blizzard_profile_module.render_profile(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Blizzard profile image was not generated.",
+                status_code=500,
+            )
+        return image.content
 
     async def handle_career_compare(self, payload, *, render=False):
         from .modules.career_compare import CareerCompareQuery, career_compare_module
@@ -566,22 +614,41 @@ class OverstatsCoreService:
             xcxtoken=str(payload.get("xcxtoken") or payload.get("xcxToken") or ""),
         )
 
-        async def run():
-            result = await career_compare_module.query_compare(query, render=render)
-            return result.image.content if render else result.to_dict()
+        if not render:
+            async def run():
+                result = await career_compare_module.query_compare(query, render=False)
+                return result.to_dict()
 
-        return await self.dashen_request_queue.run("career_compare", run)
+            return await self.dashen_request_queue.run("career_compare", run)
+
+        # 抓取阶段：占用 dashen 队列槽（含图标预热）
+        output = await self.dashen_request_queue.run(
+            "career_compare",
+            lambda: career_compare_module.fetch_compare(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await career_compare_module.render_compare(output)
+        return result.image.content
 
     async def handle_dashen_hero_compare(self, payload, *, render=False):
-        async def run():
-            try:
-                season=_coerce_optional_int(payload, "season", "season_c")
-                query=DashenHeroCompareQuery(player1=str(payload.get("player1") or ""),player2=str(payload.get("player2") or ""),hero=str(payload.get("hero") or ""),mode=str(payload.get("mode") or "quick"),season=season)
-            except (ValueError,TypeError) as exc:
-                raise ModuleError(error="invalid_compare_query",message=str(exc),status_code=400) from exc
-            result=await dashen_hero_compare_module.query_compare(query,render=render)
-            return result.image.content if render else result.to_dict()
-        return await self.dashen_request_queue.run("hero_compare",run)
+        try:
+            season=_coerce_optional_int(payload, "season", "season_c")
+            query=DashenHeroCompareQuery(player1=str(payload.get("player1") or ""),player2=str(payload.get("player2") or ""),hero=str(payload.get("hero") or ""),mode=str(payload.get("mode") or "quick"),season=season)
+        except (ValueError,TypeError) as exc:
+            raise ModuleError(error="invalid_compare_query",message=str(exc),status_code=400) from exc
+        if not render:
+            async def run():
+                result=await dashen_hero_compare_module.query_compare(query,render=False)
+                return result.to_dict()
+            return await self.dashen_request_queue.run("hero_compare",run)
+        # 抓取阶段：占用 dashen 队列槽（含图标预热）
+        output = await self.dashen_request_queue.run(
+            "hero_compare",
+            lambda: dashen_hero_compare_module.fetch_compare(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_hero_compare_module.render_compare(output)
+        return result.image.content
 
     async def handle_dashen_hero_compare_image(self, payload):
         return await self.handle_dashen_hero_compare(payload,render=True)
@@ -593,10 +660,21 @@ class OverstatsCoreService:
         )
 
     async def handle_dashen_hero_treemap_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
+        query = _build_dashen_hero_treemap_query(payload)
+        # 抓取阶段：占用 dashen 队列槽（含图标预热）
+        output = await self.dashen_request_queue.run(
             "hero_treemap_image",
-            lambda: self._handle_dashen_hero_treemap_image(payload),
+            lambda: dashen_hero_treemap_module.fetch_treemap(query, for_render=True),
         )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_hero_treemap_module.render_treemap(output)
+        if not result.image:
+            raise ModuleError(
+                error="render_failed",
+                message="Hero treemap image was not generated.",
+                status_code=500,
+            )
+        return result.image.content
 
     async def _handle_dashen_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -649,61 +727,10 @@ class OverstatsCoreService:
             "leisure": bundle.leisure,
         }
 
-    async def _handle_dashen_profile_image(self, payload: Dict[str, object]) -> bytes:
-        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
-        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
-        season_value = payload.get("season")
-        if season_value is None:
-            season_value = payload.get("season_c")
-
-        season = None
-        if season_value not in (None, "", 0, "0", "auto", "AUTO", "Auto"):
-            try:
-                season = int(season_value)
-            except (TypeError, ValueError) as exc:
-                raise ModuleError(
-                    error="invalid_season",
-                    message="season must be an integer when provided.",
-                    status_code=400,
-                    hint='Example: {"bnet_id":"Player#12345","season":22}',
-                    details={"season": season_value},
-                ) from exc
-
-        include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
-        render_mode = _coerce_profile_render_mode(payload)
-
-        result = await dashen_profile_module.query_profile_image(
-            DashenProfileQuery(
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                season=season,
-                include_previous_season=include_previous_season,
-            ),
-            render_mode=render_mode,
-        )
-        if not result.image:
-            raise ModuleError(
-                error="render_failed",
-                message="Dashen profile image was not generated.",
-                status_code=500,
-            )
-        return result.image.content
-
     async def _handle_dashen_hero_treemap(self, payload: Dict[str, object]) -> Dict[str, object]:
         query = _build_dashen_hero_treemap_query(payload)
         result = await dashen_hero_treemap_module.query_treemap(query, render=False)
         return result.to_dict()
-
-    async def _handle_dashen_hero_treemap_image(self, payload: Dict[str, object]) -> bytes:
-        query = _build_dashen_hero_treemap_query(payload)
-        result = await dashen_hero_treemap_module.query_treemap(query, render=True)
-        if not result.image:
-            raise ModuleError(
-                error="render_failed",
-                message="Hero treemap image was not generated.",
-                status_code=500,
-            )
-        return result.image.content
 
     def handle_query(
         self,
@@ -836,17 +863,6 @@ class OverstatsCoreService:
             } if (result.search_results or result.resolved_entry) else None,
             "profile": result.parsed.to_dict(),
         }
-
-    async def _handle_blizzard_profile_image(self, payload: Dict[str, object]) -> bytes:
-        query = _build_blizzard_profile_query(payload)
-        result = await blizzard_profile_module.query_profile_image(query)
-        if not result.image:
-            raise ModuleError(
-                error="render_failed",
-                message="Blizzard profile image was not generated.",
-                status_code=500,
-            )
-        return result.image.content
 
     async def handle_auto_route(self, payload: Dict[str, object]) -> Dict[str, object]:
         text = str(payload.get("text") or "").strip()
@@ -1109,21 +1125,21 @@ class OverstatsCoreService:
         return result.to_dict()
 
     async def handle_dashen_rank_leaderboard_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "rank_leaderboard_image",
-            lambda: self._handle_dashen_rank_leaderboard_image(payload),
-        )
-
-    async def _handle_dashen_rank_leaderboard_image(self, payload: Dict[str, object]) -> bytes:
         query = _build_dashen_rank_leaderboard_query(payload)
-        result = await dashen_rank_leaderboard_module.query_rank_leaderboard(query, render=True)
-        if not result.image:
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
+            "rank_leaderboard_image",
+            lambda: dashen_rank_leaderboard_module.fetch_rank_leaderboard(query),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_rank_leaderboard_module.render_rank_leaderboard(output)
+        if not image:
             raise ModuleError(
                 error="render_failed",
                 message="Dashen rank leaderboard image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return image.content
 
     async def handle_dashen_hero_leaderboard(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -1137,32 +1153,26 @@ class OverstatsCoreService:
         return result.to_dict()
 
     async def handle_dashen_hero_leaderboard_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "hero_leaderboard_image",
-            lambda: self._handle_dashen_hero_leaderboard_image(payload),
-        )
-
-    async def _handle_dashen_hero_leaderboard_image(self, payload: Dict[str, object]) -> bytes:
         query = _build_dashen_hero_leaderboard_query(payload)
-        result = await dashen_hero_leaderboard_module.query_hero_leaderboard(query, render=True)
-        if not result.image:
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
+            "hero_leaderboard_image",
+            lambda: dashen_hero_leaderboard_module.fetch_hero_leaderboard(query),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_hero_leaderboard_module.render_hero_leaderboard(output)
+        if not image:
             raise ModuleError(
                 error="render_failed",
                 message="Dashen hero leaderboard image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return image.content
 
     async def handle_dashen_match(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
             "match_list",
             lambda: self._handle_dashen_match(payload),
-        )
-
-    async def handle_dashen_match_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "match_replies",
-            lambda: self._handle_dashen_match_replies(payload),
         )
 
     async def _handle_dashen_match(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -1180,7 +1190,8 @@ class OverstatsCoreService:
         include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
         render = _coerce_bool(payload.get("render"), False)
 
-        result = await dashen_match_module.query_match_list(
+        # JSON 端点只取数据（render 仅控制是否附带抓取 risk_status，不出图）
+        result = await dashen_match_module.fetch_match_list(
             DashenMatchQuery(
                 filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
@@ -1189,7 +1200,7 @@ class OverstatsCoreService:
                 include_fight=include_fight,
                 include_previous_season=include_previous_season,
             ),
-            render=render,
+            for_render=render,
         )
         resolved = result.resolved_bnet
         return {
@@ -1205,7 +1216,7 @@ class OverstatsCoreService:
             "matches": result.matches,
         }
 
-    async def _handle_dashen_match_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+    async def handle_dashen_match_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         if not bnet_id and not customer_token:
@@ -1216,16 +1227,21 @@ class OverstatsCoreService:
                 hint='Example: {"bnet_id":"Player#12345","limit":20}',
             )
 
-        result = await dashen_match_module.query_match_list_replies(
-            DashenMatchQuery(
-                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                target_count=int(payload.get("target_count") or payload.get("limit") or 20),
-                include_fight=_coerce_bool(payload.get("include_fight"), True),
-                include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
-            )
+        query = DashenMatchQuery(
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            target_count=int(payload.get("target_count") or payload.get("limit") or 20),
+            include_fight=_coerce_bool(payload.get("include_fight"), True),
+            include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
         )
+        # 抓取阶段：占用 dashen 队列槽（含 risk_status）
+        output = await self.dashen_request_queue.run(
+            "match_replies",
+            lambda: dashen_match_module.fetch_match_list(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_match_module.render_match_list_replies(output)
         return {
             "ok": True,
             "customer_token": result.customer_token,
@@ -1239,12 +1255,6 @@ class OverstatsCoreService:
         }
 
     async def handle_dashen_match_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "match_image",
-            lambda: self._handle_dashen_match_image(payload),
-        )
-
-    async def _handle_dashen_match_image(self, payload: Dict[str, object]) -> bytes:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         if not bnet_id and not customer_token:
@@ -1258,25 +1268,28 @@ class OverstatsCoreService:
         target_count = int(payload.get("target_count") or payload.get("limit") or 20)
         include_fight = _coerce_bool(payload.get("include_fight"), True)
         include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
-
-        result = await dashen_match_module.query_match_list(
-            DashenMatchQuery(
-                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                target_count=target_count,
-                include_fight=include_fight,
-                include_previous_season=include_previous_season,
-            ),
-            render=True,
+        query = DashenMatchQuery(
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            target_count=target_count,
+            include_fight=include_fight,
+            include_previous_season=include_previous_season,
         )
-        if not result.image:
+        # 抓取阶段：占用 dashen 队列槽（含 risk_status）
+        output = await self.dashen_request_queue.run(
+            "match_image",
+            lambda: dashen_match_module.fetch_match_list(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_match_module.render_match_list(output)
+        if not image:
             raise ModuleError(
                 error="render_failed",
                 message="Dashen match image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return image.content
 
     async def handle_dashen_sameplay(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -1285,16 +1298,48 @@ class OverstatsCoreService:
         )
 
     async def handle_dashen_sameplay_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
             "sameplay_replies",
-            lambda: self._handle_dashen_sameplay_replies(payload),
+            lambda: dashen_sameplay_module.fetch_sameplay_list(query),
         )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_sameplay_module.render_sameplay_list_replies(output)
+        return {
+            "ok": True,
+            "players": {
+                "resolved": {
+                    "player1": result.player1.to_dict(),
+                    "player2": result.player2.to_dict(),
+                }
+            },
+            "customer_tokens": {
+                "player1": result.player1.customer_token,
+                "player2": result.player2.customer_token,
+            },
+            "summary": dict(result.summary),
+            "replies": result.replies,
+        }
 
     async def handle_dashen_sameplay_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        # 抓取阶段：占用 dashen 队列槽
+        output = await self.dashen_request_queue.run(
             "sameplay_image",
-            lambda: self._handle_dashen_sameplay_image(payload),
+            lambda: dashen_sameplay_module.fetch_sameplay_list(query),
         )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_sameplay_module.render_sameplay_list(output)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen sameplay image was not generated.",
+                status_code=500,
+            )
+        return image.content
 
     async def handle_dashen_sameplay_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -1303,16 +1348,87 @@ class OverstatsCoreService:
         )
 
     async def handle_dashen_sameplay_detail_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "sameplay_detail_replies",
-            lambda: self._handle_dashen_sameplay_detail_replies(payload),
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        index_value = _coerce_optional_int(payload, "index", "idx")
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        if not match_id and index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index or match_id is required for sameplay detail.",
+                status_code=400,
+                hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890","index":0}',
+            )
+        show_all_heroes = _coerce_bool(
+            payload.get("show_all_heroes", payload.get("show_all", payload.get("all_heroes"))),
+            False,
         )
+        analyze = _coerce_bool(payload.get("analyze"), False)
+        if analyze:
+            show_all_heroes = True
+        # 抓取阶段：占用 dashen 队列槽（含全员详细数据）
+        fetched = await self.dashen_request_queue.run(
+            "sameplay_detail_replies",
+            lambda: dashen_sameplay_module.fetch_sameplay_detail(
+                query,
+                index=index_value,
+                match_id=match_id,
+                show_all_heroes=show_all_heroes,
+                analyze=analyze,
+                for_render=True,
+            ),
+        )
+        # 渲染/AI 阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_sameplay_module.render_sameplay_detail_replies(fetched)
+        return {
+            "ok": True,
+            "players": {
+                "resolved": {
+                    "player1": result.player1.to_dict(),
+                    "player2": result.player2.to_dict(),
+                }
+            },
+            "customer_tokens": {
+                "player1": result.player1.customer_token,
+                "player2": result.player2.customer_token,
+            },
+            "summary": dict(result.summary),
+            "match_id": result.match_id,
+            "match_kind": result.match_kind,
+            "replies": result.replies,
+        }
 
     async def handle_dashen_sameplay_detail_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
+        query = _build_dashen_sameplay_query(payload)
+        _validate_dashen_sameplay_query(query)
+        index_value = _coerce_optional_int(payload, "index", "idx")
+        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
+        if not match_id and index_value is None:
+            raise ModuleError(
+                error="missing_match_selector",
+                message="index or match_id is required for sameplay detail image.",
+                status_code=400,
+                hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890","index":0}',
+            )
+        # 抓取阶段：占用 dashen 队列槽
+        fetched = await self.dashen_request_queue.run(
             "sameplay_detail_image",
-            lambda: self._handle_dashen_sameplay_detail_image(payload),
+            lambda: dashen_sameplay_module.fetch_sameplay_detail(
+                query,
+                index=index_value,
+                match_id=match_id,
+                for_render=True,
+            ),
         )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_sameplay_module.render_sameplay_detail(fetched)
+        if not result.main_image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen sameplay detail image was not generated.",
+                status_code=500,
+            )
+        return result.main_image.content
 
     async def _handle_dashen_sameplay(self, payload: Dict[str, object]) -> Dict[str, object]:
         query = _build_dashen_sameplay_query(payload)
@@ -1333,38 +1449,6 @@ class OverstatsCoreService:
             "summary": dict(result.summary),
             "matches": result.matches,
         }
-
-    async def _handle_dashen_sameplay_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
-        query = _build_dashen_sameplay_query(payload)
-        _validate_dashen_sameplay_query(query)
-        result = await dashen_sameplay_module.query_sameplay_list_replies(query)
-        return {
-            "ok": True,
-            "players": {
-                "resolved": {
-                    "player1": result.player1.to_dict(),
-                    "player2": result.player2.to_dict(),
-                }
-            },
-            "customer_tokens": {
-                "player1": result.player1.customer_token,
-                "player2": result.player2.customer_token,
-            },
-            "summary": dict(result.summary),
-            "replies": result.replies,
-        }
-
-    async def _handle_dashen_sameplay_image(self, payload: Dict[str, object]) -> bytes:
-        query = _build_dashen_sameplay_query(payload)
-        _validate_dashen_sameplay_query(query)
-        result = await dashen_sameplay_module.query_sameplay_list(query, render=True)
-        if not result.image:
-            raise ModuleError(
-                error="render_failed",
-                message="Dashen sameplay image was not generated.",
-                status_code=500,
-            )
-        return result.image.content
 
     async def _handle_dashen_sameplay_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
         query = _build_dashen_sameplay_query(payload)
@@ -1416,86 +1500,10 @@ class OverstatsCoreService:
             "notes": list(result.notes),
         }
 
-    async def _handle_dashen_sameplay_detail_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
-        query = _build_dashen_sameplay_query(payload)
-        _validate_dashen_sameplay_query(query)
-        index_value = _coerce_optional_int(payload, "index", "idx")
-        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
-        if not match_id and index_value is None:
-            raise ModuleError(
-                error="missing_match_selector",
-                message="index or match_id is required for sameplay detail.",
-                status_code=400,
-                hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890","index":0}',
-            )
-        show_all_heroes = _coerce_bool(
-            payload.get("show_all_heroes", payload.get("show_all", payload.get("all_heroes"))),
-            False,
-        )
-        analyze = _coerce_bool(payload.get("analyze"), False)
-        if analyze:
-            show_all_heroes = True
-        result = await dashen_sameplay_module.query_sameplay_detail_replies(
-            query,
-            index=index_value,
-            match_id=match_id,
-            show_all_heroes=show_all_heroes,
-            analyze=analyze,
-        )
-        return {
-            "ok": True,
-            "players": {
-                "resolved": {
-                    "player1": result.player1.to_dict(),
-                    "player2": result.player2.to_dict(),
-                }
-            },
-            "customer_tokens": {
-                "player1": result.player1.customer_token,
-                "player2": result.player2.customer_token,
-            },
-            "summary": dict(result.summary),
-            "match_id": result.match_id,
-            "match_kind": result.match_kind,
-            "replies": result.replies,
-        }
-
-    async def _handle_dashen_sameplay_detail_image(self, payload: Dict[str, object]) -> bytes:
-        query = _build_dashen_sameplay_query(payload)
-        _validate_dashen_sameplay_query(query)
-        index_value = _coerce_optional_int(payload, "index", "idx")
-        match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
-        if not match_id and index_value is None:
-            raise ModuleError(
-                error="missing_match_selector",
-                message="index or match_id is required for sameplay detail image.",
-                status_code=400,
-                hint='Example: {"player1_bnet_id":"PlayerA#12345","player2_bnet_id":"PlayerB#67890","index":0}',
-            )
-        result = await dashen_sameplay_module.query_sameplay_detail(
-            query,
-            index=index_value,
-            match_id=match_id,
-            render=True,
-        )
-        if not result.main_image:
-            raise ModuleError(
-                error="render_failed",
-                message="Dashen sameplay detail image was not generated.",
-                status_code=500,
-            )
-        return result.main_image.content
-
     async def handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
             "match_detail",
             lambda: self._handle_dashen_match_detail(payload),
-        )
-
-    async def handle_dashen_match_detail_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            "match_detail_replies",
-            lambda: self._handle_dashen_match_detail_replies(payload),
         )
 
     async def _handle_dashen_match_detail(self, payload: Dict[str, object]) -> Dict[str, object]:
@@ -1566,7 +1574,7 @@ class OverstatsCoreService:
             "detail": result.detail.payload,
         }
 
-    async def _handle_dashen_match_detail_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+    async def handle_dashen_match_detail_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         match_id = str(payload.get("match_id") or payload.get("matchId") or "").strip()
@@ -1617,14 +1625,20 @@ class OverstatsCoreService:
         elif bnet_id:
             query = DashenMatchQuery(customer_token=customer_token, bnet_id=bnet_id)
 
-        result = await dashen_match_module.query_match_detail_replies(
-            query=query,
-            customer_token=customer_token,
-            match_id=match_id,
-            index=int(index_value) if index_value is not None else None,
-            show_all_heroes=show_all_heroes,
-            analyze=analyze,
+        # 抓取阶段：占用 dashen 队列槽（详情 + risk 补充 + 全员详细数据）
+        fetched = await self.dashen_request_queue.run(
+            "match_detail_replies",
+            lambda: dashen_match_module.fetch_match_detail_replies(
+                query=query,
+                customer_token=customer_token,
+                match_id=match_id,
+                index=int(index_value) if index_value is not None else None,
+                show_all_heroes=show_all_heroes,
+                analyze=analyze,
+            ),
         )
+        # 渲染/AI 阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_match_module.render_match_detail_replies(fetched)
         return {
             "ok": True,
             "customer_token": result.customer_token,
@@ -1640,12 +1654,6 @@ class OverstatsCoreService:
         }
 
     async def handle_dashen_match_detail_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "match_detail_image",
-            lambda: self._handle_dashen_match_detail_image(payload),
-        )
-
-    async def _handle_dashen_match_detail_image(self, payload: Dict[str, object]) -> bytes:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         index_value = payload.get("index")
@@ -1669,31 +1677,71 @@ class OverstatsCoreService:
         target_count = int(payload.get("target_count") or payload.get("limit") or 20)
         include_fight = _coerce_bool(payload.get("include_fight"), True)
         include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
-        result = await dashen_match_module.query_match_detail_by_index(
-            DashenMatchQuery(
-                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                target_count=target_count,
-                include_fight=include_fight,
-                include_previous_season=include_previous_season,
-            ),
-            int(index_value),
-            render=True,
+        query = DashenMatchQuery(
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            target_count=target_count,
+            include_fight=include_fight,
+            include_previous_season=include_previous_season,
         )
-        if not result.image:
+        # 抓取阶段：占用 dashen 队列槽（详情 + risk 补充）
+        output = await self.dashen_request_queue.run(
+            "match_detail_image",
+            lambda: dashen_match_module.fetch_match_detail_by_index(query, int(index_value), for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_match_module.render_match_detail(output)
+        if not image:
             raise ModuleError(
                 error="render_failed",
                 message="Dashen match detail image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return image.content
 
     async def handle_dashen_summary(self, payload: Dict[str, object], *, scope: str = "today") -> Dict[str, object]:
-        return await self.dashen_request_queue.run(
-            f"summary_{scope}",
-            lambda: self._handle_dashen_summary(payload, scope=scope),
+        if scope == "season":
+            return await self.dashen_request_queue.run(
+                "summary_season",
+                lambda: self._handle_dashen_summary(payload, scope=scope),
+            )
+        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
+        full_id = str(payload.get("full_id") or payload.get("fullId") or "").strip()
+        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
+        query = DashenSummaryQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            full_id=full_id,
+            scope=scope,
         )
+        # 抓取阶段：占用 dashen 队列槽（对局数据 + 详情 + 奖项 + stats）
+        fetched = await self.dashen_request_queue.run(
+            f"summary_{scope}",
+            lambda: dashen_summary_module.fetch_summary(query),
+        )
+        # 渲染阶段：槽外执行（JSON 端点仍产出完整 timings，行为与改造前一致）
+        result = await dashen_summary_module.render_summary(fetched)
+        resolved = result.resolved_bnet
+        return {
+            "ok": True,
+            "scope": result.scope,
+            "title": result.title,
+            "customer_token": result.customer_token,
+            "resolved": {
+                "query": resolved.query if resolved else (bnet_id or full_id),
+                "full_id": result.full_id,
+                "bnet_id": result.bnet_id,
+                "has_customer_token": bool(result.customer_token),
+            },
+            "summary": {
+                "worker_url": result.worker_url,
+                "match_count": result.match_count,
+                "all_match_count": result.all_match_count,
+                "payload_kb": result.payload_kb,
+                "timings": result.timings,
+            },
+        }
 
     async def _handle_dashen_summary(self, payload: Dict[str, object], *, scope: str = "today") -> Dict[str, object]:
         if scope == "season":
@@ -1732,26 +1780,34 @@ class OverstatsCoreService:
         }
 
     async def handle_dashen_summary_image(self, payload: Dict[str, object], *, scope: str = "today") -> tuple[bytes, str]:
-        return await self.dashen_request_queue.run(
-            f"summary_{scope}_image",
-            lambda: self._handle_dashen_summary_image(payload, scope=scope),
-        )
-
-    async def _handle_dashen_summary_image(self, payload: Dict[str, object], *, scope: str = "today") -> tuple[bytes, str]:
         if scope == "season":
-            from .modules.dashen_summary.season_report import query_season_report
-            return await query_season_report(payload, render=True)
+            from .modules.dashen_summary.season_report import fetch_report, render_report
+            from .modules.dashen_summary.engine import SUMMARY_SEMAPHORE
+            role_id = str(payload.get("roleId") or payload.get("role_id") or "").strip()
+            # 抓取阶段：占用 dashen 队列槽
+            report = await self.dashen_request_queue.run(
+                "summary_season_image",
+                lambda: fetch_report(payload.get("token"), role_id, payload.get("season")),
+            )
+            # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+            async with SUMMARY_SEMAPHORE:
+                return await render_report(report, role_id)
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         full_id = str(payload.get("full_id") or payload.get("fullId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
-        result = await dashen_summary_module.query_summary(
-            DashenSummaryQuery(
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                full_id=full_id,
-                scope=scope,
-            )
+        query = DashenSummaryQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            full_id=full_id,
+            scope=scope,
         )
+        # 抓取阶段：占用 dashen 队列槽（对局数据 + 详情 + 奖项 + stats）
+        fetched = await self.dashen_request_queue.run(
+            f"summary_{scope}_image",
+            lambda: dashen_summary_module.fetch_summary(query),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        result = await dashen_summary_module.render_summary(fetched)
         # render_ms comes from worker-reported RENDER_DONE.delta_ms (worker-side render phase only).
         # Note: summary's upstream_ms already includes worker render round-trip (render_summary is an HTTP call).
         #   - upstream_ms ~ upstream API calls + worker render round-trip (network + queue + render)
@@ -1770,9 +1826,11 @@ class OverstatsCoreService:
             "team_overview", lambda: team_overview_module.query(payload.get("base64")))
 
     async def handle_dashen_team_overview_image(self, payload: Dict[str, object]) -> bytes:
+        # 抓取阶段：占用 dashen 队列槽
         result = await self.dashen_request_queue.run(
             "team_overview_image", lambda: team_overview_module.query(payload.get("base64"), include_avatars=True))
-        return await asyncio.to_thread(render_overview, result)
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        return await run_render(render_overview, result)
 
     async def handle_dashen_rank_history(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -1835,12 +1893,6 @@ class OverstatsCoreService:
         }
 
     async def handle_dashen_rank_history_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "rank_history_image",
-            lambda: self._handle_dashen_rank_history_image(payload),
-        )
-
-    async def _handle_dashen_rank_history_image(self, payload: Dict[str, object]) -> bytes:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         if not bnet_id and not customer_token:
@@ -1851,22 +1903,26 @@ class OverstatsCoreService:
                 hint='Example: {"bnet_id":"Player#12345"}',
             )
 
-        result = await dashen_rank_history_module.query_rank_history(
-            DashenRankHistoryQuery(
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                start_season=_coerce_optional_int(payload, "start_season", "startSeason"),
-                end_season=_coerce_optional_int(payload, "end_season", "endSeason"),
-            ),
-            render=True,
+        query = DashenRankHistoryQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            start_season=_coerce_optional_int(payload, "start_season", "startSeason"),
+            end_season=_coerce_optional_int(payload, "end_season", "endSeason"),
         )
-        if not result.image:
+        # 抓取阶段：占用 dashen 队列槽（含横幅/资料卡抓取）
+        output = await self.dashen_request_queue.run(
+            "rank_history_image",
+            lambda: dashen_rank_history_module.fetch_rank_history(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_rank_history_module.render_rank_history(output)
+        if not image:
             raise ModuleError(
                 error="render_failed",
                 message="Dashen rank history image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return image.content
 
     async def handle_dashen_quick_strength(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -1917,12 +1973,6 @@ class OverstatsCoreService:
         }
 
     async def handle_dashen_quick_strength_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "quick_strength_image",
-            lambda: self._handle_dashen_quick_strength_image(payload),
-        )
-
-    async def _handle_dashen_quick_strength_image(self, payload: Dict[str, object]) -> bytes:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         limit = _coerce_optional_int(payload, "limit") or 12
@@ -1934,22 +1984,26 @@ class OverstatsCoreService:
                 hint='Example: {"bnet_id":"Player#12345"}',
             )
 
-        result = await dashen_quick_strength_module.query_quick_strength(
-            DashenQuickStrengthQuery(
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                limit=limit,
-                include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
-            ),
-            render=True,
+        query = DashenQuickStrengthQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            limit=limit,
+            include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
         )
-        if not result.image:
+        # 抓取阶段：占用 dashen 队列槽（含头像/risk 抓取）
+        output = await self.dashen_request_queue.run(
+            "quick_strength_image",
+            lambda: dashen_quick_strength_module.fetch_quick_strength(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_quick_strength_module.render_quick_strength(output)
+        if not image:
             raise ModuleError(
                 error="render_failed",
                 message="Dashen quick strength image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return image.content
 
     async def handle_dashen_competitive_strength(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -2000,12 +2054,6 @@ class OverstatsCoreService:
         }
 
     async def handle_dashen_competitive_strength_image(self, payload: Dict[str, object]) -> bytes:
-        return await self.dashen_request_queue.run(
-            "competitive_strength_image",
-            lambda: self._handle_dashen_competitive_strength_image(payload),
-        )
-
-    async def _handle_dashen_competitive_strength_image(self, payload: Dict[str, object]) -> bytes:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
         limit = _coerce_optional_int(payload, "limit") or 12
@@ -2017,28 +2065,31 @@ class OverstatsCoreService:
                 hint='Example: {"bnet_id":"Player#12345"}',
             )
 
-        result = await dashen_competitive_strength_module.query_competitive_strength(
-            DashenCompetitiveStrengthQuery(
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                limit=limit,
-                include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
-            ),
-            render=True,
+        query = DashenCompetitiveStrengthQuery(
+            customer_token=customer_token,
+            bnet_id=bnet_id,
+            limit=limit,
+            include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
         )
-        if not result.image:
+        # 抓取阶段：占用 dashen 队列槽（含头像/risk 抓取）
+        output = await self.dashen_request_queue.run(
+            "competitive_strength_image",
+            lambda: dashen_competitive_strength_module.fetch_competitive_strength(query, for_render=True),
+        )
+        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        image = await dashen_competitive_strength_module.render_competitive_strength(output)
+        if not image:
             raise ModuleError(
                 error="render_failed",
                 message="Dashen competitive strength image was not generated.",
                 status_code=500,
             )
-        return result.image.content
+        return image.content
 
     async def handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
         # 注意：不再整体包进 dashen_request_queue —— 仅抓取阶段占用队列槽
         # （见 _handle_shiqu），LLM 阶段在槽外执行，可多请求并行发送。
         return await self._handle_shiqu(payload)
-
     async def _handle_shiqu(self, payload: Dict[str, object]) -> Dict[str, object]:
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
@@ -2061,14 +2112,12 @@ class OverstatsCoreService:
             # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
             result = await shiqu_module.analyze_from_db(query)
         else:
-            # 抓取阶段：先在队列外等抓取轮次闸（最多 1 个并发，等待时不占槽），
-            # 再占用 1 个 dashen 队列槽执行抓取；LLM 阶段在槽外执行。
-            async with shiqu_fetch_gate():
-                prepared = await self.dashen_request_queue.run(
-                    "shiqu_fetch",
-                    lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
-                    heavy=True,
-                )
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致，可占满全部槽位）；
+            # LLM 阶段在槽外执行，等待返回与渲染共用 stage 闸门。
+            prepared = await self.dashen_request_queue.run(
+                "shiqu_fetch",
+                lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
             result = await shiqu_module.generate_verdict(prepared)
         result["ok"] = True
         return result
@@ -2102,12 +2151,11 @@ class OverstatsCoreService:
             # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
             result = await shiqu_module.analyze_from_db(query)
         else:
-            async with shiqu_fetch_gate():
-                prepared = await self.dashen_request_queue.run(
-                    "shiqu_fetch",
-                    lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
-                    heavy=True,
-                )
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致）；LLM 阶段在槽外执行。
+            prepared = await self.dashen_request_queue.run(
+                "shiqu_fetch",
+                lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
             result = await shiqu_module.generate_verdict(prepared)
         try:
             from overstats.src.modules.dashen_shiqu.render import render_shiqu_image
@@ -2154,15 +2202,12 @@ class OverstatsCoreService:
             # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
             result = await court_module.analyze_from_db(query)
         else:
-            # 抓取阶段：先在队列外等抓取轮次闸（最多 1 个并发，等待时不占槽），
-            # 再以 heavy=True 占用 1 个 dashen 队列槽执行抓取（轻指令高峰期间让行）；
-            # LLM 阶段在槽外执行，不受让行影响。
-            async with court_fetch_gate():
-                prepared = await self.dashen_request_queue.run(
-                    "court_fetch",
-                    lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
-                    heavy=True,
-                )
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致，可占满全部槽位）；
+            # LLM 阶段在槽外执行，等待返回与渲染共用 stage 闸门。
+            prepared = await self.dashen_request_queue.run(
+                "court_fetch",
+                lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
             result = await court_module.generate_verdict(prepared)
         result["ok"] = True
         return result
@@ -2196,12 +2241,11 @@ class OverstatsCoreService:
             # use_db 模式：不占用 dashen 并发槽位，直接 DB 读取
             result = await court_module.analyze_from_db(query)
         else:
-            async with court_fetch_gate():
-                prepared = await self.dashen_request_queue.run(
-                    "court_fetch",
-                    lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
-                    heavy=True,
-                )
+            # 抓取阶段：占用 dashen 队列槽（与其他指令一致）；LLM 阶段在槽外执行。
+            prepared = await self.dashen_request_queue.run(
+                "court_fetch",
+                lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
+            )
             result = await court_module.generate_verdict(prepared)
         try:
             from overstats.src.modules.dashen_court.render import render_court_image
@@ -2311,6 +2355,13 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         f"light_load_threshold={config.dashen_light_load_threshold}"
     )
     print(f"[overstats] database writes enabled={config.enable_database_write}")
+    # 二段闸门：抓取受 dashen_request_queue 槽位控制；渲染与等单局 AI 的容量
+    # = 抓取槽位 × 3（可用 OVERSTATS_STAGE_CONCURRENCY / OVERSTATS_STAGE_MULTIPLIER 调整）。
+    configure_stage_gate(config.dashen_max_concurrent_requests)
+    print(
+        "[overstats] stage gate (render/ai) limit="
+        f"{get_stage_limit()} fetch_slots={config.dashen_max_concurrent_requests}"
+    )
     async_runner = AsyncRunner()
     request_metrics_recorder = RequestMetricsRecorder() if config.enable_database_write else None
     if request_metrics_recorder is not None:

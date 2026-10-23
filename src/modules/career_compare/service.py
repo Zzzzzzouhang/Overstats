@@ -101,7 +101,8 @@ class CareerCompareModule:
                 notes.append("详细统计暂不可用，仅显示已返回的生涯统计。")
         return {"player": identity, "heroes_raw": heroes, "notes": notes}
 
-    async def query_compare(self, query: CareerCompareQuery, *, render=False):
+    async def fetch_compare(self, query: CareerCompareQuery, *, for_render: bool = False):
+        """抓取阶段：双方生涯数据（+ 渲染所需图标）。只含上游请求。"""
         token = validate_xcxtoken(query.xcxtoken)
         if not str(query.player1).strip():
             raise ModuleError(error="missing_players", message="生涯对比需要至少一名玩家。", status_code=400)
@@ -118,7 +119,7 @@ class CareerCompareModule:
             for side in sides:
                 if isinstance(side, BaseException):
                     raise side
-            icons = await self.adapter._icons(client) if render else {}
+            icons = await self.adapter._icons(client) if for_render else {}
         benchmark = not query.player2.strip()
         if benchmark:
             sides.append({"player": {"display_name": "全服 Top 20%", "benchmark": "top20"},
@@ -156,16 +157,25 @@ class CareerCompareModule:
                 "selection": "specified_hero" if query.hero.strip() else "combined_top3",
                 "players": [s["player"] for s in sides], "sections": sections,
                 "notes": list(dict.fromkeys(note for s in sides for note in s["notes"]))}
-        image = None
-        if render:
+        if for_render:
             # Use the existing public-image cache, never attach xcxtoken to asset downloads.
             from ..dashen_hero_treemap.service import _prefetch_hero_icons
             from types import SimpleNamespace
             await _prefetch_hero_icons([SimpleNamespace(icon_url=h["icon_url"], recent_perks=()) for section in sections
                                        for h in section["players"] if h and h["icon_url"]])
-            from .render import render_career_compare
-            image = await run_render(render_career_compare, data)
-        return CareerCompareOutput(data, image)
+        return CareerCompareOutput(data, None)
+
+    async def render_compare(self, output: CareerCompareOutput):
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        from .render import render_career_compare
+        image = await run_render(render_career_compare, output.data)
+        return CareerCompareOutput(output.data, image)
+
+    async def query_compare(self, query: CareerCompareQuery, *, render=False):
+        output = await self.fetch_compare(query, for_render=render)
+        if render:
+            output = await self.render_compare(output)
+        return output
 
 
 career_compare_module = CareerCompareModule()

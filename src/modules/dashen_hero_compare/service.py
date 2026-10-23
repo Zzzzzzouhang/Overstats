@@ -32,7 +32,8 @@ class DashenHeroCompareModule:
         self.client=self.resolver.requests.api_client
         self.config_loader=config_loader or load_query_tool
 
-    async def query_compare(self, query, *, render=False):
+    async def fetch_compare(self, query, *, for_render: bool = False):
+        """抓取阶段：双方英雄对比数据（+ 渲染所需图标）。只含上游请求。"""
         try:
             mode=normalize_treemap_mode(query.mode)
         except ValueError as exc:
@@ -88,11 +89,20 @@ class DashenHeroCompareModule:
         sides=await asyncio.gather(player(query.player1),player(query.player2))
         data=dict(ok=True,mode=mode,hero=selected.get("name") if selected else None,selection="specified_hero" if selected else "top3",start_season=start,players=[s[0] for s in sides])
         await attach_references(data)
-        image=None
-        if render:
+        if for_render:
             await _prefetch_hero_icons([h for _,heroes in sides for h in heroes])
-            from .render import render_compare
-            image=await run_render(render_compare,data)
-        return CompareOutput(data,image)
+        return CompareOutput(data,None)
+
+    async def render_compare(self, output: CompareOutput):
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        from .render import render_compare
+        image=await run_render(render_compare,output.data)
+        return CompareOutput(output.data,image)
+
+    async def query_compare(self, query, *, render=False):
+        output=await self.fetch_compare(query,for_render=render)
+        if render:
+            output=await self.render_compare(output)
+        return output
 
 dashen_hero_compare_module=DashenHeroCompareModule()

@@ -114,12 +114,11 @@ class DashenHeroLeaderboardModule:
         self.requests = requests or DashenHeroLeaderboardRequests()
         self.config_loader = config_loader or load_query_tool
 
-    async def query_hero_leaderboard(
+    async def fetch_hero_leaderboard(
         self,
         query: DashenHeroLeaderboardQuery,
-        *,
-        render: bool = False,
     ) -> DashenHeroLeaderboardOutput:
+        """抓取阶段：英雄榜数据。只含上游请求。"""
         resolved_query = self._normalize_query(query)
         config = self._load_ow_config()
         hero_lookup = self._build_hero_lookup(config)
@@ -176,7 +175,7 @@ class DashenHeroLeaderboardModule:
             ),
         )
         groups = self._group_entries(entries)
-        output = DashenHeroLeaderboardOutput(
+        return DashenHeroLeaderboardOutput(
             province=resolved_query.province,
             mode=resolved_query.mode,
             mode_label=MODE_LABELS[resolved_query.mode],
@@ -184,10 +183,10 @@ class DashenHeroLeaderboardModule:
             entry_count=len(entries),
             groups=groups,
         )
-        if not render:
-            return output
 
-        image = await run_render(
+    async def render_hero_leaderboard(self, output: DashenHeroLeaderboardOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        return await run_render(
             render_hero_leaderboard,
             province=output.province,
             hero=output.hero.to_dict(),
@@ -195,6 +194,18 @@ class DashenHeroLeaderboardModule:
             entry_count=output.entry_count,
             groups=[item.to_dict() for item in output.groups],
         )
+
+    async def query_hero_leaderboard(
+        self,
+        query: DashenHeroLeaderboardQuery,
+        *,
+        render: bool = False,
+    ) -> DashenHeroLeaderboardOutput:
+        output = await self.fetch_hero_leaderboard(query)
+        if not render:
+            return output
+
+        image = await self.render_hero_leaderboard(output)
         return DashenHeroLeaderboardOutput(
             province=output.province,
             mode=output.mode,

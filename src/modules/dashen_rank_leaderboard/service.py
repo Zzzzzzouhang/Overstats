@@ -96,12 +96,11 @@ class DashenRankLeaderboardModule:
     def __init__(self, requests: Optional[DashenRankLeaderboardRequests] = None) -> None:
         self.requests = requests or DashenRankLeaderboardRequests()
 
-    async def query_rank_leaderboard(
+    async def fetch_rank_leaderboard(
         self,
         query: DashenRankLeaderboardQuery,
-        *,
-        render: bool = False,
     ) -> DashenRankLeaderboardOutput:
+        """抓取阶段：省榜数据。只含上游请求。"""
         resolved_query = self._normalize_query(query)
         try:
             data = await self.requests.query_province_rank(resolved_query.province, resolved_query.role)
@@ -141,23 +140,35 @@ class DashenRankLeaderboardModule:
             ),
         )
         groups = self._group_entries(entries)
-        output = DashenRankLeaderboardOutput(
+        return DashenRankLeaderboardOutput(
             province=resolved_query.province,
             role=resolved_query.role,
             role_label=ROLE_LABELS[resolved_query.role],
             entry_count=len(entries),
             groups=groups,
         )
-        if not render:
-            return output
 
-        image = await run_render(
+    async def render_rank_leaderboard(self, output: DashenRankLeaderboardOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        return await run_render(
             render_rank_leaderboard,
             province=output.province,
             role_label=output.role_label,
             entry_count=output.entry_count,
             groups=[item.to_dict() for item in output.groups],
         )
+
+    async def query_rank_leaderboard(
+        self,
+        query: DashenRankLeaderboardQuery,
+        *,
+        render: bool = False,
+    ) -> DashenRankLeaderboardOutput:
+        output = await self.fetch_rank_leaderboard(query)
+        if not render:
+            return output
+
+        image = await self.render_rank_leaderboard(output)
         return DashenRankLeaderboardOutput(
             province=output.province,
             role=output.role,

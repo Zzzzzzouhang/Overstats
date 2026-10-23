@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -572,11 +571,12 @@ async def _call_llm(prompt: str) -> Optional[str]:
         },
     }
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
-    from ..analysis_common import build_async_client, get_analysis_proxy, LLM_SEMAPHORE
+    from ..analysis_common import build_async_client, get_analysis_proxy
+    from ..render_base import stage_slot
 
     proxy = get_analysis_proxy(cfg.base_url)
-    await LLM_SEMAPHORE.acquire()
-    try:
+    # 等 LLM 返回与渲染共用同一闸门（容量 = 抓取槽位 × 3），不占用抓取槽位。
+    async with stage_slot():
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
             try:
                 if cfg.stream:
@@ -619,41 +619,14 @@ async def _call_llm(prompt: str) -> Optional[str]:
             except Exception as e:
                 logger.error(f"[court] LLM 调用异常: {e}", exc_info=True)
                 return None
-    finally:
-        LLM_SEMAPHORE.release()
 
 
 # ── 主流程 ──
 
 # ── 抓取阶段轮次闸 ──
-# 与 shiqu 一致：跨请求共享，保证任意时刻最多 1 个 court 请求处于抓取阶段，
-# 从而最多占用 1 个 dashen_request_queue 槽位；LLM 阶段不占队列槽，可并行发送。
-COURT_FETCH_PHASE_CONCURRENCY = int(
-    os.getenv("OVERSTATS_COURT_FETCH_PHASE_CONCURRENCY", "1")
-)
-# 注意：全局变量用大写、函数用小写，避免 def 重新绑定把变量 shadow 成函数对象。
-_COURT_FETCH_PHASE_SEMAPHORE: Optional[asyncio.Semaphore] = None
-
-
-def _court_fetch_phase_semaphore() -> asyncio.Semaphore:
-    """懒加载抓取轮次信号量，绑定到运行中的事件循环，避免启动期创建。"""
-    global _COURT_FETCH_PHASE_SEMAPHORE
-    if _COURT_FETCH_PHASE_SEMAPHORE is None:
-        _COURT_FETCH_PHASE_SEMAPHORE = asyncio.Semaphore(
-            max(1, COURT_FETCH_PHASE_CONCURRENCY)
-        )
-    return _COURT_FETCH_PHASE_SEMAPHORE
-
-
-@asynccontextmanager
-async def court_fetch_gate():
-    """抓取阶段轮次闸（在 dashen_request_queue 之外获取，等待时不占队列槽）。"""
-    sem = _court_fetch_phase_semaphore()
-    await sem.acquire()
-    try:
-        yield
-    finally:
-        sem.release()
+# （已废弃）历史版本曾用跨请求信号量把 court 抓取压到 1 个并发、只占 1 个
+# dashen_request_queue 槽位。现与其他指令一致：抓取直接进队列槽（可占满
+# 全部槽位），LLM 阶段在槽外执行并受渲染/AI 闸门约束。
 
 
 @dataclass
@@ -705,9 +678,9 @@ class CourtModule:
         """抓取阶段（会实际请求大神上游，必须置于 dashen_request_queue 之内）：
         解析目标 → 拉取单局详情 → 补齐队友英雄 → 构建 Prompt。
 
-        调用方约定：先在 dashen_request_queue **之外**进入 court_fetch_gate()
-        （抓取轮次闸，等待时不占队列槽），再在队列槽内以 heavy=True 调用本方法
-        （轻指令高峰期间让行）。use_db 模式不走本方法（直接用 analyze_from_db）。
+        调用方约定：在 dashen_request_queue 队列槽内调用本方法执行抓取
+        （与其他指令一致，可占满全部抓取槽位）。
+        use_db 模式不走本方法（直接用 analyze_from_db）。
 
         Args:
             query: CourtQuery（bnet_id / customer_token / index；use_db 必须为 False）
@@ -812,9 +785,9 @@ class CourtModule:
         """LLM 阶段（不占用 dashen_request_queue 槽位）：
         调用独立 LLM → 校验 JSON → 落库 → 返回判决书结构。
 
-        与抓取阶段分离后，多个请求可同时处于本阶段并行发送，
-        并发上限见 analysis_common.LLM_SEMAPHORE（默认 4，可用
-        OVERSTATS_LLM_MAX_CONCURRENT 调整）。
+        与抓取阶段分离后，多个请求可同时处于本阶段并行发送；
+        等待 LLM 返回与渲染共用 render_base.stage_slot 闸门
+        （容量 = 抓取槽位 × 3，可用 OVERSTATS_STAGE_MULTIPLIER 调整）。
         """
         query = prepared.query
         full_id = prepared.full_id
@@ -890,13 +863,11 @@ class CourtModule:
         """一步到位入口（抓取 + LLM 连续执行）：供直接调用与测试使用。
 
         注意：HTTP 处理器不要用本方法——LLM 等待会一起关在
-        dashen_request_queue 槽位里。请改用拆分形式：
-            async with court_fetch_gate():
-                prepared = await queue.run(
-                    "court_fetch",
-                    lambda: court_module.collect_data(query, db=db),
-                    heavy=True,
-                )
+        dashen_request_queue 槽位里。请改用拆分形式（与其他指令一致）：
+            prepared = await queue.run(
+                "court_fetch",
+                lambda: court_module.collect_data(query, db=db),
+            )
             result = await court_module.generate_verdict(prepared)
         """
         if not query.bnet_id and not query.customer_token:

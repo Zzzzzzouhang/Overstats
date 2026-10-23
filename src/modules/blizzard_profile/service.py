@@ -65,6 +65,7 @@ class BlizzardProfileOutput:
     resolved_entry: Optional[BlizzardPlayerSearchEntry] = None
     search_results: tuple[BlizzardPlayerSearchEntry, ...] = ()
     image: Optional[RenderedImage] = None
+    avatar_bytes: Optional[bytes] = None
 
     @property
     def battletag(self) -> str:
@@ -86,12 +87,13 @@ class BlizzardProfileModule:
         self.api_client = api_client or dashen_api_client
         self.search_module = search_module or blizzard_player_search_module
 
-    async def query_profile(
+    async def fetch_profile(
         self,
         query: BlizzardProfileQuery,
         *,
-        render: bool = False,
+        for_render: bool = False,
     ) -> BlizzardProfileOutput:
+        """抓取阶段：解析 + 职业页面（+ 渲染所需头像/英雄图标）。只含上游请求。"""
         normalized_query = self._normalize_query(query)
         resolved_entry, search_results, fetch_target = await self._resolve_target(normalized_query)
         html, final_url, status_code = await self.api_client.fetch_blizzard_career_page(
@@ -144,22 +146,10 @@ class BlizzardProfileModule:
 
         resolved_blizzard_id = self._extract_blizzard_id(final_url) or normalized_query.blizzard_id or fetch_target
         resolved_player_id = normalized_query.player_id or parsed.summary.display_name
-        image = None
-        if render:
+        avatar_bytes = None
+        if for_render:
             await self._warm_hero_icon_cache(parsed)
             avatar_bytes = await self._try_fetch_avatar_bytes(parsed)
-            try:
-                context = build_blizzard_render_context(parsed, resolved_player_label=resolved_player_id)
-                context = replace(context, avatar_bytes=avatar_bytes)
-                image = await run_render(render_profile_summary, context)
-            except RuntimeError as exc:
-                raise ModuleError(
-                    error="render_dependency_missing",
-                    message=str(exc),
-                    status_code=500,
-                    hint="Install Pillow in the runtime environment to enable image rendering.",
-                ) from exc
-
         return BlizzardProfileOutput(
             query=normalized_query,
             resolved_player_id=resolved_player_id,
@@ -168,8 +158,33 @@ class BlizzardProfileModule:
             parsed=parsed,
             resolved_entry=resolved_entry,
             search_results=search_results,
-            image=image,
+            avatar_bytes=avatar_bytes,
         )
+
+    async def render_profile(self, output: BlizzardProfileOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        try:
+            context = build_blizzard_render_context(output.parsed, resolved_player_label=output.resolved_player_id)
+            context = replace(context, avatar_bytes=output.avatar_bytes)
+            return await run_render(render_profile_summary, context)
+        except RuntimeError as exc:
+            raise ModuleError(
+                error="render_dependency_missing",
+                message=str(exc),
+                status_code=500,
+                hint="Install Pillow in the runtime environment to enable image rendering.",
+            ) from exc
+
+    async def query_profile(
+        self,
+        query: BlizzardProfileQuery,
+        *,
+        render: bool = False,
+    ) -> BlizzardProfileOutput:
+        output = await self.fetch_profile(query, for_render=render)
+        if render:
+            output = replace(output, image=await self.render_profile(output))
+        return output
 
     async def query_profile_image(self, query: BlizzardProfileQuery) -> BlizzardProfileOutput:
         return await self.query_profile(query, render=True)

@@ -1,19 +1,9 @@
+"""Shared helpers for LLM (analysis) endpoint calls."""
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
-import asyncio
 import httpx
-
-# 跨模块共享的 LLM 并发信号量：shiqu 与 court 共用这些槽位，
-# 使对外部 LLM 端点的同时调用总数受单一上限约束（默认 4，可用
-# OVERSTATS_LLM_MAX_CONCURRENT 调整）。shiqu 的 LLM 阶段不占用
-# dashen_request_queue 槽位，多个请求可同时进入该阶段并行发送，
-# 因此该上限即"往 LLM 同时发送"的最大并发。
-LLM_SEMAPHORE = asyncio.Semaphore(
-    max(1, int(os.getenv("OVERSTATS_LLM_MAX_CONCURRENT", "4") or 4))
-)
 
 try:
     from overstats.config import config as app_config

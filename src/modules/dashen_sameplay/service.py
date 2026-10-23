@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 try:
@@ -191,6 +191,7 @@ class DashenSameplayListOutput:
     matches: List[Dict[str, Any]]
     all_matches: List[Dict[str, Any]]
     image: Optional[RenderedImage] = None
+    scan_complete: bool = False
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,11 @@ class DashenSameplayDetailOutput:
     waterfall_image: Optional[RenderedImage] = None
     analysis_image: Optional[RenderedImage] = None
     notes: List[str] = field(default_factory=list)
+    detail_root: Dict[str, Any] = field(default_factory=dict)
+    all_player_details: List[Dict[str, Any]] = field(default_factory=list)
+    target_id: str = ""
+    show_all_heroes: bool = False
+    analyze: bool = False
 
 
 @dataclass(frozen=True)
@@ -258,7 +264,8 @@ class DashenSameplayModule:
         self.requests = requests or DashenMatchRequests()
         self.match_module = dashen_match_module
 
-    async def query_sameplay_list(self, query: DashenSameplayQuery, *, render: bool = True) -> DashenSameplayListOutput:
+    async def fetch_sameplay_list(self, query: DashenSameplayQuery) -> DashenSameplayListOutput:
+        """抓取阶段：解析双方玩家 + 同玩对局列表。只含上游请求。"""
         player1, player2 = await self._resolve_players(query)
         visible_limit = self._clamp_limit(query.limit)
         common_output = await self._list_common_matches(
@@ -270,59 +277,72 @@ class DashenSameplayModule:
         visible_matches = list(common_output["matches"])[:visible_limit]
         summary = dict(common_output["summary"])
         summary["returned_count"] = len(visible_matches)
-        image = None
-        if render:
-            render_kwargs: Dict[str, Any] = {
-                "title": f"{player1.display_name} & {player2.display_name} 同玩对局",
-                "footer_lines": [self._build_list_footer(summary, scan_complete=bool(common_output.get("scan_complete")))],
-                "hint_text": "回复此图片并 @机器人 发送 1 / 1* / 1**，可按序号查看同玩对局详情",
-            }
-            if player1.risk_status is not None or player2.risk_status is not None:
-                render_kwargs["title_risk_statuses"] = [
-                    (player1.display_name, player1.risk_status),
-                    (player2.display_name, player2.risk_status),
-                ]
-            image = await run_render(render_match_list, visible_matches, **render_kwargs)
         return DashenSameplayListOutput(
             player1=player1,
             player2=player2,
             summary=summary,
             matches=visible_matches,
             all_matches=list(common_output["matches"]),
-            image=image,
+            scan_complete=bool(common_output.get("scan_complete")),
         )
 
-    async def query_sameplay_list_replies(self, query: DashenSameplayQuery) -> DashenSameplayRepliesOutput:
-        result = await self.query_sameplay_list(query, render=True)
+    async def render_sameplay_list(self, output: DashenSameplayListOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        player1, player2 = output.player1, output.player2
+        render_kwargs: Dict[str, Any] = {
+            "title": f"{player1.display_name} & {player2.display_name} 同玩对局",
+            "footer_lines": [self._build_list_footer(output.summary, scan_complete=output.scan_complete)],
+            "hint_text": "回复此图片并 @机器人 发送 1 / 1* / 1**，可按序号查看同玩对局详情",
+        }
+        if player1.risk_status is not None or player2.risk_status is not None:
+            render_kwargs["title_risk_statuses"] = [
+                (player1.display_name, player1.risk_status),
+                (player2.display_name, player2.risk_status),
+            ]
+        return await run_render(render_match_list, output.matches, **render_kwargs)
+
+    async def query_sameplay_list(self, query: DashenSameplayQuery, *, render: bool = True) -> DashenSameplayListOutput:
+        output = await self.fetch_sameplay_list(query)
+        if render:
+            output = replace(output, image=await self.render_sameplay_list(output))
+        return output
+
+    async def render_sameplay_list_replies(self, output: DashenSameplayListOutput) -> DashenSameplayRepliesOutput:
+        """渲染阶段：由抓取产物生成同玩列表图并组装 replies（槽外执行）。"""
+        image = await self.render_sameplay_list(output)
         replies = [
             _meta_reply(
                 "ds_sameplay_list",
                 {
                     "context_type": "ds_sameplay_list",
                     "players": {
-                        "player1": result.player1.to_dict(),
-                        "player2": result.player2.to_dict(),
+                        "player1": output.player1.to_dict(),
+                        "player2": output.player2.to_dict(),
                     },
                     "customer_tokens": {
-                        "player1": result.player1.customer_token,
-                        "player2": result.player2.customer_token,
+                        "player1": output.player1.customer_token,
+                        "player2": output.player2.customer_token,
                     },
-                    "summary": dict(result.summary),
-                    "match_entries": list(result.matches),
+                    "summary": dict(output.summary),
+                    "match_entries": list(output.matches),
                 },
             )
         ]
-        if result.image:
-            replies.append(_image_reply(result.image))
+        if image:
+            replies.append(_image_reply(image))
         return DashenSameplayRepliesOutput(
-            player1=result.player1,
-            player2=result.player2,
-            summary=dict(result.summary),
+            player1=output.player1,
+            player2=output.player2,
+            summary=dict(output.summary),
             replies=replies,
-            matches=list(result.matches),
+            matches=list(output.matches),
         )
 
-    async def query_sameplay_detail(
+    async def query_sameplay_list_replies(self, query: DashenSameplayQuery) -> DashenSameplayRepliesOutput:
+        output = await self.fetch_sameplay_list(query)
+        return await self.render_sameplay_list_replies(output)
+
+    async def fetch_sameplay_detail(
         self,
         query: DashenSameplayQuery,
         *,
@@ -330,8 +350,9 @@ class DashenSameplayModule:
         match_id: str = "",
         show_all_heroes: bool = False,
         analyze: bool = False,
-        render: bool = True,
+        for_render: bool = False,
     ) -> DashenSameplayDetailOutput:
+        """抓取阶段：解析 + 同玩列表 + 主详情 + 双方英雄详情（+ 全员详细数据）。只含上游请求。"""
         player1, player2 = await self._resolve_players(query)
         force_full_scan = bool(match_id)
         required_count = None if force_full_scan else max(1, int(index or 0) + 1)
@@ -345,7 +366,7 @@ class DashenSameplayModule:
         source_match = self._select_source_match(common_output["matches"], index=index, match_id=match_id)
         detail, source_player_index = await self._fetch_main_match_detail(player1, player2, source_match)
         detail_root = _extract_match_detail_data(detail.payload)
-        if render:
+        if for_render:
             detail_root = await self.match_module._hydrate_match_detail_risk_statuses(
                 detail.payload,
                 known_risk_statuses={
@@ -354,40 +375,23 @@ class DashenSameplayModule:
                 },
             )
 
-        main_image = None
-        if render:
-            main_image = await run_render(
-                render_match_detail,
-                detail_root,
-                source_match=source_match,
-                query_full_id=player1.full_id,
-                query_bnet_id=player1.bnet_id,
-                query_customer_token=player1.customer_token,
-            )
-            main_header_kwargs: Dict[str, Any] = {"bnet_id": player1.bnet_id, "subtitle": "同玩对局主战绩"}
-            if player1.risk_status is not None:
-                main_header_kwargs["risk_status"] = player1.risk_status
-            main_image = decorate_rendered_image_header(main_image, player1.display_name, **main_header_kwargs)
-
         player_details = await asyncio.gather(
             self._build_focus_player_output(
                 player1,
                 source_match,
-                render=render,
                 prefetched_payload=detail.payload if source_player_index == 1 else None,
             ),
             self._build_focus_player_output(
                 player2,
                 source_match,
-                render=render,
                 prefetched_payload=detail.payload if source_player_index == 2 else None,
             ),
         )
         notes = [item.note for item in player_details if item.note]
 
-        waterfall_image = None
-        analysis_image = None
-        if render and show_all_heroes:
+        all_player_details: List[Dict[str, Any]] = []
+        target_id = ""
+        if for_render and show_all_heroes:
             focus_player = player1 if source_player_index == 1 else player2
             all_player_details, target_id = await self.match_module._build_all_player_details(
                 detail_root,
@@ -396,51 +400,6 @@ class DashenSameplayModule:
                 query_bnet_id=focus_player.bnet_id,
                 query_customer_token=focus_player.customer_token,
             )
-            if all_player_details:
-                waterfall_image = await run_render(
-                    render_all_players_waterfall,
-                    all_player_details,
-                    match_game_time_sec=detail_root.get("gameTimeSec"),
-                )
-                waterfall_header_kwargs: Dict[str, Any] = {
-                    "bnet_id": focus_player.bnet_id,
-                    "subtitle": "全员详细数据",
-                }
-                if focus_player.risk_status is not None:
-                    waterfall_header_kwargs["risk_status"] = focus_player.risk_status
-                waterfall_image = decorate_rendered_image_header(
-                    waterfall_image,
-                    focus_player.display_name,
-                    **waterfall_header_kwargs,
-                )
-                if analyze:
-                    analysis = await self.match_module._build_ai_analysis(
-                        match_data=detail_root,
-                        all_player_details=all_player_details,
-                        target_id=target_id,
-                    )
-                    if analysis.get("json") is not None:
-                        json_data = dict(analysis["json"])
-                        json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.localtime())
-                        focus_detail = next(
-                            (
-                                item
-                                for item in all_player_details
-                                if str(item.get("name") or "").strip().lower() == str(target_id).strip().lower()
-                            ),
-                            {},
-                        )
-                        analysis_image = await run_render(
-                            render_analysis_report,
-                            json_data,
-                            target_hero_images=build_target_hero_icons(focus_detail.get("heroList") or [], size=40),
-                            map_name=map_name_for_match(detail_root),
-                            map_icon_img=map_icon_image_for_match(detail_root),
-                            match_result=self.match_module._match_result_text(detail_root),
-                            footer_source=analysis.get("footer_source"),
-                        )
-                    elif analysis.get("fallback_text"):
-                        notes.append(str(analysis.get("fallback_text")))
 
         summary = dict(common_output["summary"])
         summary["returned_count"] = min(self._clamp_limit(query.limit), len(common_output["matches"]))
@@ -453,15 +412,103 @@ class DashenSameplayModule:
             match_id=detail.match_id,
             detail=detail.payload,
             match_kind=detail.match_kind,
-            main_image=main_image,
+            main_image=None,
             main_detail_source_player=source_player_index,
             player_details=list(player_details),
+            waterfall_image=None,
+            analysis_image=None,
+            notes=notes,
+            detail_root=detail_root,
+            all_player_details=all_player_details,
+            target_id=target_id,
+            show_all_heroes=show_all_heroes,
+            analyze=analyze,
+        )
+
+    async def render_sameplay_detail(self, fetched: DashenSameplayDetailOutput) -> DashenSameplayDetailOutput:
+        """渲染/AI 阶段：主战绩 + 双方英雄详情 + 全员瀑布 + 单局 AI。全部在抓取槽外执行。"""
+        player1 = fetched.player1
+        detail_root = fetched.detail_root
+        source_player_index = fetched.main_detail_source_player
+
+        main_image = await run_render(
+            render_match_detail,
+            detail_root,
+            source_match=fetched.source_match,
+            query_full_id=player1.full_id,
+            query_bnet_id=player1.bnet_id,
+            query_customer_token=player1.customer_token,
+        )
+        main_header_kwargs: Dict[str, Any] = {"bnet_id": player1.bnet_id, "subtitle": "同玩对局主战绩"}
+        if player1.risk_status is not None:
+            main_header_kwargs["risk_status"] = player1.risk_status
+        main_image = decorate_rendered_image_header(main_image, player1.display_name, **main_header_kwargs)
+
+        rendered_player_details: List[DashenSameplayDetailPlayerOutput] = []
+        for item in fetched.player_details:
+            image = await self._render_focus_player_output(item)
+            rendered_player_details.append(replace(item, image=image))
+
+        waterfall_image = None
+        analysis_image = None
+        notes = list(fetched.notes)
+        if fetched.show_all_heroes and fetched.all_player_details:
+            focus_player = player1 if source_player_index == 1 else fetched.player2
+            waterfall_image = await run_render(
+                render_all_players_waterfall,
+                fetched.all_player_details,
+                match_game_time_sec=detail_root.get("gameTimeSec"),
+            )
+            waterfall_header_kwargs: Dict[str, Any] = {
+                "bnet_id": focus_player.bnet_id,
+                "subtitle": "全员详细数据",
+            }
+            if focus_player.risk_status is not None:
+                waterfall_header_kwargs["risk_status"] = focus_player.risk_status
+            waterfall_image = decorate_rendered_image_header(
+                waterfall_image,
+                focus_player.display_name,
+                **waterfall_header_kwargs,
+            )
+            if fetched.analyze:
+                analysis = await self.match_module._build_ai_analysis(
+                    match_data=detail_root,
+                    all_player_details=fetched.all_player_details,
+                    target_id=fetched.target_id,
+                )
+                if analysis.get("json") is not None:
+                    json_data = dict(analysis["json"])
+                    json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+                    focus_detail = next(
+                        (
+                            item
+                            for item in fetched.all_player_details
+                            if str(item.get("name") or "").strip().lower() == str(fetched.target_id).strip().lower()
+                        ),
+                        {},
+                    )
+                    analysis_image = await run_render(
+                        render_analysis_report,
+                        json_data,
+                        target_hero_images=build_target_hero_icons(focus_detail.get("heroList") or [], size=40),
+                        map_name=map_name_for_match(detail_root),
+                        map_icon_img=map_icon_image_for_match(detail_root),
+                        match_result=self.match_module._match_result_text(detail_root),
+                        footer_source=analysis.get("footer_source"),
+                    )
+                elif analysis.get("fallback_text"):
+                    notes.append(str(analysis.get("fallback_text")))
+
+        return replace(
+            fetched,
+            main_image=main_image,
+            player_details=rendered_player_details,
             waterfall_image=waterfall_image,
             analysis_image=analysis_image,
             notes=notes,
         )
 
-    async def query_sameplay_detail_replies(
+    async def query_sameplay_detail(
         self,
         query: DashenSameplayQuery,
         *,
@@ -469,15 +516,23 @@ class DashenSameplayModule:
         match_id: str = "",
         show_all_heroes: bool = False,
         analyze: bool = False,
-    ) -> DashenSameplayRepliesOutput:
-        detail_output = await self.query_sameplay_detail(
+        render: bool = True,
+    ) -> DashenSameplayDetailOutput:
+        fetched = await self.fetch_sameplay_detail(
             query,
             index=index,
             match_id=match_id,
             show_all_heroes=show_all_heroes,
             analyze=analyze,
-            render=True,
+            for_render=render,
         )
+        if render:
+            fetched = await self.render_sameplay_detail(fetched)
+        return fetched
+
+    async def render_sameplay_detail_replies(self, fetched: DashenSameplayDetailOutput) -> DashenSameplayRepliesOutput:
+        """渲染/AI 阶段：渲染同玩详情全部图片并组装 replies（槽外执行）。"""
+        detail_output = await self.render_sameplay_detail(fetched)
         detail_root = _extract_match_detail_data(detail_output.detail)
         replies: List[Dict[str, Any]] = [
             _meta_reply(
@@ -515,6 +570,25 @@ class DashenSameplayModule:
             match_id=detail_output.match_id,
             match_kind=detail_output.match_kind,
         )
+
+    async def query_sameplay_detail_replies(
+        self,
+        query: DashenSameplayQuery,
+        *,
+        index: Optional[int] = None,
+        match_id: str = "",
+        show_all_heroes: bool = False,
+        analyze: bool = False,
+    ) -> DashenSameplayRepliesOutput:
+        fetched = await self.fetch_sameplay_detail(
+            query,
+            index=index,
+            match_id=match_id,
+            show_all_heroes=show_all_heroes,
+            analyze=analyze,
+            for_render=True,
+        )
+        return await self.render_sameplay_detail_replies(fetched)
 
     async def _resolve_players(self, query: DashenSameplayQuery) -> tuple[ResolvedSameplayPlayer, ResolvedSameplayPlayer]:
         player1 = await self._resolve_player(query.player1_bnet_id, query.player1_customer_token)
@@ -876,9 +950,9 @@ class DashenSameplayModule:
         player: ResolvedSameplayPlayer,
         source_match: Dict[str, Any],
         *,
-        render: bool,
         prefetched_payload: Optional[Dict[str, Any]] = None,
     ) -> DashenSameplayDetailPlayerOutput:
+        """抓取阶段：取该玩家在此对局中的英雄详情 payload（不渲染）。"""
         match_id = str(source_match.get("matchId") or "").strip()
         if not match_id:
             return DashenSameplayDetailPlayerOutput(
@@ -917,25 +991,40 @@ class DashenSameplayModule:
                 detail_payload=payload,
                 note=f"Hero detail for {player.display_name} did not return a valid heroList.",
             )
-
-        image = None
-        if render:
-            image = await run_render(
-                render_player_hero_detail,
-                player.display_name,
-                focus_detail,
-                match_game_time_sec=detail_root.get("gameTimeSec"),
-            )
-            header_kwargs: Dict[str, Any] = {"bnet_id": player.bnet_id, "subtitle": "英雄详细数据"}
-            if player.risk_status is not None:
-                header_kwargs["risk_status"] = player.risk_status
-            image = decorate_rendered_image_header(image, player.display_name, **header_kwargs)
         return DashenSameplayDetailPlayerOutput(
             player=player,
             available=True,
             detail_payload=payload,
-            image=image,
         )
+
+    async def _render_focus_player_output(self, item: DashenSameplayDetailPlayerOutput) -> Optional[RenderedImage]:
+        """渲染阶段：由抓取阶段的 payload 生成英雄详情图（纯 PIL）。"""
+        if not item.available or not isinstance(item.detail_payload, dict):
+            return None
+        player = item.player
+        detail_root = _extract_match_detail_data(item.detail_payload)
+        focus_player = self.match_module._find_focus_player(
+            detail_root,
+            query_full_id=player.full_id,
+            query_bnet_id=player.bnet_id,
+            query_customer_token=player.customer_token,
+        )
+        focus_detail = {
+            "heroList": detail_root.get("heroList") or (focus_player.get("heroList") if focus_player else []) or [],
+            "rankInfo": (focus_player.get("rankInfo") if focus_player else {}) or {},
+        }
+        if not focus_detail["heroList"]:
+            return None
+        image = await run_render(
+            render_player_hero_detail,
+            player.display_name,
+            focus_detail,
+            match_game_time_sec=detail_root.get("gameTimeSec"),
+        )
+        header_kwargs: Dict[str, Any] = {"bnet_id": player.bnet_id, "subtitle": "英雄详细数据"}
+        if player.risk_status is not None:
+            header_kwargs["risk_status"] = player.risk_status
+        return decorate_rendered_image_header(image, player.display_name, **header_kwargs)
 
     def _clamp_limit(self, value: int) -> int:
         try:

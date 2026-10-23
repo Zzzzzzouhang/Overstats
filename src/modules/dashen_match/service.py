@@ -4,7 +4,7 @@ import asyncio
 import base64
 import copy
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import re
 import threading
@@ -19,7 +19,7 @@ try:
     from overstats.src.constants.ranks import get_rank_score
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from overstats.src.modules.errors import ModuleError
-    from overstats.src.modules.render_base import run_render
+    from overstats.src.modules.render_base import run_render, stage_slot
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
 except ModuleNotFoundError:
     from config import config as app_config
@@ -27,7 +27,7 @@ except ModuleNotFoundError:
     from src.constants.ranks import get_rank_score
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from src.modules.errors import ModuleError
-    from src.modules.render_base import run_render
+    from src.modules.render_base import run_render, stage_slot
     from src.modules.risk_status import RiskStatus, parse_risk_status
 from ..analysis_common import build_async_client as build_analysis_async_client
 from ..analysis_common import get_analysis_proxy
@@ -211,6 +211,9 @@ class DashenMatchListOutput:
     customer_token: str
     resolved_bnet: Optional[BnetSearchResult] = None
     image: Optional[RenderedImage] = None
+    full_id: str = ""
+    risk_status: Optional[RiskStatus] = None
+    footer_lines: List[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -219,6 +222,28 @@ class DashenMatchDetailOutput:
     customer_token: str
     resolved_bnet: Optional[BnetSearchResult] = None
     image: Optional[RenderedImage] = None
+    detail_root: Dict[str, Any] = field(default_factory=dict)
+    query_full_id: str = ""
+    query_bnet_id: str = ""
+
+
+@dataclass(frozen=True)
+class MatchDetailRepliesFetched:
+    """对局详情 replies 的抓取阶段产物：渲染/AI 阶段只消费这些数据。"""
+
+    customer_token: str
+    resolved_bnet: Optional[BnetSearchResult] = None
+    detail: Optional[DashenMatchDetail] = None
+    detail_root: Dict[str, Any] = field(default_factory=dict)
+    source_match: Dict[str, Any] = field(default_factory=dict)
+    query_full_id: str = ""
+    query_bnet_id: str = ""
+    target_risk_status: Optional[RiskStatus] = None
+    match_kind: str = ""
+    show_all_heroes: bool = False
+    analyze: bool = False
+    all_player_details: List[Dict[str, Any]] = field(default_factory=list)
+    target_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -239,48 +264,98 @@ class DashenMatchModule:
         self.requests = DashenMatchRequests(api_client)
         self.search_module = search_module or bnet_search_module
 
-    async def query_match_list(self, query: DashenMatchQuery, *, render: bool = True) -> DashenMatchListOutput:
+    async def fetch_match_list(self, query: DashenMatchQuery, *, for_render: bool = False) -> DashenMatchListOutput:
+        """抓取阶段：解析 + 对局列表（+ 渲染所需 risk_status）。只含上游请求。"""
         query, resolved_bnet = await self._resolve_query(query)
         matches = await self.requests.list_recent_matches(query)
         full_id = self._display_identity(query, resolved_bnet)
-        image = None
-        if render:
-            risk_status = await self._fetch_player_risk_status(query.customer_token)
-            render_kwargs: Dict[str, Any] = {"full_id": full_id}
-            if query.filters:
-                labels = [f"{label}：{query.filters[key]}" for key, label in (("map", "地图"), ("hero", "英雄"), ("search", "筛选")) if query.filters.get(key)]
-                render_kwargs["footer_lines"] = [" / ".join(labels), "检索最近两个赛季，最多显示 20 场"]
-            if risk_status is not None:
-                render_kwargs["risk_status"] = risk_status
-            image = await run_render(render_match_list, matches, **render_kwargs)
+        risk_status = await self._fetch_player_risk_status(query.customer_token) if for_render else None
+        footer_lines: List[str] = []
+        if for_render and query.filters:
+            labels = [f"{label}：{query.filters[key]}" for key, label in (("map", "地图"), ("hero", "英雄"), ("search", "筛选")) if query.filters.get(key)]
+            footer_lines = [" / ".join(labels), "检索最近两个赛季，最多显示 20 场"]
         self._store_reply_context(query, resolved_bnet, matches)
         return DashenMatchListOutput(
             matches=matches,
             customer_token=query.customer_token,
             resolved_bnet=resolved_bnet,
-            image=image,
+            full_id=full_id,
+            risk_status=risk_status,
+            footer_lines=footer_lines,
         )
 
-    async def query_match_list_replies(self, query: DashenMatchQuery) -> DashenMatchRepliesOutput:
-        result = await self.query_match_list(query, render=True)
-        full_id = self._display_identity(query, result.resolved_bnet)
+    async def render_match_list(self, output: DashenMatchListOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        render_kwargs: Dict[str, Any] = {"full_id": output.full_id}
+        if output.footer_lines:
+            render_kwargs["footer_lines"] = output.footer_lines
+        if output.risk_status is not None:
+            render_kwargs["risk_status"] = output.risk_status
+        return await run_render(render_match_list, output.matches, **render_kwargs)
+
+    async def query_match_list(self, query: DashenMatchQuery, *, render: bool = True) -> DashenMatchListOutput:
+        output = await self.fetch_match_list(query, for_render=render)
+        if render:
+            output = replace(output, image=await self.render_match_list(output))
+        return output
+
+    async def render_match_list_replies(self, output: DashenMatchListOutput) -> DashenMatchRepliesOutput:
+        """渲染阶段：由抓取产物生成列表图并组装 replies（槽外执行）。"""
+        image = await self.render_match_list(output)
         replies = [
             _meta_reply(
                 "ds_match_list",
                 {
                     "context_type": "ds_match_list",
-                    "full_id": full_id,
-                    "resolved": _resolved_payload(result.resolved_bnet),
-                    "match_entries": result.matches,
+                    "full_id": output.full_id,
+                    "resolved": _resolved_payload(output.resolved_bnet),
+                    "match_entries": output.matches,
                 },
             ),
         ]
-        if result.image:
-            replies.append(_image_reply(result.image))
+        if image:
+            replies.append(_image_reply(image))
         return DashenMatchRepliesOutput(
-            customer_token=result.customer_token,
-            resolved_bnet=result.resolved_bnet,
+            customer_token=output.customer_token,
+            resolved_bnet=output.resolved_bnet,
             replies=replies,
+        )
+
+    async def query_match_list_replies(self, query: DashenMatchQuery) -> DashenMatchRepliesOutput:
+        output = await self.fetch_match_list(query, for_render=True)
+        return await self.render_match_list_replies(output)
+
+    async def fetch_match_detail(
+        self,
+        customer_token: str,
+        match: Dict[str, Any] | str,
+        *,
+        query_full_id: str = "",
+        query_bnet_id: str = "",
+        for_render: bool = False,
+    ) -> DashenMatchDetailOutput:
+        """抓取阶段：对局详情（+ 渲染所需 risk 状态补充）。只含上游请求。"""
+        detail = await self.requests.get_match_detail(customer_token, match)
+        detail_root = await self._hydrate_match_detail_risk_statuses(detail.payload) if for_render else {}
+        return DashenMatchDetailOutput(
+            detail=detail,
+            customer_token=customer_token,
+            detail_root=detail_root,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+        )
+
+    async def render_match_detail(self, output: DashenMatchDetailOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        safe_query_full_id = _safe_display_identity(output.query_full_id) or UNKNOWN_PLAYER_LABEL
+        safe_query_bnet_id = _safe_display_identity(output.query_bnet_id)
+        return await run_render(
+            render_match_detail,
+            output.detail_root,
+            source_match=output.detail.source_match,
+            query_full_id=safe_query_full_id,
+            query_bnet_id=safe_query_bnet_id,
+            query_customer_token=output.customer_token,
         )
 
     async def query_match_detail(
@@ -292,29 +367,25 @@ class DashenMatchModule:
         query_bnet_id: str = "",
         render: bool = True,
     ) -> DashenMatchDetailOutput:
-        detail = await self.requests.get_match_detail(customer_token, match)
-        image = None
+        output = await self.fetch_match_detail(
+            customer_token,
+            match,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+            for_render=render,
+        )
         if render:
-            enriched_detail = await self._hydrate_match_detail_risk_statuses(detail.payload)
-            safe_query_full_id = _safe_display_identity(query_full_id) or UNKNOWN_PLAYER_LABEL
-            safe_query_bnet_id = _safe_display_identity(query_bnet_id)
-            image = await run_render(
-                render_match_detail,
-                enriched_detail,
-                source_match=detail.source_match,
-                query_full_id=safe_query_full_id,
-                query_bnet_id=safe_query_bnet_id,
-                query_customer_token=customer_token,
-            )
-        return DashenMatchDetailOutput(detail=detail, customer_token=customer_token, image=image)
+            output = replace(output, image=await self.render_match_detail(output))
+        return output
 
-    async def query_match_detail_by_index(
+    async def fetch_match_detail_by_index(
         self,
         query: DashenMatchQuery,
         index: int,
         *,
-        render: bool = True,
+        for_render: bool = False,
     ) -> DashenMatchDetailOutput:
+        """抓取阶段：解析 + 列表 + 详情（+ 渲染所需 risk 状态补充）。只含上游请求。"""
         query, resolved_bnet = await self._resolve_query(query)
         matches = await self._list_matches_for_query(query, resolved_bnet)
         if index < 0 or index >= len(matches):
@@ -326,25 +397,29 @@ class DashenMatchModule:
                 details={"index": index, "match_count": len(matches)},
             )
         detail = await self.requests.get_match_detail(query.customer_token, matches[index])
-        image = None
-        if render:
-            enriched_detail = await self._hydrate_match_detail_risk_statuses(detail.payload)
-            image = await run_render(
-                render_match_detail,
-                enriched_detail,
-                source_match=detail.source_match,
-                query_full_id=resolved_bnet.full_id if resolved_bnet else query.bnet_id,
-                query_bnet_id=resolved_bnet.bnet_id if resolved_bnet else "",
-                query_customer_token=query.customer_token,
-            )
+        detail_root = await self._hydrate_match_detail_risk_statuses(detail.payload) if for_render else {}
         return DashenMatchDetailOutput(
             detail=detail,
             customer_token=query.customer_token,
             resolved_bnet=resolved_bnet,
-            image=image,
+            detail_root=detail_root,
+            query_full_id=resolved_bnet.full_id if resolved_bnet else query.bnet_id,
+            query_bnet_id=resolved_bnet.bnet_id if resolved_bnet else "",
         )
 
-    async def query_match_detail_replies(
+    async def query_match_detail_by_index(
+        self,
+        query: DashenMatchQuery,
+        index: int,
+        *,
+        render: bool = True,
+    ) -> DashenMatchDetailOutput:
+        output = await self.fetch_match_detail_by_index(query, index, for_render=render)
+        if render:
+            output = replace(output, image=await self.render_match_detail(output))
+        return output
+
+    async def fetch_match_detail_replies(
         self,
         *,
         query: Optional[DashenMatchQuery] = None,
@@ -353,7 +428,8 @@ class DashenMatchModule:
         index: Optional[int] = None,
         show_all_heroes: bool = False,
         analyze: bool = False,
-    ) -> DashenMatchRepliesOutput:
+    ) -> MatchDetailRepliesFetched:
+        """抓取阶段：解析 + 列表 + 详情 + risk 补充 +（全员详细数据）。只含上游请求。"""
         resolved_query: Optional[DashenMatchQuery] = None
         resolved_bnet: Optional[BnetSearchResult] = None
         source_match: Dict[str, Any] = {}
@@ -413,6 +489,43 @@ class DashenMatchModule:
             detail.payload,
             known_risk_statuses={customer_token: target_risk_status},
         )
+
+        fetched = MatchDetailRepliesFetched(
+            customer_token=customer_token,
+            resolved_bnet=resolved_bnet,
+            detail=detail,
+            detail_root=detail_root,
+            source_match=source_match,
+            query_full_id=query_full_id,
+            query_bnet_id=query_bnet_id,
+            target_risk_status=target_risk_status,
+            match_kind=detail.match_kind,
+            show_all_heroes=show_all_heroes,
+            analyze=analyze,
+        )
+        # 角斗对局不支持全员详细/AI；其余情况在抓取阶段一次性取齐全员数据，
+        # 渲染/AI 阶段不再发起任何上游请求。
+        if detail.match_kind != "fight" and show_all_heroes:
+            all_player_details, target_id = await self._build_all_player_details(
+                detail_root,
+                detail.match_id,
+                query_full_id=query_full_id,
+                query_bnet_id=query_bnet_id,
+                query_customer_token=customer_token,
+            )
+            fetched = replace(fetched, all_player_details=all_player_details, target_id=target_id)
+        return fetched
+
+    async def render_match_detail_replies(self, fetched: MatchDetailRepliesFetched) -> DashenMatchRepliesOutput:
+        """渲染/AI 阶段：主战绩 + 全员瀑布/英雄详情 + 单局 AI。全部在抓取槽外执行。"""
+        detail = fetched.detail
+        detail_root = fetched.detail_root
+        source_match = fetched.source_match
+        query_full_id = fetched.query_full_id
+        query_bnet_id = fetched.query_bnet_id
+        target_risk_status = fetched.target_risk_status
+        customer_token = fetched.customer_token
+
         main_image = await run_render(
             render_match_detail,
             detail_root,
@@ -444,11 +557,11 @@ class DashenMatchModule:
         ]
 
         if detail.match_kind == "fight":
-            if show_all_heroes or analyze:
+            if fetched.show_all_heroes or fetched.analyze:
                 replies.append(_text_reply("角斗对局暂不支持全员详细或 AI锐评。"))
             return DashenMatchRepliesOutput(
                 customer_token=customer_token,
-                resolved_bnet=resolved_bnet,
+                resolved_bnet=fetched.resolved_bnet,
                 replies=replies,
                 match_id=detail.match_id,
                 match_kind=detail.match_kind,
@@ -465,21 +578,20 @@ class DashenMatchModule:
             "rankInfo": (focus_player.get("rankInfo") if focus_player else {}) or {},
         }
 
-        if show_all_heroes:
-            player_details, target_id = await self._build_all_player_details(
-                detail_root,
-                detail.match_id,
-                query_full_id=query_full_id,
-                query_bnet_id=query_bnet_id,
-                query_customer_token=customer_token,
+        if fetched.show_all_heroes:
+            player_details = fetched.all_player_details
+            target_id = fetched.target_id
+            waterfall = await run_render(
+                render_all_players_waterfall,
+                player_details,
+                match_game_time_sec=detail_root.get("gameTimeSec"),
             )
-            waterfall = render_all_players_waterfall(player_details, match_game_time_sec=detail_root.get("gameTimeSec"))
             waterfall_header_kwargs: Dict[str, Any] = {"bnet_id": query_bnet_id, "subtitle": "全员详细数据"}
             if target_risk_status is not None:
                 waterfall_header_kwargs["risk_status"] = target_risk_status
             waterfall = decorate_rendered_image_header(waterfall, query_full_id, **waterfall_header_kwargs)
             replies.append(_image_reply(waterfall))
-            if analyze:
+            if fetched.analyze:
                 analysis_result = await self._build_ai_analysis(
                     match_data=detail_root,
                     all_player_details=player_details,
@@ -487,7 +599,7 @@ class DashenMatchModule:
                 )
                 if analysis_result.get("json") is not None:
                     json_data = dict(analysis_result["json"])
-                    json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+                    json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.locftime())
                     analysis_image = await run_render(
                         render_analysis_report,
                         json_data,
@@ -516,11 +628,31 @@ class DashenMatchModule:
 
         return DashenMatchRepliesOutput(
             customer_token=customer_token,
-            resolved_bnet=resolved_bnet,
+            resolved_bnet=fetched.resolved_bnet,
             replies=replies,
             match_id=detail.match_id,
             match_kind=detail.match_kind,
         )
+
+    async def query_match_detail_replies(
+        self,
+        *,
+        query: Optional[DashenMatchQuery] = None,
+        customer_token: str = "",
+        match_id: str = "",
+        index: Optional[int] = None,
+        show_all_heroes: bool = False,
+        analyze: bool = False,
+    ) -> DashenMatchRepliesOutput:
+        fetched = await self.fetch_match_detail_replies(
+            query=query,
+            customer_token=customer_token,
+            match_id=match_id,
+            index=index,
+            show_all_heroes=show_all_heroes,
+            analyze=analyze,
+        )
+        return await self.render_match_detail_replies(fetched)
 
     async def query_match_list_by_bnet_id(
         self,
@@ -1053,15 +1185,18 @@ class DashenMatchModule:
 
         model = _analysis_model_for_base_url(base_url)
         try:
-            raw = await self._call_openai_compatible(
-                self._chat_completion_url(base_url),
-                api_key,
-                {
-                    "model": model,
-                    "temperature": 0.2,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
+            # 等 AI 返回属于渲染/AI 阶段：占用 stage 闸门槽位（抓取槽位的 3 倍量），
+            # 不占用 dashen 抓取槽位，避免阻塞其他指令的抓取。
+            async with stage_slot():
+                raw = await self._call_openai_compatible(
+                    self._chat_completion_url(base_url),
+                    api_key,
+                    {
+                        "model": model,
+                        "temperature": 0.2,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
             parsed = _parse_analysis_json(_extract_llm_message_content(raw))
             if parsed:
                 parsed["carry_index_data"] = build_carry_index_data(match_data)

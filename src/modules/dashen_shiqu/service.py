@@ -18,7 +18,6 @@ import os
 import random
 import re
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -1059,10 +1058,11 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
         }
 
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
-    from ..analysis_common import build_async_client, get_analysis_proxy, LLM_SEMAPHORE
+    from ..analysis_common import build_async_client, get_analysis_proxy
+    from ..render_base import stage_slot
     proxy = get_analysis_proxy(cfg.base_url)
-    await LLM_SEMAPHORE.acquire()  # 限制对外部 LLM 端点的并发（shiqu/court 共享 2 槽，受 AsyncRunner 单循环控制）
-    try:
+    # 等 LLM 返回与渲染共用同一闸门（容量 = 抓取槽位 × 3），不占用抓取槽位。
+    async with stage_slot():
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
 
             async def _do_request() -> Optional[str]:
@@ -1114,8 +1114,6 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
             # 兼容任何不支持 structured outputs 的模型（如 Nemotron 3.5 Lightning 免费版）。
             content = await _do_request()
             return content
-    finally:
-        LLM_SEMAPHORE.release()
 
 
 # ── 主流程 ──
@@ -1136,41 +1134,9 @@ def _shiqu_fetch_semaphore() -> "asyncio.Semaphore":
 
 
 # ── 抓取阶段轮次闸 ──
-# 跨请求共享，保证任意时刻最多 1 个 shiqu 请求处于抓取阶段（默认，可用
-# OVERSTATS_SHIQU_FETCH_PHASE_CONCURRENCY 调整）。抓取阶段才真正请求大神
-# 上游，把它压到 1 个并发，意味着 shiqu 最多占用 1 个 dashen_request_queue
-# 槽位，其余槽位留给其它端点；而 LLM 阶段不占队列槽，可与之重叠并行。
-SHIQU_FETCH_PHASE_CONCURRENCY = int(
-    os.getenv("OVERSTATS_SHIQU_FETCH_PHASE_CONCURRENCY", "1")
-)
-# 注意：全局变量用大写、函数用小写，避免 def 重新绑定把变量 shadow 成函数对象。
-_SHIQU_FETCH_PHASE_SEMAPHORE: "Optional[asyncio.Semaphore]" = None
-
-
-def _shiqu_fetch_phase_semaphore() -> "asyncio.Semaphore":
-    """懒加载抓取轮次信号量，绑定到运行中的事件循环，避免启动期创建。"""
-    global _SHIQU_FETCH_PHASE_SEMAPHORE
-    if _SHIQU_FETCH_PHASE_SEMAPHORE is None:
-        _SHIQU_FETCH_PHASE_SEMAPHORE = asyncio.Semaphore(
-            max(1, SHIQU_FETCH_PHASE_CONCURRENCY)
-        )
-    return _SHIQU_FETCH_PHASE_SEMAPHORE
-
-
-@asynccontextmanager
-async def shiqu_fetch_gate():
-    """抓取阶段轮次闸。
-
-    必须在 dashen_request_queue **之外**获取：等待轮次时不占用队列槽，
-    避免排队期间把共享槽位卡住（进而把其它端点挤到 429）。
-    进入后再由调用方申请队列槽执行 collect_data。
-    """
-    sem = _shiqu_fetch_phase_semaphore()
-    await sem.acquire()
-    try:
-        yield
-    finally:
-        sem.release()
+# （已废弃）历史版本曾用跨请求信号量把 shiqu 抓取压到 1 个并发、只占 1 个
+# dashen_request_queue 槽位。现与其他指令一致：抓取直接进队列槽（可占满
+# 全部槽位），LLM 阶段在槽外执行并受渲染/AI 闸门约束。
 
 
 @dataclass
@@ -1312,10 +1278,9 @@ class ShiquModule:
         3. render._extract_match_detail_data —— 提取与原始 shiqu.py 一致的根数据结构。
         仅保留预设/6v6 对局，不足则重试一次（对齐原版网络抖动重试）。
 
-        调用方约定：先在 dashen_request_queue **之外**进入 shiqu_fetch_gate()
-        （抓取轮次闸，等待时不占队列槽），再在队列槽内调用本方法。
-        两者配合保证任意时刻最多 1 个 shiqu 请求占用 1 个队列槽位。
-        use_db 模式不走本方法（直接用 analyze_from_db）。
+        调用方约定：在 dashen_request_queue 队列槽内调用本方法执行抓取
+        （与其他指令一致，可占满全部抓取槽位）。use_db 模式不走本方法
+        （直接用 analyze_from_db）。
 
         Args:
             query: ShiquQuery（use_db 必须为 False）
@@ -1440,9 +1405,9 @@ class ShiquModule:
         """LLM 阶段（不占用 dashen_request_queue 槽位）：
         调用独立 LLM → 解析结构化结果 → 遥测落库 → 详情缓存写回。
 
-        与抓取阶段分离后，多个请求可同时处于本阶段并行发送，
-        并发上限见 analysis_common.LLM_SEMAPHORE（默认 4，可用
-        OVERSTATS_LLM_MAX_CONCURRENT 调整）。
+        与抓取阶段分离后，多个请求可同时处于本阶段并行发送；
+        等待 LLM 返回与渲染共用 render_base.stage_slot 闸门
+        （容量 = 抓取槽位 × 3，可用 OVERSTATS_STAGE_MULTIPLIER 调整）。
 
         Args:
             prepared: collect_data 的产物。
@@ -1541,12 +1506,11 @@ class ShiquModule:
         """一步到位入口（抓取 + LLM 连续执行）：供直接调用与测试使用。
 
         注意：HTTP 处理器不要用本方法——它会把耗时最长的 LLM 等待
-        一起关在 dashen_request_queue 槽位里。请改用拆分形式：
-            async with shiqu_fetch_gate():
-                prepared = await queue.run(
-                    "shiqu_fetch",
-                    lambda: shiqu_module.collect_data(query, db=db),
-                )
+        一起关在 dashen_request_queue 槽位里。请改用拆分形式（与其他指令一致）：
+            prepared = await queue.run(
+                "shiqu_fetch",
+                lambda: shiqu_module.collect_data(query, db=db),
+            )
             result = await shiqu_module.generate_verdict(prepared)
         """
         if not query.bnet_id and not query.customer_token:

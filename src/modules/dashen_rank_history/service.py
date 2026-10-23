@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 try:
@@ -60,12 +60,13 @@ class DashenRankHistoryModule:
         self.requests = DashenRankHistoryRequests(api_client)
         self.search_module = search_module or bnet_search_module
 
-    async def query_rank_history(
+    async def fetch_rank_history(
         self,
         query: DashenRankHistoryQuery,
         *,
-        render: bool = False,
+        for_render: bool = False,
     ) -> DashenRankHistoryOutput:
+        """抓取阶段：解析 + 各赛季战绩（+ 渲染所需横幅/资料卡）。只含上游请求。"""
         query, resolved_bnet = await self._resolve_query(query)
         start_season, end_season = self._resolve_season_range(query.start_season, query.end_season)
         raw_seasons = await self.requests.get_history_payloads(
@@ -74,7 +75,7 @@ class DashenRankHistoryModule:
             end_season=end_season,
         )
         seasons = self._build_season_summaries(raw_seasons)
-        if render:
+        if for_render:
             await ensure_season_banners(seasons)
         missing_assets = collect_missing_assets(seasons)
 
@@ -87,33 +88,17 @@ class DashenRankHistoryModule:
             full_id = query.bnet_id
             bnet_id = query.bnet_id
 
-        image = None
         risk_status = None
-        if render:
+        if for_render:
             try:
-                try:
-                    card_payload = await self.requests.api_client.query_card(query.customer_token)
-                except Exception:
-                    card_payload = {}
-                card_data = card_payload.get("data") if isinstance(card_payload, dict) else None
-                if isinstance(card_data, dict):
-                    risk_status = parse_risk_status(card_data)
-                    full_id = str(card_data.get("name") or full_id).strip()
-                    bnet_id = str(card_data.get("bnetId") or bnet_id).strip()
-                image = await run_render(
-                    render_rank_history,
-                    player_name=full_id or bnet_id or query.bnet_id or "Unknown",
-                    subtitle=HISTORY_SUBTITLE,
-                    seasons=seasons,
-                    risk_status=risk_status,
-                )
-            except RuntimeError as exc:
-                raise ModuleError(
-                    error="render_dependency_missing",
-                    message=str(exc),
-                    status_code=500,
-                    hint="Install Pillow in the runtime environment to enable image rendering.",
-                ) from exc
+                card_payload = await self.requests.api_client.query_card(query.customer_token)
+            except Exception:
+                card_payload = {}
+            card_data = card_payload.get("data") if isinstance(card_payload, dict) else None
+            if isinstance(card_data, dict):
+                risk_status = parse_risk_status(card_data)
+                full_id = str(card_data.get("name") or full_id).strip()
+                bnet_id = str(card_data.get("bnetId") or bnet_id).strip()
 
         return DashenRankHistoryOutput(
             customer_token=query.customer_token,
@@ -126,8 +111,36 @@ class DashenRankHistoryModule:
             missing_assets=tuple(missing_assets),
             risk_status=risk_status,
             resolved_bnet=resolved_bnet,
-            image=image,
         )
+
+    async def render_rank_history(self, output: DashenRankHistoryOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        try:
+            return await run_render(
+                render_rank_history,
+                player_name=output.full_id or output.bnet_id or "Unknown",
+                subtitle=HISTORY_SUBTITLE,
+                seasons=output.seasons,
+                risk_status=output.risk_status,
+            )
+        except RuntimeError as exc:
+            raise ModuleError(
+                error="render_dependency_missing",
+                message=str(exc),
+                status_code=500,
+                hint="Install Pillow in the runtime environment to enable image rendering.",
+            ) from exc
+
+    async def query_rank_history(
+        self,
+        query: DashenRankHistoryQuery,
+        *,
+        render: bool = False,
+    ) -> DashenRankHistoryOutput:
+        output = await self.fetch_rank_history(query, for_render=render)
+        if render:
+            output = replace(output, image=await self.render_rank_history(output))
+        return output
 
     async def _resolve_query(self, query: DashenRankHistoryQuery) -> tuple[DashenRankHistoryQuery, Optional[BnetSearchResult]]:
         if query.customer_token:

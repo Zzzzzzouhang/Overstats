@@ -12,6 +12,17 @@ except ModuleNotFoundError:
 
 from .requests import DashenSummaryQuery, DashenSummaryRequests, decode_summary_image_base64
 
+try:
+    from overstats.src.modules.dashen_summary.engine import (
+        fetch_summary_payload,
+        render_summary_image_from_payload,
+    )
+except ModuleNotFoundError:
+    from src.modules.dashen_summary.engine import (
+        fetch_summary_payload,
+        render_summary_image_from_payload,
+    )
+
 
 @dataclass(frozen=True)
 class DashenSummaryOutput:
@@ -31,34 +42,52 @@ class DashenSummaryOutput:
     resolved_bnet: Optional[BnetSearchResult] = None
 
 
+@dataclass(frozen=True)
+class DashenSummaryFetched:
+    """总结抓取阶段产物：渲染阶段只消费 payload，不再发起上游请求。"""
+
+    query: DashenSummaryQuery
+    resolved_bnet: Optional[BnetSearchResult]
+    payload: Dict[str, Any]
+
+
 class DashenSummaryModule:
     def __init__(self, search_module: Optional[BnetSearchModule] = None) -> None:
         self.requests = DashenSummaryRequests()
         self.search_module = search_module or bnet_search_module
 
-    async def query_summary(self, query: DashenSummaryQuery) -> DashenSummaryOutput:
+    async def fetch_summary(self, query: DashenSummaryQuery) -> DashenSummaryFetched:
+        """抓取阶段：解析 + 对局数据 + 详情 + 奖项 + stats。只含上游请求，可放入抓取槽位。"""
         query, resolved_bnet = await self._resolve_query(query)
-        worker_result = await self.requests.render_summary(query)
-        image_bytes, image_media_type = decode_summary_image_base64(worker_result.image_base64)
-        payload = worker_result.payload
-        full_id = str(payload.get("full_id") or query.full_id or query.bnet_id).strip()
-        bnet_id = str((resolved_bnet.bnet_id if resolved_bnet else query.bnet_id) or "").strip()
+        payload = await fetch_summary_payload(query)
+        return DashenSummaryFetched(query=query, resolved_bnet=resolved_bnet, payload=payload)
+
+    async def render_summary(self, fetched: DashenSummaryFetched) -> DashenSummaryOutput:
+        """渲染阶段：PIL 渲染 + 编码，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        payload = await render_summary_image_from_payload(fetched.payload)
+        image_bytes, image_media_type = decode_summary_image_base64(payload.get("image_base64") or "")
+        full_id = str(payload.get("full_id") or fetched.query.full_id or fetched.query.bnet_id).strip()
+        bnet_id = str((fetched.resolved_bnet.bnet_id if fetched.resolved_bnet else fetched.query.bnet_id) or "").strip()
         return DashenSummaryOutput(
-            scope=worker_result.scope,
-            title=worker_result.title,
-            customer_token=query.customer_token,
+            scope=payload.get("scope") or fetched.query.scope,
+            title=payload.get("title") or "",
+            customer_token=fetched.query.customer_token,
             full_id=full_id,
             bnet_id=bnet_id,
-            worker_url=worker_result.worker_url,
+            worker_url=payload.get("worker_url") or "local-module",
             match_count=int(payload.get("match_count") or 0),
             all_match_count=int(payload.get("all_match_count") or 0),
             payload_kb=int(payload.get("payload_kb") or 0),
             timings=list(payload.get("timings") or []),
-            image_base64=worker_result.image_base64,
+            image_base64=payload.get("image_base64") or "",
             image_bytes=image_bytes,
             image_media_type=image_media_type,
-            resolved_bnet=resolved_bnet,
+            resolved_bnet=fetched.resolved_bnet,
         )
+
+    async def query_summary(self, query: DashenSummaryQuery) -> DashenSummaryOutput:
+        fetched = await self.fetch_summary(query)
+        return await self.render_summary(fetched)
 
     async def _resolve_query(self, query: DashenSummaryQuery) -> tuple[DashenSummaryQuery, Optional[BnetSearchResult]]:
         if query.customer_token:

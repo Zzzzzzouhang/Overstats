@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional
 
 try:
@@ -25,6 +25,8 @@ class DashenProfileOutput:
     customer_token: str
     resolved_bnet: Optional[BnetSearchResult] = None
     image: Optional[RenderedImage] = None
+    avatar_bytes: Optional[bytes] = None
+    resolved_name: str = ""
 
 
 class DashenProfileModule:
@@ -37,13 +39,14 @@ class DashenProfileModule:
         self.engine = DashenProfileEngine(self.requests)
         self.search_module = search_module or bnet_search_module
 
-    async def query_profile(
+    async def fetch_profile(
         self,
         query: DashenProfileQuery,
         *,
-        render: bool = False,
+        for_render: bool = False,
         render_mode: str = "quick",
     ) -> DashenProfileOutput:
+        """抓取阶段：解析 + 资料包（+ 渲染所需头像）。只含上游请求，可放入抓取槽位。"""
         query, resolved_bnet = await self._resolve_query(query)
         bundle = await self.requests.get_profile_bundle(query)
 
@@ -59,31 +62,49 @@ class DashenProfileModule:
                 },
             )
 
-        image = None
-        if render:
-            avatar_bytes = await self._try_fetch_avatar_bytes(profile_card)
-            try:
-                context = await self.engine.build_render_context(
-                    bundle,
-                    resolved_name=(resolved_bnet.full_id if resolved_bnet else query.bnet_id),
-                    avatar_bytes=avatar_bytes,
-                    render_mode=render_mode,
-                )
-                image = await run_render(render_profile_summary, context)
-            except RuntimeError as exc:
-                raise ModuleError(
-                    error="render_dependency_missing",
-                    message=str(exc),
-                    status_code=500,
-                    hint="Install Pillow in the runtime environment to enable image rendering.",
-                ) from exc
-
+        avatar_bytes = await self._try_fetch_avatar_bytes(profile_card) if for_render else None
         return DashenProfileOutput(
             bundle=bundle,
             customer_token=query.customer_token,
             resolved_bnet=resolved_bnet,
-            image=image,
+            avatar_bytes=avatar_bytes,
+            resolved_name=(resolved_bnet.full_id if resolved_bnet else query.bnet_id),
         )
+
+    async def render_profile(
+        self,
+        output: DashenProfileOutput,
+        *,
+        render_mode: str = "quick",
+    ) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        try:
+            context = await self.engine.build_render_context(
+                output.bundle,
+                resolved_name=output.resolved_name,
+                avatar_bytes=output.avatar_bytes,
+                render_mode=render_mode,
+            )
+            return await run_render(render_profile_summary, context)
+        except RuntimeError as exc:
+            raise ModuleError(
+                error="render_dependency_missing",
+                message=str(exc),
+                status_code=500,
+                hint="Install Pillow in the runtime environment to enable image rendering.",
+            ) from exc
+
+    async def query_profile(
+        self,
+        query: DashenProfileQuery,
+        *,
+        render: bool = False,
+        render_mode: str = "quick",
+    ) -> DashenProfileOutput:
+        output = await self.fetch_profile(query, for_render=render, render_mode=render_mode)
+        if render:
+            output = replace(output, image=await self.render_profile(output, render_mode=render_mode))
+        return output
 
     async def query_profile_by_bnet_id(
         self,

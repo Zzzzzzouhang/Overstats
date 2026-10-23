@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Sequence
 
 try:
@@ -111,6 +111,7 @@ class DashenCompetitiveStrengthOutput:
     resolved_bnet: Optional[BnetSearchResult] = None
     image: Optional[RenderedImage] = None
     risk_status: Optional[RiskStatus] = None
+    avatar_bytes: Optional[bytes] = None
 
 
 class DashenCompetitiveStrengthModule:
@@ -123,12 +124,13 @@ class DashenCompetitiveStrengthModule:
         self.engine = DashenCompetitiveStrengthEngine(self.requests)
         self.search_module = search_module or bnet_search_module
 
-    async def query_competitive_strength(
+    async def fetch_competitive_strength(
         self,
         query: DashenCompetitiveStrengthQuery,
         *,
-        render: bool = False,
+        for_render: bool = False,
     ) -> DashenCompetitiveStrengthOutput:
+        """抓取阶段：解析 + 强度计算（+ 渲染所需头像/risk）。只含上游请求。"""
         query, resolved_bnet = await self._resolve_query(query)
         config = self._load_ow_config()
         computed = await self.engine.build(
@@ -183,36 +185,13 @@ class DashenCompetitiveStrengthModule:
 
         full_id = resolved_bnet.full_id if resolved_bnet else (query.bnet_id or "Unknown")
         bnet_id = resolved_bnet.bnet_id if resolved_bnet else (query.bnet_id or "Unknown")
-        image = None
+        avatar_bytes = None
         risk_status = None
-        if render:
+        if for_render:
             avatar_bytes, risk_status = await self._try_fetch_profile_assets(
                 resolved_bnet,
                 query.customer_token,
             )
-            try:
-                image = await run_render(
-                    render_quick_strength,
-                    player_name=full_id,
-                    bnet_id=bnet_id,
-                    summary=summary.to_dict(),
-                    matches=[item.to_dict() for item in matches],
-                    avatar_bytes=avatar_bytes,
-                    risk_status=risk_status,
-                    config=config,
-                    theme=COMPETITIVE_STRENGTH_THEME,
-                    title_text="竞技强度指数",
-                    chart_title_text="竞技强度趋势",
-                    match_scope_text="竞技",
-                )
-            except RuntimeError as exc:
-                raise ModuleError(
-                    error="render_dependency_missing",
-                    message=str(exc),
-                    status_code=500,
-                    hint="Install Pillow in the runtime environment to enable image rendering.",
-                ) from exc
-
         return DashenCompetitiveStrengthOutput(
             customer_token=query.customer_token,
             full_id=full_id,
@@ -221,8 +200,44 @@ class DashenCompetitiveStrengthModule:
             matches=matches,
             risk_status=risk_status,
             resolved_bnet=resolved_bnet,
-            image=image,
+            avatar_bytes=avatar_bytes,
         )
+
+    async def render_competitive_strength(self, output: DashenCompetitiveStrengthOutput) -> RenderedImage:
+        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        try:
+            return await run_render(
+                render_quick_strength,
+                player_name=output.full_id,
+                bnet_id=output.bnet_id,
+                summary=output.summary.to_dict(),
+                matches=[item.to_dict() for item in output.matches],
+                avatar_bytes=output.avatar_bytes,
+                risk_status=output.risk_status,
+                config=self._load_ow_config(),
+                theme=COMPETITIVE_STRENGTH_THEME,
+                title_text="竞技强度指数",
+                chart_title_text="竞技强度趋势",
+                match_scope_text="竞技",
+            )
+        except RuntimeError as exc:
+            raise ModuleError(
+                error="render_dependency_missing",
+                message=str(exc),
+                status_code=500,
+                hint="Install Pillow in the runtime environment to enable image rendering.",
+            ) from exc
+
+    async def query_competitive_strength(
+        self,
+        query: DashenCompetitiveStrengthQuery,
+        *,
+        render: bool = False,
+    ) -> DashenCompetitiveStrengthOutput:
+        output = await self.fetch_competitive_strength(query, for_render=render)
+        if render:
+            output = replace(output, image=await self.render_competitive_strength(output))
+        return output
 
     async def _resolve_query(
         self,

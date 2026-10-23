@@ -196,7 +196,7 @@ def get_api_config() -> APIConfig:
             0,
             _read_int_env(
                 "OVERSTATS_DASHEN_LIGHT_LOAD_THRESHOLD",
-                getattr(config, "DASHEN_LIGHT_LOAD_THRESHOLD", 4),
+                getattr(config, "DASHEN_LIGHT_LOAD_THRESHOLD", 2),
             ),
         ),
     )

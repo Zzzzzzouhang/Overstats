@@ -384,14 +384,16 @@ class DashenRequestQueue:
         max_concurrent_requests: int,
         max_accepted_requests: Optional[int] = None,
         *,
-        light_load_threshold: int = 4,
+        light_load_threshold: int = 2,
     ) -> None:
         self.max_concurrent_requests = max(1, int(max_concurrent_requests or 1))
         accepted_limit = self.max_concurrent_requests if max_accepted_requests is None else int(max_accepted_requests)
         self.max_accepted_requests = max(1, accepted_limit)
-        # 轻指令负载让行阈值：轻指令（除 shiqu/court 外的队列请求）pending 超过该值时，
-        # 重指令（heavy=True）在队列槽外等待，把槽位让给轻指令，提升高峰期轻指令响应速度。
-        # 重指令的 LLM 阶段不走本队列，不受让行影响。
+        # 轻指令负载让行阈值：轻指令（除 shiqu/court 外的队列请求）pending 达到该值时
+        #（大于等于，默认 2），重指令（heavy=True）在队列槽外等待，把槽位让给轻指令，
+        # 提升高峰期轻指令响应速度。正在抓取的重指令不受影响（跑完本次抓取即暂停，
+        # 后续请求才让行）；重指令的 LLM 阶段不走本队列，始终不受让行影响。
+        # 设为 0 可完全暂停重指令抓取（应急开关）。
         self.light_load_threshold = max(0, int(light_load_threshold))
         self._light_pending = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
@@ -410,17 +412,18 @@ class DashenRequestQueue:
         """重指令让行：轻指令高峰期间在队列槽外轮询等待。
 
         等待条件（满足其一即继续等）：
-        1. 轻指令 pending 超过 light_load_threshold；
+        1. 轻指令 pending 达到 light_load_threshold（大于等于，默认 2）；
         2. 队列 pending 已达准入上限（继续等而不是直接 429，让行期间轻指令优先消化）。
         等待期间不占用队列槽、不计入 pending/active，因此既不会阻塞轻指令，
-        也不会把后续请求挤到 429；LLM 阶段不走本队列，不受影响。
+        也不会把后续请求挤到 429；已进入抓取的重指令跑完本次即暂停后续让行；
+        LLM 阶段不走本队列，始终不受影响。
         """
         announced = False
         while True:
             light_pending = self._light_pending
             pending_requests = self._pending_requests()
             if (
-                light_pending <= self.light_load_threshold
+                light_pending < self.light_load_threshold
                 and pending_requests < self.max_accepted_requests
             ):
                 return
@@ -505,7 +508,7 @@ class OverstatsCoreService:
         self,
         dashen_max_concurrent_requests: int = 2,
         dashen_max_accepted_requests: Optional[int] = None,
-        dashen_light_load_threshold: int = 4,
+        dashen_light_load_threshold: int = 2,
     ) -> None:
         self.dashen_request_queue = DashenRequestQueue(
             dashen_max_concurrent_requests,

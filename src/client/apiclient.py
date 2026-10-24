@@ -770,15 +770,8 @@ class SafeClient:
         if not REQUEST_LOG_ENABLED:
             return
         now = time.monotonic()
-        start_rps = _record_request_window_sample(_request_started_timestamps, now)
-        cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        context_suffix = f" {log_context}" if log_context else ""
-        print(
-            f"[{cur_time}] [{method} Start] "
-            f"id={request_id} route={route.label} slot={slot_kind} attempt={attempt} "
-            f"active={self._active_count()} start_rps={start_rps}/{REQUEST_LOG_WINDOW_SECONDS:.1f}s"
-            f"{context_suffix} URL: {_request_log_url(url)}"
-        )
+        # 成功请求不再逐条打印：仅保留窗口采样，日志噪音交给请求级 [FETCH DONE] 汇总。
+        _record_request_window_sample(_request_started_timestamps, now)
 
     def _log_request_success(
         self,
@@ -797,11 +790,12 @@ class SafeClient:
         now = time.monotonic()
         done_rps = _record_request_window_sample(_request_finished_timestamps, now)
         start_rps = _current_request_window_count(_request_started_timestamps, now)
+        # status=200 的成功请求不再打印：一次请求只留一条 [FETCH DONE] 汇总日志。
+        if response.status_code == 200:
+            return
         cur_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         context_suffix = f" {log_context}" if log_context else ""
-        reason_suffix = ""
-        if response.status_code != 200:
-            reason_suffix = f" reason={json.dumps(_response_failure_reason(response), ensure_ascii=False)}"
+        reason_suffix = f" reason={json.dumps(_response_failure_reason(response), ensure_ascii=False)}"
         print(
             f"[{cur_time}] [{method} Done] "
             f"id={request_id} route={route.label} slot={slot_kind} attempt={attempt} status={response.status_code} "

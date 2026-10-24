@@ -287,7 +287,7 @@ def render_ow_esports(
 
 def _encode_image(image: Any) -> RenderedImage:
     output = BytesIO()
-    image.convert("RGB").save(output, format="PNG", optimize=True)
+    image.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue())
 
 

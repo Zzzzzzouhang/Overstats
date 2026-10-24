@@ -159,7 +159,7 @@ def render_match_list(
 
     output = BytesIO()
     img = append_dashen_promo(img)
-    img.convert("RGB").save(output, format="PNG", optimize=True)
+    img.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue())
 
 
@@ -349,7 +349,7 @@ def _render_scoreboard_match_detail(
 
     output = BytesIO()
     img = append_dashen_promo(img)
-    img.convert("RGB").save(output, format="PNG", optimize=True)
+    img.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue())
 
 
@@ -646,7 +646,7 @@ def _render_fight_match_detail(
 
     output = BytesIO()
     img = append_dashen_promo(img)
-    img.convert("RGB").save(output, format="PNG", optimize=True)
+    img.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue())
 
 

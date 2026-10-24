@@ -16,6 +16,11 @@ try:
 except ModuleNotFoundError:
     from src.modules.risk_status import RiskStatus, parse_risk_status
 
+try:
+    from overstats.src.modules.dashen_request_cache import cache_owner_key
+except ModuleNotFoundError:
+    from src.modules.dashen_request_cache import cache_owner_key
+
 from .requests import (
     DashenProfileBundle,
     DashenProfileRequests,
@@ -28,6 +33,12 @@ from .requests import (
 
 
 RECENT_MATCH_TARGET = 24
+
+# 历史赛季 count 缓存：渲染阶段会为「前 1~3 个赛季」各拉一次 count（sport+leisure
+# 共 2 次上游，单次约 180ms）。这些赛季的数据基本不再变化，跨请求复用可省约 1s。
+# 注意：只缓存历史赛季，当前赛季仍每次实时拉取。
+HISTORICAL_COUNT_CACHE_TTL_SEC = 600.0
+HISTORICAL_COUNT_CACHE_MAX_ENTRIES = 64
 ROLE_ORDER = ("tank", "dps", "healer", "open")
 
 DASHEN_RACE_PROGRESS_DISPLAY_START = dt.datetime(2026, 4, 10, 0, 0, 0)
@@ -315,6 +326,8 @@ def build_role_panel_entries(
 class DashenProfileEngine:
     def __init__(self, requests: DashenProfileRequests) -> None:
         self.requests = requests
+        # (customer_token, season_id) -> (写入时刻 monotonic, count_payload_pair)
+        self._historical_count_cache: dict[tuple[str, int], tuple[float, tuple]] = {}
 
     async def build_render_context(
         self,
@@ -633,6 +646,28 @@ class DashenProfileEngine:
                 limit=RECENT_MATCH_TARGET,
             )
 
+    async def _get_historical_count_pair(self, customer_token: str, season_id: int) -> Any:
+        """历史赛季 count（sport+leisure）带 TTL 缓存，避免每次渲染都重新抓。
+
+        customer_token 每次请求都会重新签发（内含随机数），因此缓存键用从 token
+        解出的稳定玩家标识（dashen_bnet:xxx），否则永远命中不到。
+        """
+        owner = cache_owner_key(customer_token=customer_token) or str(customer_token or "")
+        key = (owner, int(season_id))
+        now = time.monotonic()
+        cached = self._historical_count_cache.get(key)
+        if cached is not None and now - cached[0] <= HISTORICAL_COUNT_CACHE_TTL_SEC:
+            return cached[1]
+        result = await self.requests.get_count_payload_pair(customer_token, logical_season=season_id)
+        try:
+            if len(self._historical_count_cache) >= HISTORICAL_COUNT_CACHE_MAX_ENTRIES:
+                oldest_key = min(self._historical_count_cache.items(), key=lambda kv: kv[1][0])[0]
+                self._historical_count_cache.pop(oldest_key, None)
+            self._historical_count_cache[key] = (now, result)
+        except Exception:
+            pass
+        return result
+
     async def _build_role_panel_entries(
         self,
         bundle: DashenProfileBundle,
@@ -646,7 +681,7 @@ class DashenProfileEngine:
             if season_id > 0
         ]
         tasks = [
-            self.requests.get_count_payload_pair(bundle.customer_token, logical_season=season_id)
+            self._get_historical_count_pair(bundle.customer_token, season_id)
             for season_id in seasons
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

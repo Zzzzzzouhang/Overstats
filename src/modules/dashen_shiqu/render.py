@@ -824,5 +824,5 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
 
     img = append_dashen_promo(img, compact=True)
     output = BytesIO()
-    img.convert("RGB").save(output, format="PNG", optimize=True)
+    img.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue(), media_type="image/png")

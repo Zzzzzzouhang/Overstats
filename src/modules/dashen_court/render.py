@@ -231,7 +231,7 @@ def render_court_image(
 
     img = append_dashen_promo(img, compact=True)
     output = BytesIO()
-    img.convert("RGB").save(output, format="PNG", optimize=True)
+    img.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue(), media_type="image/png")
 
 
@@ -338,7 +338,7 @@ def _render_court_error(message: str) -> RenderedImage:
     _draw_segments(d, img, lines, pad_x, 24 + title_h + 16, f_body, int(f_body.size * 1.55), max_w, _emoji_enabled())
     img = append_dashen_promo(img, compact=True)
     output = BytesIO()
-    img.convert("RGB").save(output, format="PNG", optimize=True)
+    img.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue(), media_type="image/png")
 
 

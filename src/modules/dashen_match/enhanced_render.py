@@ -89,7 +89,7 @@ def _pil_to_rendered(image: Any, *, add_promo: bool = True) -> RenderedImage:
     output = BytesIO()
     if add_promo:
         image = append_dashen_promo(image)
-    image.convert("RGB").save(output, format="PNG", optimize=True)
+    image.convert("RGB").save(output, format="PNG", optimize=False)
     return RenderedImage(content=output.getvalue())
 
 

@@ -488,8 +488,17 @@ class DashenRequestQueue:
                     "[overstats] dashen request dequeued "
                     f"label={label} active={self._active_requests} queued={self._queued_requests}"
                 )
+            _fetch_t0 = time.monotonic()
             try:
-                return await factory()
+                result = await factory()
+            except BaseException:
+                raise
+            else:
+                # 抓取结束即渲染开始，这里打一行边界日志，便于定位渲染卡顿。
+                _fetch_t1 = time.monotonic()
+                _wall_end = time.time()
+                log_fetch_done(label, _wall_end - (_fetch_t1 - _fetch_t0), _wall_end, _qw)
+                return result
             finally:
                 self._active_requests -= 1
                 semaphore.release()
@@ -2282,6 +2291,37 @@ _db_read_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = context
     "overstats_db_read_hits", default=None
 )
 
+# 当前请求的标识（战网 ID / 监听端口），用于抓取完成日志。
+_req_bnet_var: contextvars.ContextVar[str] = contextvars.ContextVar("overstats_req_bnet", default="")
+_req_port_var: contextvars.ContextVar[int] = contextvars.ContextVar("overstats_req_port", default=0)
+
+
+def _clock_ms(epoch_seconds: float) -> str:
+    """HH:MM:SS.mmm，便于在日志里直接对比抓取/渲染时间点。"""
+    return time.strftime("%H:%M:%S", time.localtime(epoch_seconds)) + f".{int((epoch_seconds % 1) * 1000):03d}"
+
+
+def log_fetch_done(label: str, started_at_wall: float, finished_at_wall: float, wait_ms: int) -> None:
+    """抓取阶段结束（= 渲染开始）打印一行：时间 / 战网ID / 端口 / 抓取起止。"""
+    cost_ms = int((finished_at_wall - started_at_wall) * 1000)
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [FETCH DONE] "
+        f"bnet={_req_bnet_var.get() or '-'} port={_req_port_var.get() or '-'} task={label} "
+        f"fetch={_clock_ms(started_at_wall)}->{_clock_ms(finished_at_wall)} ({cost_ms}ms) wait={wait_ms}ms",
+        flush=True,
+    )
+
+
+def _extract_request_bnet(payload: Any) -> str:
+    """从请求体里取战网 ID（不同接口字段名不同，取第一个非空）。"""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("bnet_id", "target_bnet_id", "player", "player1", "full_id", "name"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
 
 def report_db_cache_hit(source: str = "memory", count: int = 1) -> None:
     """Modules call this to report a cache or DB hit.
@@ -2395,6 +2435,10 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         def do_GET(self) -> None:
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
+            try:
+                _req_port_var.set(int(self.server.server_address[1]))
+            except Exception:
+                pass
             self._perf_handler_start = time.monotonic()
             self._perf_service_ms = 0
             self._perf_upstream_ms = 0
@@ -2438,6 +2482,10 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         def do_POST(self) -> None:
             path = self._request_path()
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
+            try:
+                _req_port_var.set(int(self.server.server_address[1]))
+            except Exception:
+                pass
             self._perf_handler_start = time.monotonic()
             self._perf_service_ms = 0
             self._perf_upstream_ms = 0
@@ -5408,6 +5456,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 raise ValueError(f"malformed json body: {exc.msg}") from exc
             if not isinstance(data, dict):
                 raise ValueError("json body must be an object")
+            _req_bnet_var.set(_extract_request_bnet(data))
             return data
 
         def _decode_body(self, raw_body: bytes) -> str:

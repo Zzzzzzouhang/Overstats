@@ -281,7 +281,7 @@ def _scaled_image(image: Any, *, scale: float, cache: dict[float, Any]) -> Any:
 
 def _save_png_bytes(image: Any) -> bytes:
     output = BytesIO()
-    image.save(output, format="PNG", optimize=True)
+    image.save(output, format="PNG", optimize=False)
     return output.getvalue()
 
 

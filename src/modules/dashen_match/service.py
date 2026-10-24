@@ -595,7 +595,7 @@ class DashenMatchModule:
                 )
                 if analysis_result.get("json") is not None:
                     json_data = dict(analysis_result["json"])
-                    json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.locftime())
+                    json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.localtime())
                     analysis_image = render_analysis_report(
                         json_data,
                         target_hero_images=build_target_hero_icons(focus_detail["heroList"], size=40),

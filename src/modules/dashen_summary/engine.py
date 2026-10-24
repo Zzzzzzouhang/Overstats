@@ -37,7 +37,7 @@ TITLE_BY_SCOPE = {
     "week": "本周总结",
 }
 # 0 表示不限制并发；正整数表示同时处理的总结请求数量上限。
-DEFAULT_SUMMARY_CONCURRENCY = 2
+DEFAULT_SUMMARY_CONCURRENCY = 0
 DEFAULT_MATCH_LOOKBACK_DAYS = 8
 DEFAULT_WEATHER_LOOKBACK_DAYS = 45
 DEFAULT_WEATHER_CACHE_TTL = 600
@@ -59,11 +59,26 @@ def _read_env_int(name: str, default: int) -> int:
         return int(default)
 
 
-SUMMARY_CONCURRENCY = max(
-    1,
-    _read_env_int("OVERSTATS_SUMMARY_CONCURRENCY", DEFAULT_SUMMARY_CONCURRENCY),
-)
-SUMMARY_SEMAPHORE = asyncio.Semaphore(SUMMARY_CONCURRENCY)
+class _UnlimitedSemaphore:
+    """不限制并发的异步上下文管理器（SUMMARY_CONCURRENCY=0 时使用）。"""
+
+    async def __aenter__(self) -> "_UnlimitedSemaphore":
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
+_raw_summary_concurrency = _read_env_int("OVERSTATS_SUMMARY_CONCURRENCY", DEFAULT_SUMMARY_CONCURRENCY)
+if _raw_summary_concurrency > 0:
+    SUMMARY_CONCURRENCY = _raw_summary_concurrency
+    SUMMARY_SEMAPHORE = asyncio.Semaphore(SUMMARY_CONCURRENCY)
+    SUMMARY_LIMITED = True
+else:
+    # 0 或负数：不限制并发，不再返回 summary_busy。
+    SUMMARY_CONCURRENCY = 0
+    SUMMARY_SEMAPHORE = _UnlimitedSemaphore()
+    SUMMARY_LIMITED = False
 SUMMARY_MATCH_FETCH_LOOKBACK_DAYS = max(
     8,
     _read_env_int("OVERSTATS_SUMMARY_MATCH_LOOKBACK_DAYS", DEFAULT_MATCH_LOOKBACK_DAYS),
@@ -608,7 +623,7 @@ async def fetch_summary_payload(query: Any) -> Dict[str, Any]:
     title_text = title_for_scope(scope)
     timer = StageTimer()
     timer.mark("REQUEST_START")
-    if SUMMARY_SEMAPHORE.locked():
+    if SUMMARY_LIMITED and SUMMARY_SEMAPHORE.locked():
         timer.mark("MODULE_BUSY", f"summary_concurrency={SUMMARY_CONCURRENCY}")
         raise ModuleError(
             error="summary_busy",
@@ -716,7 +731,7 @@ async def fetch_summary_payload(query: Any) -> Dict[str, Any]:
 async def render_summary_image_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """渲染阶段：由抓取产物生成总结图（与上游一致：循环上渲染 + 同步编码）。
 
-    SUMMARY_SEMAPHORE 与上游一致地覆盖渲染阶段，保证全局最多 2 个总结渲染在飞。
+    SUMMARY_SEMAPHORE 覆盖渲染阶段；SUMMARY_CONCURRENCY=0（默认）时不限制并发。
     """
     runtime = _load_runtime()
     context = payload.get("_render_context") or {}

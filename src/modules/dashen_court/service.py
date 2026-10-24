@@ -571,12 +571,11 @@ async def _call_llm(prompt: str) -> Optional[str]:
         },
     }
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
-    from ..analysis_common import build_async_client, get_analysis_proxy
-    from ..render_base import stage_slot
+    from ..analysis_common import LLM_SEMAPHORE, build_async_client, get_analysis_proxy
 
     proxy = get_analysis_proxy(cfg.base_url)
-    # 等 LLM 返回与渲染共用同一闸门（容量 = 抓取槽位 × 3），不占用抓取槽位。
-    async with stage_slot():
+    # 等 LLM 返回不占用抓取槽位，受全局 LLM 并发槽约束。
+    async with LLM_SEMAPHORE:
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
             try:
                 if cfg.stream:
@@ -626,7 +625,7 @@ async def _call_llm(prompt: str) -> Optional[str]:
 # ── 抓取阶段轮次闸 ──
 # （已废弃）历史版本曾用跨请求信号量把 court 抓取压到 1 个并发、只占 1 个
 # dashen_request_queue 槽位。现与其他指令一致：抓取直接进队列槽（可占满
-# 全部槽位），LLM 阶段在槽外执行并受渲染/AI 闸门约束。
+# 全部槽位），LLM 阶段在槽外执行，受全局 LLM 并发槽约束。
 
 
 @dataclass
@@ -785,9 +784,9 @@ class CourtModule:
         """LLM 阶段（不占用 dashen_request_queue 槽位）：
         调用独立 LLM → 校验 JSON → 落库 → 返回判决书结构。
 
-        与抓取阶段分离后，多个请求可同时处于本阶段并行发送；
-        等待 LLM 返回与渲染共用 render_base.stage_slot 闸门
-        （容量 = 抓取槽位 × 3，可用 OVERSTATS_STAGE_MULTIPLIER 调整）。
+        与抓取阶段分离后，多个请求可同时处于本阶段并行发送，
+        并发上限见 analysis_common.LLM_SEMAPHORE（默认 4，可用
+        OVERSTATS_LLM_MAX_CONCURRENT 调整）。
         """
         query = prepared.query
         full_id = prepared.full_id

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..dashen_promo import append_dashen_promo
+from ..dashen_promo import append_dashen_promo, mark_promo_reserved, promo_reserve_height
 
 from dataclasses import dataclass
 from io import BytesIO
@@ -28,11 +28,6 @@ try:
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
     from src.modules.risk_status import draw_risk_status_badge
-
-try:
-    from overstats.src.modules.render_base import load_image_rgba
-except ModuleNotFoundError:
-    from src.modules.render_base import load_image_rgba
 
 from .requests import fight_payload_has_content, payload_data, sport_payload_has_content
 
@@ -458,8 +453,16 @@ def _decorate_with_header(base_image: Any, *, player_name: str, subtitle: str, r
     from PIL import Image, ImageDraw
 
     header_height = 88
-    canvas = Image.new("RGBA", (base_image.width, base_image.height + header_height), (18, 22, 30, 255))
+    # 底部一次性预留 promo 高度，避免最后 append 再复制整图。
+    promo_height = promo_reserve_height(base_image.width, compact=True)
+    canvas = Image.new(
+        "RGBA",
+        (base_image.width, base_image.height + header_height + promo_height),
+        (18, 22, 30, 255),
+    )
     canvas.paste(base_image, (0, header_height), base_image)
+    if promo_height:
+        mark_promo_reserved(canvas, promo_height)
     draw = ImageDraw.Draw(canvas)
     fonts = _load_fonts()
 
@@ -528,11 +531,13 @@ def _load_background(width: int, height: int, *, rows: int) -> Any:
 
 
 def _load_remote_asset_image(url: str, *, category: str) -> Any:
+    from PIL import Image
+
     asset_path = _find_cached_asset_path(url, category=category)
     if asset_path is None or not asset_path.exists():
         return None
     try:
-        return load_image_rgba(asset_path)
+        return Image.open(asset_path).convert("RGBA")
     except Exception:
         return None
 
@@ -613,10 +618,12 @@ def _safe_float(value: Any) -> float:
 
 
 def _load_local_rgba(path: Path) -> Any:
+    from PIL import Image
+
     if not path.exists():
         return None
     try:
-        return load_image_rgba(path)
+        return Image.open(path).convert("RGBA")
     except Exception:
         return None
 

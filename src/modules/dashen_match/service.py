@@ -19,7 +19,6 @@ try:
     from overstats.src.constants.ranks import get_rank_score
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from overstats.src.modules.errors import ModuleError
-    from overstats.src.modules.render_base import run_render, stage_slot
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
 except ModuleNotFoundError:
     from config import config as app_config
@@ -27,8 +26,8 @@ except ModuleNotFoundError:
     from src.constants.ranks import get_rank_score
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from src.modules.errors import ModuleError
-    from src.modules.render_base import run_render, stage_slot
     from src.modules.risk_status import RiskStatus, parse_risk_status
+from ..analysis_common import LLM_SEMAPHORE
 from ..analysis_common import build_async_client as build_analysis_async_client
 from ..analysis_common import get_analysis_proxy
 
@@ -285,13 +284,13 @@ class DashenMatchModule:
         )
 
     async def render_match_list(self, output: DashenMatchListOutput) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         render_kwargs: Dict[str, Any] = {"full_id": output.full_id}
         if output.footer_lines:
             render_kwargs["footer_lines"] = output.footer_lines
         if output.risk_status is not None:
             render_kwargs["risk_status"] = output.risk_status
-        return await run_render(render_match_list, output.matches, **render_kwargs)
+        return render_match_list(output.matches, **render_kwargs)
 
     async def query_match_list(self, query: DashenMatchQuery, *, render: bool = True) -> DashenMatchListOutput:
         output = await self.fetch_match_list(query, for_render=render)
@@ -346,11 +345,10 @@ class DashenMatchModule:
         )
 
     async def render_match_detail(self, output: DashenMatchDetailOutput) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         safe_query_full_id = _safe_display_identity(output.query_full_id) or UNKNOWN_PLAYER_LABEL
         safe_query_bnet_id = _safe_display_identity(output.query_bnet_id)
-        return await run_render(
-            render_match_detail,
+        return render_match_detail(
             output.detail_root,
             source_match=output.detail.source_match,
             query_full_id=safe_query_full_id,
@@ -526,8 +524,7 @@ class DashenMatchModule:
         target_risk_status = fetched.target_risk_status
         customer_token = fetched.customer_token
 
-        main_image = await run_render(
-            render_match_detail,
+        main_image = render_match_detail(
             detail_root,
             source_match=detail.source_match or source_match,
             query_full_id=query_full_id,
@@ -581,8 +578,7 @@ class DashenMatchModule:
         if fetched.show_all_heroes:
             player_details = fetched.all_player_details
             target_id = fetched.target_id
-            waterfall = await run_render(
-                render_all_players_waterfall,
+            waterfall = render_all_players_waterfall(
                 player_details,
                 match_game_time_sec=detail_root.get("gameTimeSec"),
             )
@@ -600,8 +596,7 @@ class DashenMatchModule:
                 if analysis_result.get("json") is not None:
                     json_data = dict(analysis_result["json"])
                     json_data["generated_at"] = time.strftime("%Y-%m-%d %H:%M", time.locftime())
-                    analysis_image = await run_render(
-                        render_analysis_report,
+                    analysis_image = render_analysis_report(
                         json_data,
                         target_hero_images=build_target_hero_icons(focus_detail["heroList"], size=40),
                         risk_status=target_risk_status,
@@ -614,8 +609,7 @@ class DashenMatchModule:
                 else:
                     replies.append(_text_reply(analysis_result.get("fallback_text") or "AI锐评暂不可用。"))
         else:
-            detail_image = await run_render(
-                render_player_hero_detail,
+            detail_image = render_player_hero_detail(
                 query_full_id,
                 focus_detail,
                 match_game_time_sec=detail_root.get("gameTimeSec"),
@@ -1185,9 +1179,8 @@ class DashenMatchModule:
 
         model = _analysis_model_for_base_url(base_url)
         try:
-            # 等 AI 返回属于渲染/AI 阶段：占用 stage 闸门槽位（抓取槽位的 3 倍量），
-            # 不占用 dashen 抓取槽位，避免阻塞其他指令的抓取。
-            async with stage_slot():
+            # 等 AI 返回不占用 dashen 抓取槽位，受全局 LLM 并发槽约束。
+            async with LLM_SEMAPHORE:
                 raw = await self._call_openai_compatible(
                     self._chat_completion_url(base_url),
                     api_key,

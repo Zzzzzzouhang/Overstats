@@ -1,6 +1,8 @@
 """Shared helpers for LLM (analysis) endpoint calls."""
 from __future__ import annotations
 
+import asyncio
+import os
 from typing import Any, Dict
 
 import httpx
@@ -9,6 +11,22 @@ try:
     from overstats.config import config as app_config
 except ModuleNotFoundError:
     from config import config as app_config
+
+
+def _read_env_int(name: str, default: int) -> int:
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+# 外部 LLM 端点的全局并发上限（shiqu / court / 单局锐评共享）。
+LLM_SEMAPHORE = asyncio.Semaphore(
+    max(1, _read_env_int("OVERSTATS_LLM_MAX_CONCURRENT", 4))
+)
 
 
 def _normalized_base_url(base_url: str) -> str:

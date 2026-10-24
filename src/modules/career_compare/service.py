@@ -13,7 +13,6 @@ from ..dashen_hero_treemap.mini_program import (
 )
 from ..dashen_hero_treemap.requests import normalize_treemap_mode
 from ..errors import ModuleError
-from ..render_base import run_render
 from .metrics import collect_metrics, compare_radar, hero_hours, radar_dimensions, rows
 
 
@@ -166,9 +165,9 @@ class CareerCompareModule:
         return CareerCompareOutput(data, None)
 
     async def render_compare(self, output: CareerCompareOutput):
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         from .render import render_career_compare
-        image = await run_render(render_career_compare, output.data)
+        image = render_career_compare(output.data)
         return CareerCompareOutput(output.data, image)
 
     async def query_compare(self, query: CareerCompareQuery, *, render=False):

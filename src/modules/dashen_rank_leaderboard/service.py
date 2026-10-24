@@ -12,7 +12,6 @@ try:
         strength_score_to_rank,
     )
     from overstats.src.modules.errors import ModuleError
-    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.constants.ranks import (
         RANK_LABELS_CN,
@@ -22,7 +21,6 @@ except ModuleNotFoundError:
         strength_score_to_rank,
     )
     from src.modules.errors import ModuleError
-    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_rank_leaderboard
 from .requests import DashenRankLeaderboardQuery, DashenRankLeaderboardRequests, ROLE_LABELS, normalize_role
@@ -149,9 +147,8 @@ class DashenRankLeaderboardModule:
         )
 
     async def render_rank_leaderboard(self, output: DashenRankLeaderboardOutput) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
-        return await run_render(
-            render_rank_leaderboard,
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
+        return render_rank_leaderboard(
             province=output.province,
             role_label=output.role_label,
             entry_count=output.entry_count,

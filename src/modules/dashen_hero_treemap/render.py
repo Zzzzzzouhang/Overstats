@@ -15,12 +15,10 @@ from ...constants.backgrounds import build_random_map_background
 try:
     from overstats.src.modules.font_resolver import load_font
     from overstats.src.modules.query_tool import get_cached_asset_path
-    from overstats.src.modules.render_base import load_image_rgba
     from overstats.src.modules.risk_status import draw_risk_status_badge
 except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
     from src.modules.query_tool import get_cached_asset_path
-    from src.modules.render_base import load_image_rgba
     from src.modules.risk_status import draw_risk_status_badge
 
 from .engine import ROLE_LABELS, cloud_summary
@@ -209,7 +207,11 @@ def _load_local_background(size: tuple[int, int]) -> Any | None:
         background = ImageEnhance.Color(background).enhance(0.82)
         background = ImageEnhance.Brightness(background).enhance(0.68)
         background = background.filter(ImageFilter.GaussianBlur(radius=20))
-        return Image.alpha_composite(background, Image.new("RGBA", (width, height), (7, 11, 17, 104)))
+        try:
+            background.alpha_composite(Image.new("RGBA", (width, height), (7, 11, 17, 104)))
+        except Exception:
+            background = Image.alpha_composite(background, Image.new("RGBA", (width, height), (7, 11, 17, 104)))
+        return background
     return None
 
 
@@ -687,7 +689,7 @@ def _open_cached_asset(url: Any, categories: Sequence[str]) -> Any | None:
         if path is None or not path.exists():
             continue
         try:
-            return load_image_rgba(path)
+            return Image.open(path).convert("RGBA")
         except Exception:
             continue
     return None

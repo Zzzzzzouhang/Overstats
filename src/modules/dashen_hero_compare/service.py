@@ -10,7 +10,6 @@ from ..dashen_profile.requests import DashenProfileBundle, get_live_dashen_seaso
 from ..dashen_hero_treemap.requests import DashenHeroTreemapQuery, normalize_treemap_mode, is_quick
 from ..dashen_hero_treemap.service import DashenHeroTreemapModule, _prefetch_hero_icons
 from ..dashen_hero_treemap.engine import DashenHeroTreemapEngine, cloud_summary
-from ..render_base import run_render
 
 @dataclass(frozen=True)
 class DashenHeroCompareQuery:
@@ -94,9 +93,9 @@ class DashenHeroCompareModule:
         return CompareOutput(data,None)
 
     async def render_compare(self, output: CompareOutput):
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         from .render import render_compare
-        image=await run_render(render_compare,output.data)
+        image=render_compare(output.data)
         return CompareOutput(output.data,image)
 
     async def query_compare(self, query, *, render=False):

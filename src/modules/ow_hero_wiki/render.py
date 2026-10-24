@@ -22,11 +22,6 @@ except ModuleNotFoundError:
     from src.modules.font_resolver import load_font
     from src.modules.query_tool import get_cached_asset_path
 
-try:
-    from overstats.src.modules.render_base import finalize_rendered_image, load_image_rgba
-except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image, load_image_rgba
-
 
 CARD_FILL = (18, 24, 34, 206)
 CARD_INNER_FILL = (25, 33, 46, 232)
@@ -106,8 +101,10 @@ def render_hero_wiki_error(title: str, message: str) -> RenderedImage:
     body_lines = _wrap_text(draw, str(message or "暂时无法生成英雄资料图"), fonts["body"], box[2] - box[0] - 48 * scale, max_lines=6)
     _draw_multiline(draw, box[0] + 24 * scale, box[1] + 96 * scale, body_lines, fonts["body"], TEXT_SUB, line_gap=8 * scale)
 
+    output = BytesIO()
     canvas = canvas.resize((base_width, base_height), Image.LANCZOS)
-    return RenderedImage(content=finalize_rendered_image(canvas, keep_alpha=True))
+    canvas.save(output, format="PNG")
+    return RenderedImage(content=output.getvalue())
 
 
 def _draw_header(
@@ -1118,7 +1115,7 @@ def _open_cached_or_remote_rgba(url: Any, *, categories: Sequence[str]) -> Any |
     if not cached_bytes:
         return None
     try:
-        return load_image_rgba(cached_bytes)
+        return Image.open(BytesIO(cached_bytes)).convert("RGBA")
     except Exception:
         return None
 

@@ -19,6 +19,7 @@ import sys
 import json
 from functools import lru_cache
 from pathlib import Path
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -28,7 +29,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 try:
     from overstats.src.modules.font_resolver import load_font, resolve_resource_dir
-    from overstats.src.modules.render_base import finalize_rendered_image
     from overstats.src.modules.dashen_promo import append_dashen_promo
     # 复用 shiqu 的 emoji / 标点处理（逐字一致）
     from overstats.src.modules.dashen_shiqu.render import (
@@ -45,7 +45,6 @@ try:
     )
 except ModuleNotFoundError:  # pragma: no cover
     from src.modules.font_resolver import load_font, resolve_resource_dir
-    from src.modules.render_base import finalize_rendered_image
     from src.modules.dashen_promo import append_dashen_promo
     from src.modules.dashen_shiqu.render import (
         _normalize_llm_text,
@@ -231,7 +230,9 @@ def render_court_image(
             draw.text((pad_x, top_y), text, font=font, fill=MUTED_COLOR)
 
     img = append_dashen_promo(img, compact=True)
-    return RenderedImage(content=finalize_rendered_image(img), media_type="image/png")
+    output = BytesIO()
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue(), media_type="image/png")
 
 
 def _assemble_court_text(obj: dict) -> str:
@@ -336,7 +337,9 @@ def _render_court_error(message: str) -> RenderedImage:
     d.text((pad_x, 24), "⚠ 电竞法庭判决书生成失败", font=f_title, fill=ERROR_COLOR)
     _draw_segments(d, img, lines, pad_x, 24 + title_h + 16, f_body, int(f_body.size * 1.55), max_w, _emoji_enabled())
     img = append_dashen_promo(img, compact=True)
-    return RenderedImage(content=finalize_rendered_image(img), media_type="image/png")
+    output = BytesIO()
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue(), media_type="image/png")
 
 
 __all__ = ["RenderedImage", "render_court_image"]

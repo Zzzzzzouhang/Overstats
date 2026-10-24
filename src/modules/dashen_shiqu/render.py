@@ -10,6 +10,7 @@ import re
 import sys
 from functools import lru_cache
 from pathlib import Path
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -19,11 +20,9 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 try:
     from overstats.src.modules.font_resolver import load_font, resolve_resource_dir
-    from overstats.src.modules.render_base import finalize_rendered_image
     from overstats.src.modules.dashen_promo import append_dashen_promo
 except ModuleNotFoundError:  # pragma: no cover
     from src.modules.font_resolver import load_font, resolve_resource_dir
-    from src.modules.render_base import finalize_rendered_image
     from src.modules.dashen_promo import append_dashen_promo
 
 
@@ -824,4 +823,6 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
             _draw_segments(draw, img, lines, pad_x, top_y, font, int(font.size * 1.5), max_w, _emoji_enabled())
 
     img = append_dashen_promo(img, compact=True)
-    return RenderedImage(content=finalize_rendered_image(img), media_type="image/png")
+    output = BytesIO()
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue(), media_type="image/png")

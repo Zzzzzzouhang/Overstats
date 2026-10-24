@@ -10,7 +10,6 @@ try:
     from overstats.src.modules.dashen_profile import get_live_dashen_season
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
-    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.season_config import get_dashen_history_start_season
 except ModuleNotFoundError:
     from src.constants.ranks import get_rank_score, get_rank_sub_tier, raw_rank_score_to_icon_level
@@ -19,7 +18,6 @@ except ModuleNotFoundError:
     from src.modules.dashen_profile import get_live_dashen_season
     from src.modules.errors import ModuleError
     from src.modules.risk_status import RiskStatus, parse_risk_status
-    from src.modules.render_base import run_render
     from src.modules.season_config import get_dashen_history_start_season
 
 from .render import HISTORY_SUBTITLE, RenderedImage, collect_missing_assets, render_rank_history, ensure_season_banners
@@ -114,10 +112,9 @@ class DashenRankHistoryModule:
         )
 
     async def render_rank_history(self, output: DashenRankHistoryOutput) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         try:
-            return await run_render(
-                render_rank_history,
+            return render_rank_history(
                 player_name=output.full_id or output.bnet_id or "Unknown",
                 subtitle=HISTORY_SUBTITLE,
                 seasons=output.seasons,

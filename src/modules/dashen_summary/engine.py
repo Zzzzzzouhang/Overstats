@@ -37,7 +37,7 @@ TITLE_BY_SCOPE = {
     "week": "本周总结",
 }
 # 0 表示不限制并发；正整数表示同时处理的总结请求数量上限。
-DEFAULT_SUMMARY_CONCURRENCY = 0
+DEFAULT_SUMMARY_CONCURRENCY = 2
 DEFAULT_MATCH_LOOKBACK_DAYS = 8
 DEFAULT_WEATHER_LOOKBACK_DAYS = 45
 DEFAULT_WEATHER_CACHE_TTL = 600
@@ -59,24 +59,11 @@ def _read_env_int(name: str, default: int) -> int:
         return int(default)
 
 
-class _UnlimitedSemaphore:
-    """不限制并发的异步上下文管理器，等价于无限信号量。"""
-    async def __aenter__(self) -> "_UnlimitedSemaphore":
-        return self
-    async def __aexit__(self, *exc_info: object) -> bool:
-        return False
-
-
-_raw_summary_concurrency = _read_env_int("OVERSTATS_SUMMARY_CONCURRENCY", DEFAULT_SUMMARY_CONCURRENCY)
-if _raw_summary_concurrency and _raw_summary_concurrency > 0:
-    SUMMARY_CONCURRENCY = _raw_summary_concurrency
-    SUMMARY_SEMAPHORE = asyncio.Semaphore(SUMMARY_CONCURRENCY)
-    SUMMARY_LIMITED = True
-else:
-    # 0 或负数：不限制并发，所有请求正常处理，不再返回 summary_busy。
-    SUMMARY_CONCURRENCY = 0
-    SUMMARY_SEMAPHORE = _UnlimitedSemaphore()
-    SUMMARY_LIMITED = False
+SUMMARY_CONCURRENCY = max(
+    1,
+    _read_env_int("OVERSTATS_SUMMARY_CONCURRENCY", DEFAULT_SUMMARY_CONCURRENCY),
+)
+SUMMARY_SEMAPHORE = asyncio.Semaphore(SUMMARY_CONCURRENCY)
 SUMMARY_MATCH_FETCH_LOOKBACK_DAYS = max(
     8,
     _read_env_int("OVERSTATS_SUMMARY_MATCH_LOOKBACK_DAYS", DEFAULT_MATCH_LOOKBACK_DAYS),
@@ -580,26 +567,19 @@ async def _render_summary_image(
     all_matches: List[Dict[str, Any]],
     timer: StageTimer,
 ) -> str:
-    """渲染阶段：受渲染/AI 闸门约束，不占用抓取槽位。
-
-    注意：``_render_period_image`` 为 async 声明（内部含图片加载 await），
-    必须经 ``_run_summary_render_async`` 在循环上驱动，不能进 executor。
-    """
-    image = await runtime.summary._run_summary_render_async(
-        "period-image",
-        lambda: runtime.summary._render_period_image(
-            render_inputs["stats"],
-            resolved_target,
-            matches,
-            render_inputs["detail_pairs"],
-            title_text,
-            all_matches=all_matches,
-            match_awards=render_inputs["match_awards"],
-            render_stage_log=lambda stage, extra=None: timer.mark(f"RENDER_{stage}", extra),
-        ),
+    """渲染阶段：与上游一致——事件循环上直接渲染 + 同步编码，不占用抓取槽位。"""
+    image = await runtime.summary._render_period_image(
+        render_inputs["stats"],
+        resolved_target,
+        matches,
+        render_inputs["detail_pairs"],
+        title_text,
+        all_matches=all_matches,
+        match_awards=render_inputs["match_awards"],
+        render_stage_log=lambda stage, extra=None: timer.mark(f"RENDER_{stage}", extra),
     )
     timer.mark("RENDER_DONE")
-    image_b64 = await runtime.summary._summary_png_b64_async(image, "period-image")
+    image_b64 = runtime.summary._summary_png_b64(image)
     timer.mark("ENCODE_DONE", f"payload_kb={runtime.summary._base64_payload_kb(image_b64)}")
     return image_b64
 
@@ -628,7 +608,7 @@ async def fetch_summary_payload(query: Any) -> Dict[str, Any]:
     title_text = title_for_scope(scope)
     timer = StageTimer()
     timer.mark("REQUEST_START")
-    if SUMMARY_LIMITED and SUMMARY_SEMAPHORE.locked():
+    if SUMMARY_SEMAPHORE.locked():
         timer.mark("MODULE_BUSY", f"summary_concurrency={SUMMARY_CONCURRENCY}")
         raise ModuleError(
             error="summary_busy",
@@ -734,19 +714,23 @@ async def fetch_summary_payload(query: Any) -> Dict[str, Any]:
 
 
 async def render_summary_image_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """渲染阶段：由抓取产物生成总结图（PIL + 编码均卸载，受渲染/AI 闸门约束）。"""
+    """渲染阶段：由抓取产物生成总结图（与上游一致：循环上渲染 + 同步编码）。
+
+    SUMMARY_SEMAPHORE 与上游一致地覆盖渲染阶段，保证全局最多 2 个总结渲染在飞。
+    """
     runtime = _load_runtime()
     context = payload.get("_render_context") or {}
     render_inputs = payload.get("_render_inputs") or {}
-    image_b64 = await _render_summary_image(
-        runtime,
-        render_inputs,
-        context.get("resolved") or {},
-        context.get("period_matches") or [],
-        context.get("title_text") or "",
-        context.get("weather_matches") or [],
-        context.get("timer") or StageTimer(),
-    )
+    async with SUMMARY_SEMAPHORE:
+        image_b64 = await _render_summary_image(
+            runtime,
+            render_inputs,
+            context.get("resolved") or {},
+            context.get("period_matches") or [],
+            context.get("title_text") or "",
+            context.get("weather_matches") or [],
+            context.get("timer") or StageTimer(),
+        )
     updated = dict(payload)
     updated["image_base64"] = image_b64
     updated["payload_kb"] = runtime.summary._base64_payload_kb(image_b64)

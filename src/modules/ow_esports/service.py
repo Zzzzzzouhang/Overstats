@@ -7,11 +7,9 @@ from typing import Any, Callable, Dict, Optional, Sequence
 try:
     from overstats.config import config as app_config
     from overstats.src.modules.errors import ModuleError
-    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from config import config as app_config
     from src.modules.errors import ModuleError
-    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_ow_esports
 from .requests import OWEsportsRequests, build_ow_esports_sections
@@ -68,7 +66,7 @@ class OWEsportsModule:
         image = None
         if render:
             assets = await self.requests.fetch_logo_assets(rows)
-            image = await run_render(self.renderer, sections, requested_region=requested, region=effective,
+            image = self.renderer(sections, requested_region=requested, region=effective,
                                      generated_at=generated_at, logo_assets=assets)
         return OWEsportsOutput(generated_at=generated_at, realtime=True, rows=tuple(rows),
                                sections=tuple(sections), image=image, requested_region=requested, region=effective)

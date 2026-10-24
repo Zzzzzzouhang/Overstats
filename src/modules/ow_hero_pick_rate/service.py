@@ -12,7 +12,6 @@ try:
         COMPETITIVE_STRENGTH_THEME,
         QUICK_STRENGTH_THEME,
     )
-    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.db import HERO_LEADERBOARD_CN_TABLE, OWHeroLeaderboardDB
     from src.modules.errors import ModuleError
@@ -21,7 +20,6 @@ except ModuleNotFoundError:
         COMPETITIVE_STRENGTH_THEME,
         QUICK_STRENGTH_THEME,
     )
-    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_pick_rate_history, render_pick_rate_ranking, render_pick_rate_overview
 from .requests import (
@@ -186,8 +184,7 @@ class OWHeroPickRateModule:
             if render:
                 theme = self._theme_for_game_mode(resolved_query.game_mode)
                 renderer = render_pick_rate_overview if output.view == VIEW_OVERVIEW else render_pick_rate_ranking
-                image = await run_render(
-                    renderer,
+                image = renderer(
                     game_mode=resolved_query.game_mode,
                     mmr=resolved_query.mmr,
                     snapshot=output.snapshot.to_dict() if output.snapshot else {},
@@ -220,8 +217,7 @@ class OWHeroPickRateModule:
             output = replace(output, patch_events=labeled_events, patch_dates_available=available)
         if render:
             theme = self._theme_for_game_mode(resolved_query.game_mode)
-            image = await run_render(
-                render_pick_rate_history,
+            image = render_pick_rate_history(
                 game_mode=resolved_query.game_mode,
                 mmr=resolved_query.mmr,
                 hero=output.hero.to_dict() if output.hero else {},

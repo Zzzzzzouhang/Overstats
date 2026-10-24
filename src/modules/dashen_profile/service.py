@@ -7,12 +7,10 @@ try:
     from overstats.src.client.apiclient import DashenAPIClient
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
-    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient
     from src.modules.errors import ModuleError
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
-    from src.modules.render_base import run_render
 
 from .engine import DashenProfileEngine
 from .render import RenderedImage, render_profile_summary
@@ -77,7 +75,7 @@ class DashenProfileModule:
         *,
         render_mode: str = "quick",
     ) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         try:
             context = await self.engine.build_render_context(
                 output.bundle,
@@ -85,7 +83,7 @@ class DashenProfileModule:
                 avatar_bytes=output.avatar_bytes,
                 render_mode=render_mode,
             )
-            return await run_render(render_profile_summary, context)
+            return render_profile_summary(context)
         except RuntimeError as exc:
             raise ModuleError(
                 error="render_dependency_missing",

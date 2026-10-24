@@ -63,7 +63,7 @@ class DashenSummaryModule:
         return DashenSummaryFetched(query=query, resolved_bnet=resolved_bnet, payload=payload)
 
     async def render_summary(self, fetched: DashenSummaryFetched) -> DashenSummaryOutput:
-        """渲染阶段：PIL 渲染 + 编码，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：PIL 渲染 + 编码，在事件循环上直接执行（与上游一致），不占用抓取槽位。"""
         payload = await render_summary_image_from_payload(fetched.payload)
         image_bytes, image_media_type = decode_summary_image_base64(payload.get("image_base64") or "")
         full_id = str(payload.get("full_id") or fetched.query.full_id or fetched.query.bnet_id).strip()

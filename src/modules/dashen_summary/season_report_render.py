@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from ..map_modes import draw_map_mode_icon
 
-from ..dashen_promo import append_dashen_promo
+from ..dashen_promo import append_dashen_promo, mark_promo_reserved, promo_reserve_height
 
 import datetime as dt
 import html
@@ -152,9 +152,18 @@ async def render_report(report, role_id):
         urls.extend(p["icon"] for p in perks_for(row))
     urls.extend(s._hero_icon_url(g) for g in guids if g)
     await s._prefetch_summary_images(urls)
-    canvas = await s._make_period_background((1400, cursor + 24), [])
+    # 底部一次性预留 promo 高度，避免最后 append 再复制整图。
+    promo_height = promo_reserve_height(1400, compact=False)
+    canvas = await s._make_period_background((1400, cursor + 24 + promo_height), [])
+    if promo_height:
+        mark_promo_reserved(canvas, promo_height)
     # Additional dark tint keeps the extended page and smaller labels legible.
-    canvas = Image.alpha_composite(canvas.convert("RGBA"), Image.new("RGBA", canvas.size, (5, 10, 18, 55)))
+    if canvas.mode != "RGBA":
+        canvas = canvas.convert("RGBA")
+    try:
+        canvas.alpha_composite(Image.new("RGBA", canvas.size, (5, 10, 18, 55)))
+    except Exception:
+        canvas = Image.alpha_composite(canvas, Image.new("RGBA", canvas.size, (5, 10, 18, 55)))
     draw = ImageDraw.Draw(canvas, "RGBA")
 
     def text(x, y, value, size=20, color=WHITE, width=570, bold=False):

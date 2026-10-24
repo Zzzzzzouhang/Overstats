@@ -12,6 +12,8 @@ except ModuleNotFoundError:
 
 ASSET_DIR = Path(__file__).resolve().parents[2] / "res" / "dashen_promo"
 PROMO_URL = "https://act.ds.163.com/f0834ac50394246e/"
+# 画布上标记"底部已预留 promo 高度"的属性名。
+PROMO_RESERVED_ATTR = "_promo_reserved_height"
 
 
 def is_dashen_promo_enabled() -> bool:
@@ -112,6 +114,25 @@ def _footer(width: int, compact: bool = False) -> Any:
     return background
 
 
+def promo_reserve_height(width: int, *, compact: bool = True) -> int:
+    """调用方在创建画布时可预留的底部高度；未启用时返回 0。"""
+    if not is_dashen_promo_enabled():
+        return 0
+    try:
+        return int(_footer(max(1, int(width)), compact).height)
+    except Exception:
+        return 0
+
+
+def mark_promo_reserved(canvas: Any, height: int) -> Any:
+    """标记画布底部已预留 promo 区域，append 时原地绘制、不再复制整图。"""
+    try:
+        setattr(canvas, PROMO_RESERVED_ATTR, max(0, int(height)))
+    except Exception:
+        pass
+    return canvas
+
+
 def append_dashen_promo(image: Any, *, compact: bool = True) -> Any:
     """Extend the bottom only; disabled calls return the original image untouched."""
     if not is_dashen_promo_enabled():
@@ -119,8 +140,14 @@ def append_dashen_promo(image: Any, *, compact: bool = True) -> Any:
     from PIL import Image
 
     footer = _footer(image.width, compact)
+    reserved = int(getattr(image, PROMO_RESERVED_ATTR, 0) or 0)
+    if reserved == footer.height and image.height >= footer.height:
+        # 画布已预留底部区域：原地绘制，省一次整图复制（1400x2500 约 13.4MB / 2.6ms）。
+        image.paste(footer, (0, image.height - footer.height))
+        return image
     mode = "RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB"
     result = Image.new(mode, (image.width, image.height + footer.height))
-    result.paste(image.convert(mode), (0, 0))
+    # convert(mode) 在 mode 相同时也会整图复制，这里只为真正需要换模式时复制一次。
+    result.paste(image if image.mode == mode else image.convert(mode), (0, 0))
     result.paste(footer, (0, image.height))
     return result

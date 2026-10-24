@@ -8,11 +8,6 @@ from ..dashen_promo import append_dashen_promo
 
 from collections import defaultdict
 from io import BytesIO
-
-try:
-    from overstats.src.modules.render_base import finalize_rendered_image
-except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image
 import math
 import re
 from typing import Any, Dict, List, Optional, Sequence
@@ -91,9 +86,11 @@ HIGHLIGHT_COLORS = {
 
 
 def _pil_to_rendered(image: Any, *, add_promo: bool = True) -> RenderedImage:
+    output = BytesIO()
     if add_promo:
         image = append_dashen_promo(image)
-    return RenderedImage(content=finalize_rendered_image(image, gc_collect=True))
+    image.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _open_rendered(rendered: RenderedImage) -> Any:

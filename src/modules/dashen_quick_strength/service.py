@@ -8,14 +8,12 @@ try:
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.query_tool import load_query_tool
-    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from src.modules.errors import ModuleError
     from src.modules.query_tool import load_query_tool
-    from src.modules.render_base import run_render
     from src.modules.risk_status import RiskStatus, parse_risk_status
 
 from .engine import DashenQuickStrengthEngine, normalize_limit
@@ -199,10 +197,9 @@ class DashenQuickStrengthModule:
         )
 
     async def render_quick_strength(self, output: DashenQuickStrengthOutput) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         try:
-            return await run_render(
-                render_quick_strength,
+            return render_quick_strength(
                 player_name=output.full_id,
                 bnet_id=output.bnet_id,
                 summary=output.summary.to_dict(),

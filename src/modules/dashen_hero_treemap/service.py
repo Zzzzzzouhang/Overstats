@@ -8,12 +8,10 @@ try:
     from overstats.src.client.apiclient import DashenAPIClient
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
-    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.client.apiclient import DashenAPIClient
     from src.modules.errors import ModuleError
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
-    from src.modules.render_base import run_render
 
 from .engine import DashenHeroTreemapEngine, DashenHeroTreemapHero, DashenHeroTreemapPlayer, DashenHeroTreemapSeason
 from .engine import cloud_summary
@@ -108,9 +106,8 @@ class DashenHeroTreemapModule:
         return output
 
     async def render_treemap(self, output: DashenHeroTreemapOutput) -> DashenHeroTreemapOutput:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
-        image = await run_render(
-            render_hero_treemap,
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
+        image = render_hero_treemap(
             player=output.player.to_dict(),
             season=output.season.to_dict(),
             mode=output.mode,

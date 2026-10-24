@@ -7,6 +7,7 @@ from ..subroles import draw_subrole_badge, get_subrole
 from ..dashen_promo import append_dashen_promo
 
 from dataclasses import dataclass
+from io import BytesIO
 import math
 from pathlib import Path
 import time
@@ -28,11 +29,6 @@ try:
     from overstats.src.constants.ranks import get_rank_name, get_rank_score, get_rank_sub_tier, rank_info_to_icon_level, rank_name_to_icon_level
 except ModuleNotFoundError:
     from src.constants.ranks import get_rank_name, get_rank_score, get_rank_sub_tier, rank_info_to_icon_level, rank_name_to_icon_level
-
-try:
-    from overstats.src.modules.render_base import finalize_rendered_image, load_image_rgba
-except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image, load_image_rgba
 
 from .engine import HeroBillboardEntry, HeroUsageRow, ProfileRenderContext, RolePanelEntry
 
@@ -161,8 +157,10 @@ def render_profile_summary(context: ProfileRenderContext) -> RenderedImage:
     )
     _draw_recent_match_timeline(image, config, context.recent_matches, fonts)
 
+    output = BytesIO()
     image = append_dashen_promo(image, compact=True)
-    return RenderedImage(content=finalize_rendered_image(image, keep_alpha=True, gc_collect=True))
+    image.save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _draw_name_block(
@@ -1275,7 +1273,7 @@ def _build_rank_icon(
     if not path.exists():
         return None
     try:
-        icon = load_image_rgba(path)
+        icon = Image.open(path).convert("RGBA")
     except Exception:
         return None
     original_width, original_height = icon.size
@@ -1320,7 +1318,7 @@ def _load_rank_pure_icon(rank_level: int) -> Any | None:
     if not path.exists():
         return None
     try:
-        return load_image_rgba(path)
+        return Image.open(path).convert("RGBA")
     except Exception:
         return None
 
@@ -1356,7 +1354,7 @@ def _load_level_tier_icon(level_tier: int) -> Any | None:
     if not path.exists():
         return None
     try:
-        return load_image_rgba(path)
+        return Image.open(path).convert("RGBA")
     except Exception:
         return None
 
@@ -1417,7 +1415,7 @@ def _draw_avatar(image: Any, avatar_bytes: bytes | None, pos: tuple[int, int], s
 
     if avatar_bytes:
         try:
-            avatar = load_image_rgba(avatar_bytes)
+            avatar = Image.open(BytesIO(avatar_bytes)).convert("RGBA")
             avatar = ImageOps.fit(avatar, size, method=_resampling_lanczos())
             image.paste(avatar, pos, avatar)
             return
@@ -1438,7 +1436,7 @@ def _load_background() -> Any:
         if not path.exists():
             continue
         try:
-            return load_image_rgba(path)
+            return Image.open(path).convert("RGBA")
         except Exception:
             continue
     return Image.new("RGBA", (2560, 1300), (245, 247, 250, 255))
@@ -1490,7 +1488,7 @@ def _load_remote_asset_image(url: Any, category: str = "misc") -> Any | None:
     if asset_path is None or not asset_path.exists():
         return None
     try:
-        return load_image_rgba(asset_path)
+        return Image.open(asset_path).convert("RGBA")
     except Exception:
         return None
 

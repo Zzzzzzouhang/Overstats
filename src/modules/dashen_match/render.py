@@ -4,9 +4,10 @@ from ..map_modes import draw_map_mode_icon
 
 from ..subroles import draw_subrole_badge, get_subrole
 
-from ..dashen_promo import append_dashen_promo
+from ..dashen_promo import append_dashen_promo, mark_promo_reserved, promo_reserve_height
 
 from dataclasses import dataclass
+from io import BytesIO
 import json
 from pathlib import Path
 import re
@@ -25,8 +26,11 @@ except ModuleNotFoundError:
     from src.modules.font_resolver import load_font, resolve_resource_dir
 
 try:
-    from overstats.src.modules.render_base import finalize_rendered_image, load_image_rgba
     from overstats.src.modules.risk_status import draw_risk_status_badge, measure_risk_status_badge
+except ModuleNotFoundError:
+    from src.modules.risk_status import draw_risk_status_badge, measure_risk_status_badge
+
+try:
     from overstats.src.constants.ranks import (
         get_rank_name,
         get_rank_score,
@@ -37,8 +41,6 @@ try:
         strength_score_to_rank,
     )
 except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image, load_image_rgba
-    from src.modules.risk_status import draw_risk_status_badge, measure_risk_status_badge
     from src.constants.ranks import (
         get_rank_name,
         get_rank_score,
@@ -102,7 +104,11 @@ def render_match_list(
         rendered_footer_lines.append(effective_hint_text)
     footer_h = max(58, 24 + 22 * max(len(rendered_footer_lines), 1))
     img_h = row_h * max(len(recent_matches), 1) + 70 + footer_h
-    img = Image.new("RGBA", (900, img_h), (22, 23, 30, 255))
+    # 底部一次性预留 promo 高度（footer_top 仍按 img_h 计算，内容区不变）。
+    promo_height = promo_reserve_height(900, compact=True)
+    img = Image.new("RGBA", (900, img_h + promo_height), (22, 23, 30, 255))
+    if promo_height:
+        mark_promo_reserved(img, promo_height)
     draw = ImageDraw.Draw(img, "RGBA")
 
     font_title = _font(24)
@@ -151,8 +157,10 @@ def render_match_list(
             font=font_sm,
         )
 
+    output = BytesIO()
     img = append_dashen_promo(img)
-    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _draw_title_with_risk_statuses(
@@ -261,7 +269,7 @@ def _render_scoreboard_match_detail(
 
     template_path = RESOURCE_DIR / "score_board.png"
     if template_path.exists():
-        img = load_image_rgba(template_path)
+        img = Image.open(template_path).convert("RGBA")
     else:
         img = Image.new("RGBA", (1825, 994), (24, 26, 34, 255))
         ImageDraw.Draw(img).rectangle((1125, 0, 1825, 994), fill=(32, 35, 45, 255))
@@ -339,8 +347,10 @@ def _render_scoreboard_match_detail(
         query_customer_token=query_customer_token,
     )
 
+    output = BytesIO()
     img = append_dashen_promo(img)
-    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _extract_match_detail_data(payload: Any) -> Dict[str, Any]:
@@ -634,8 +644,10 @@ def _render_fight_match_detail(
             row_y += row_h
         y += round_h + round_gap
 
+    output = BytesIO()
     img = append_dashen_promo(img)
-    return RenderedImage(content=finalize_rendered_image(img, gc_collect=True))
+    img.convert("RGB").save(output, format="PNG", optimize=True)
+    return RenderedImage(content=output.getvalue())
 
 
 def _match_stat_text(match: Dict[str, Any], key: str) -> str:
@@ -709,7 +721,7 @@ def _draw_detail_map_background(img: Any, map_info: Dict[str, Any], width: int, 
     try:
         from PIL import Image
 
-        icon = load_image_rgba(local_path)
+        icon = Image.open(local_path).convert("RGBA")
         bg = _crop_center_to_size(icon, (width, height))
         overlay = Image.new("RGBA", (width, height), (0, 0, 0, 125))
         img.paste(bg, (0, 0))
@@ -1197,7 +1209,7 @@ def _build_rank_badge_image(rank_info: Dict[str, Any], *, width: int, height: in
     if asset_path is None or not asset_path.exists():
         return None
     try:
-        icon = load_image_rgba(asset_path)
+        icon = Image.open(asset_path).convert("RGBA")
     except Exception:
         return None
 
@@ -1258,7 +1270,10 @@ def _draw_map_background(img: Any, map_info: Dict[str, Any], y: int) -> None:
         with Image.open(local_path) as source:
             bg = _crop_center_to_size(source.convert("RGBA"), (860, 72))
         shade = Image.new("RGBA", bg.size, (10, 17, 28, 125))
-        bg = Image.alpha_composite(bg, shade)
+        try:
+            bg.alpha_composite(shade)
+        except Exception:
+            bg = Image.alpha_composite(bg, shade)
         mask = Image.new("L", bg.size, 0)
         ImageDraw.Draw(mask).rounded_rectangle((0, 0, 859, 71), radius=9, fill=255)
         gradient = Image.new("L", (860, 1))
@@ -1279,7 +1294,7 @@ def _paste_map_image(img: Any, map_info: Dict[str, Any], pos: tuple[int, int], s
     try:
         from PIL import Image
 
-        icon = load_image_rgba(path)
+        icon = Image.open(path).convert("RGBA")
         bg = _crop_center_to_size(icon, size)
         img.paste(bg, pos)
     except Exception:
@@ -1301,7 +1316,7 @@ def _paste_icon_from_url(
     try:
         from PIL import Image
 
-        icon = _resize_image(load_image_rgba(path), size)
+        icon = _resize_image(Image.open(path).convert("RGBA"), size)
         img.paste(icon, pos, icon)
         return True
     except Exception:
@@ -1441,7 +1456,7 @@ def _paste_perk_icon(img: Any, url: Any, pos: tuple[int, int], icon_width: int) 
     try:
         from PIL import Image
 
-        icon = load_image_rgba(path)
+        icon = Image.open(path).convert("RGBA")
         if icon.width <= 0 or icon.height <= 0:
             return False
         icon_height = max(1, int(icon.height * icon_width / icon.width))
@@ -1476,7 +1491,7 @@ def _draw_perks(draw: Any, img: Any, config: Dict[str, Any], perks: Sequence[Dic
             try:
                 from PIL import Image
 
-                bg = _resize_image(load_image_rgba(bg_path), (size, size))
+                bg = _resize_image(Image.open(bg_path).convert("RGBA"), (size, size))
                 img.paste(bg, (x, py), bg)
             except Exception:
                 draw.rectangle((x, py, x + size, py + size), outline=(255, 190, 60))

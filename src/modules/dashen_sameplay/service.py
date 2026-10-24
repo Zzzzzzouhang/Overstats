@@ -28,7 +28,6 @@ try:
     )
     from overstats.src.modules.dashen_match.requests import get_recent_dashen_seasons, iter_dashen_season_request_values
     from overstats.src.modules.errors import ModuleError
-    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
 except ModuleNotFoundError:
     from src.modules.dashen_match import DashenMatchQuery, DashenMatchRequests, dashen_match_module
@@ -49,7 +48,6 @@ except ModuleNotFoundError:
     )
     from src.modules.dashen_match.requests import get_recent_dashen_seasons, iter_dashen_season_request_values
     from src.modules.errors import ModuleError
-    from src.modules.render_base import run_render
     from src.modules.risk_status import RiskStatus, parse_risk_status
 
 
@@ -287,7 +285,7 @@ class DashenSameplayModule:
         )
 
     async def render_sameplay_list(self, output: DashenSameplayListOutput) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         player1, player2 = output.player1, output.player2
         render_kwargs: Dict[str, Any] = {
             "title": f"{player1.display_name} & {player2.display_name} 同玩对局",
@@ -299,7 +297,7 @@ class DashenSameplayModule:
                 (player1.display_name, player1.risk_status),
                 (player2.display_name, player2.risk_status),
             ]
-        return await run_render(render_match_list, output.matches, **render_kwargs)
+        return render_match_list(output.matches, **render_kwargs)
 
     async def query_sameplay_list(self, query: DashenSameplayQuery, *, render: bool = True) -> DashenSameplayListOutput:
         output = await self.fetch_sameplay_list(query)
@@ -431,8 +429,7 @@ class DashenSameplayModule:
         detail_root = fetched.detail_root
         source_player_index = fetched.main_detail_source_player
 
-        main_image = await run_render(
-            render_match_detail,
+        main_image = render_match_detail(
             detail_root,
             source_match=fetched.source_match,
             query_full_id=player1.full_id,
@@ -454,8 +451,7 @@ class DashenSameplayModule:
         notes = list(fetched.notes)
         if fetched.show_all_heroes and fetched.all_player_details:
             focus_player = player1 if source_player_index == 1 else fetched.player2
-            waterfall_image = await run_render(
-                render_all_players_waterfall,
+            waterfall_image = render_all_players_waterfall(
                 fetched.all_player_details,
                 match_game_time_sec=detail_root.get("gameTimeSec"),
             )
@@ -487,8 +483,7 @@ class DashenSameplayModule:
                         ),
                         {},
                     )
-                    analysis_image = await run_render(
-                        render_analysis_report,
+                    analysis_image = render_analysis_report(
                         json_data,
                         target_hero_images=build_target_hero_icons(focus_detail.get("heroList") or [], size=40),
                         map_name=map_name_for_match(detail_root),
@@ -1015,8 +1010,7 @@ class DashenSameplayModule:
         }
         if not focus_detail["heroList"]:
             return None
-        image = await run_render(
-            render_player_hero_detail,
+        image = render_player_hero_detail(
             player.display_name,
             focus_detail,
             match_game_time_sec=detail_root.get("gameTimeSec"),

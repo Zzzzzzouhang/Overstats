@@ -1,20 +1,29 @@
-"""渲染并发闸门（兼容层）。
+import asyncio
+import os
 
-实现已上移到 src/modules/render_base.py（全局共享的渲染/AI 二段闸门，
-容量 = 抓取槽位 × 3）。本文件仅保留转发，供既有
-`from .render_gate import get_global_render_limit, get_global_render_semaphore`
-的调用方使用。
-"""
 
-try:
-    from overstats.src.modules.render_base import (
-        get_global_render_limit,
-        get_global_render_semaphore,
-    )
-except ModuleNotFoundError:  # 直接以 src.* 路径运行
-    from src.modules.render_base import (  # type: ignore[no-redef]
-        get_global_render_limit,
-        get_global_render_semaphore,
-    )
+def _read_env_int(name, default):
+    raw_value = str(os.getenv(name, "") or "").strip()
+    if not raw_value:
+        return int(default)
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError):
+        return int(default)
 
-__all__ = ["get_global_render_limit", "get_global_render_semaphore"]
+
+GLOBAL_RENDER_CONCURRENCY = max(1, _read_env_int("OVERSHOP_RENDER_CONCURRENCY", 2))
+_GLOBAL_RENDER_SEMAPHORE_BY_LOOP = {}
+
+
+def get_global_render_limit():
+    return GLOBAL_RENDER_CONCURRENCY
+
+
+def get_global_render_semaphore():
+    loop = asyncio.get_running_loop()
+    semaphore = _GLOBAL_RENDER_SEMAPHORE_BY_LOOP.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(GLOBAL_RENDER_CONCURRENCY)
+        _GLOBAL_RENDER_SEMAPHORE_BY_LOOP[loop] = semaphore
+    return semaphore

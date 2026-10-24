@@ -1,6 +1,6 @@
 from ...map_modes import draw_map_mode_icon
 from ...subroles import draw_subrole_badge, get_subrole
-from ...dashen_promo import append_dashen_promo
+from ...dashen_promo import append_dashen_promo, mark_promo_reserved, promo_reserve_height
 
 import asyncio
 import base64
@@ -10,19 +10,16 @@ import json
 import os
 import random
 import re
+import tempfile
 import threading
 import time
 from collections import Counter, OrderedDict, defaultdict
 from functools import partial
 from math import ceil
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-try:
-    from overstats.src.modules.render_base import finalize_rendered_image, load_image_rgba
-except ModuleNotFoundError:
-    from src.modules.render_base import finalize_rendered_image, load_image_rgba
 
 from ....constants.backgrounds import build_random_map_background
 from ....constants.ranks import get_rank_score, normalize_raw_rank_bucket, raw_rank_score_to_strength, get_rank_name, get_rank_sub_tier, rank_name_cn, rank_info_to_icon_level, strength_score_to_rank
@@ -101,28 +98,32 @@ _SEASON_SUMMARY_URL_SEMAPHORES = {}
 _SEASON_SUMMARY_COMMAND_BUSY = False
 _SUMMARY_IMAGE_CACHE = OrderedDict()
 _SUMMARY_IMAGE_CACHE_BYTES_BY_URL = {}
-_SUMMARY_IMAGE_CACHE_TS = {}
 _SUMMARY_COVER_CACHE = OrderedDict()
 _SUMMARY_COVER_CACHE_BYTES_BY_KEY = {}
-_SUMMARY_FONT_CACHE = OrderedDict()
-_SUMMARY_MASK_CACHE = OrderedDict()
+_SUMMARY_FONT_CACHE = {}
+_SUMMARY_MASK_CACHE = {}
 _SUMMARY_STATMAP_REFERENCE_CACHE = OrderedDict()
 _SUMMARY_DETAIL_CACHE = OrderedDict()
 _LAST_SUMMARY_DETAIL_DECISIONS = []
 SUMMARY_PRELOAD_IMAGES_ENABLED = os.getenv("OVERSTATS_PRELOAD_IMAGES", "1").strip().lower() not in {"0", "false", "no", "off"}
-# Preloaded hero/map icon images. Default budget lowered to 32MB for
-# low-memory hosts; floor is 32MB so it cannot be trimmed further via env.
-SUMMARY_PRELOAD_IMAGE_BUDGET_MB = max(32, _read_env_int("OVERSTATS_SUMMARY_PRELOAD_IMAGE_MB", 32))
+# 图标 RAM 热层：只保留活跃玩家的常用图标；未命中落回磁盘（get_icon 读 res/cache_img）。
+SUMMARY_PRELOAD_IMAGE_BUDGET_MB = max(8, _read_env_int("OVERSTATS_SUMMARY_PRELOAD_IMAGE_MB", 32))
 SUMMARY_PRELOAD_IMAGE_BUDGET_BYTES = SUMMARY_PRELOAD_IMAGE_BUDGET_MB * 1024 * 1024
 SUMMARY_IMAGE_CACHE_MAX_BYTES = SUMMARY_PRELOAD_IMAGE_BUDGET_BYTES
-# Preloaded images are only useful during an active render session. Expire
-# them after this idle window so the budget can be reclaimed during quiet
-# periods instead of lingering at the cap indefinitely.
-SUMMARY_IMAGE_CACHE_TTL_SEC = max(300, _read_env_int("OVERSTATS_SUMMARY_IMAGE_TTL_SEC", 1800))
-SUMMARY_COVER_CACHE_BUDGET_MB = max(32, _read_env_int("OVERSTATS_SUMMARY_COVER_CACHE_MB", 32))
+# 封面 RAM 热层：合成结果落盘（cache/render_cover），RAM 只留少量热数据。
+SUMMARY_COVER_CACHE_BUDGET_MB = max(2, _read_env_int("OVERSTATS_SUMMARY_COVER_CACHE_MB", 8))
 SUMMARY_COVER_CACHE_MAX_BYTES = SUMMARY_COVER_CACHE_BUDGET_MB * 1024 * 1024
-SUMMARY_FONT_CACHE_MAX = max(16, _read_env_int("OVERSTATS_SUMMARY_FONT_CACHE_MAX", 256))
-SUMMARY_MASK_CACHE_MAX = max(64, _read_env_int("OVERSTATS_SUMMARY_MASK_CACHE_MAX", 512))
+SUMMARY_COVER_DISK_CACHE_ENABLED = os.getenv("OVERSTATS_SUMMARY_COVER_DISK_CACHE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SUMMARY_COVER_DISK_CACHE_DIR = PROJECT_ROOT / "cache" / "render_cover"
+SUMMARY_COVER_DISK_CACHE_MAX_BYTES = (
+    max(64, _read_env_int("OVERSTATS_SUMMARY_COVER_DISK_CACHE_MB", 512)) * 1024 * 1024
+)
+_SUMMARY_COVER_DISK_WRITES = {"count": 0}
 SUMMARY_STATMAP_REFERENCE_CACHE_MAX = max(128, _read_env_int("OVERSTATS_SUMMARY_STATMAP_REF_CACHE_MAX", 2048))
 SUMMARY_DETAIL_CACHE_TTL = max(60, _read_env_int("OVERSTATS_SUMMARY_DETAIL_CACHE_TTL", 1800))
 SUMMARY_DETAIL_CACHE_MAX = max(128, _read_env_int("OVERSTATS_SUMMARY_DETAIL_CACHE_MAX", 2048))
@@ -165,13 +166,28 @@ async def _ensure_resolved_target_risk_status(resolved_target):
 
 def _summary_png_b64(image):
     image = append_dashen_promo(image, compact=False)
-    data = finalize_rendered_image(
-        image,
-        format="JPEG",
-        jpeg_quality=SUMMARY_IMAGE_JPEG_QUALITY,
-        gc_collect=True,
-    )
-    return "base64://" + base64.b64encode(data).decode("utf-8")
+    out = BytesIO()
+    # 已是 RGB 时 convert 会白白整图复制一次（1400x5000 约 20MB），这里直接复用。
+    rgb = image if image.mode == "RGB" else image.convert("RGB")
+    try:
+        rgb.save(
+            out,
+            format="JPEG",
+            quality=SUMMARY_IMAGE_JPEG_QUALITY,
+            optimize=False,
+            progressive=False,
+            subsampling=1,
+        )
+    except OSError:
+        rgb.save(
+            out,
+            format="JPEG",
+            quality=max(65, SUMMARY_IMAGE_JPEG_QUALITY - 6),
+            optimize=False,
+            progressive=False,
+            subsampling=1,
+        )
+    return "base64://" + base64.b64encode(out.getvalue()).decode("utf-8")
 
 
 def _base64_payload_kb(image_b64):
@@ -484,17 +500,8 @@ def _estimate_summary_image_bytes(image):
 
 
 def _get_cached_summary_image_copy(url):
-    global _SUMMARY_PRELOAD_IMAGE_BYTES
     cached = _SUMMARY_IMAGE_CACHE.get(url)
     if cached is None:
-        return None
-    ts = _SUMMARY_IMAGE_CACHE_TS.get(url, 0)
-    if ts and (time.monotonic() - ts) > SUMMARY_IMAGE_CACHE_TTL_SEC:
-        # Expired: drop and report a miss so the caller can re-fetch.
-        with _SUMMARY_PRELOAD_LOCK:
-            _SUMMARY_IMAGE_CACHE.pop(url, None)
-            _SUMMARY_IMAGE_CACHE_TS.pop(url, None)
-            _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(url, 0))
         return None
     try:
         _SUMMARY_IMAGE_CACHE.move_to_end(url)
@@ -504,18 +511,7 @@ def _get_cached_summary_image_copy(url):
 
 
 def _has_cached_summary_image(url):
-    global _SUMMARY_PRELOAD_IMAGE_BYTES
-    cached = _SUMMARY_IMAGE_CACHE.get(url)
-    if cached is None:
-        return False
-    ts = _SUMMARY_IMAGE_CACHE_TS.get(url, 0)
-    if ts and (time.monotonic() - ts) > SUMMARY_IMAGE_CACHE_TTL_SEC:
-        with _SUMMARY_PRELOAD_LOCK:
-            _SUMMARY_IMAGE_CACHE.pop(url, None)
-            _SUMMARY_IMAGE_CACHE_TS.pop(url, None)
-            _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(url, 0))
-        return False
-    return True
+    return str(url or "").strip() in _SUMMARY_IMAGE_CACHE
 
 
 def _put_summary_image_cache(url, image):
@@ -532,33 +528,110 @@ def _put_summary_image_cache(url, image):
             _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(url, 0))
         _SUMMARY_IMAGE_CACHE[url] = image.copy()
         _SUMMARY_IMAGE_CACHE_BYTES_BY_URL[url] = estimated_bytes
-        _SUMMARY_IMAGE_CACHE_TS[url] = time.monotonic()
         _SUMMARY_PRELOAD_IMAGE_BYTES += estimated_bytes
 
-        while _SUMMARY_PRELOAD_IMAGE_BYTES > SUMMARY_IMAGE_CACHE_MAX_BYTES:
-            if not _SUMMARY_IMAGE_CACHE:
-                break
+        while (
+            _SUMMARY_PRELOAD_IMAGE_BYTES > SUMMARY_IMAGE_CACHE_MAX_BYTES
+            and len(_SUMMARY_IMAGE_CACHE) > 1
+        ):
             old_url, _ = _SUMMARY_IMAGE_CACHE.popitem(last=False)
             _SUMMARY_PRELOAD_IMAGE_BYTES -= int(_SUMMARY_IMAGE_CACHE_BYTES_BY_URL.pop(old_url, 0))
-            _SUMMARY_IMAGE_CACHE_TS.pop(old_url, None)
     return True
+
+
+def _summary_cover_disk_path(cache_key):
+    raw = "|".join(str(part) for part in cache_key) if isinstance(cache_key, (tuple, list)) else str(cache_key)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:32]
+    return SUMMARY_COVER_DISK_CACHE_DIR / f"{digest}.png"
+
+
+def _read_summary_cover_disk(cache_key):
+    if not SUMMARY_COVER_DISK_CACHE_ENABLED:
+        return None
+    try:
+        with Image.open(_summary_cover_disk_path(cache_key)) as image:
+            return image.convert("RGBA")
+    except Exception:
+        return None
+
+
+def _write_summary_cover_disk(cache_key, image):
+    if not SUMMARY_COVER_DISK_CACHE_ENABLED or image is None:
+        return
+    path = _summary_cover_disk_path(cache_key)
+    try:
+        if path.exists():
+            return
+        SUMMARY_COVER_DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f"{path.stem}.", suffix=".tmp", dir=str(SUMMARY_COVER_DISK_CACHE_DIR)
+        )
+        try:
+            with os.fdopen(fd, "wb") as file:
+                image.save(file, format="PNG", compress_level=6)
+            Path(temp_path).replace(path)
+        except Exception:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+    except Exception:
+        return
+    _SUMMARY_COVER_DISK_WRITES["count"] += 1
+    if _SUMMARY_COVER_DISK_WRITES["count"] % 64 == 0:
+        _prune_summary_cover_disk()
+
+
+def _prune_summary_cover_disk():
+    """按 mtime 淘汰冷层，控制在 80% 上限以内。"""
+    try:
+        entries = [
+            (path.stat().st_mtime, path.stat().st_size, path)
+            for path in SUMMARY_COVER_DISK_CACHE_DIR.glob("*.png")
+            if path.is_file()
+        ]
+    except Exception:
+        return
+    total = sum(size for _, size, _ in entries)
+    if total <= SUMMARY_COVER_DISK_CACHE_MAX_BYTES:
+        return
+    target = int(SUMMARY_COVER_DISK_CACHE_MAX_BYTES * 0.8)
+    for _, size, path in sorted(entries):
+        if total <= target:
+            break
+        try:
+            path.unlink()
+            total -= size
+        except OSError:
+            continue
 
 
 def _get_cached_summary_cover_copy(cache_key):
     cached = _SUMMARY_COVER_CACHE.get(cache_key)
-    if cached is None:
+    if cached is not None:
+        try:
+            _SUMMARY_COVER_CACHE.move_to_end(cache_key)
+        except Exception:
+            pass
+        return cached.copy()
+    # RAM 热层未命中：回落磁盘冷层（读取约 0.7ms，远低于重新合成 12ms）。
+    disk_cached = _read_summary_cover_disk(cache_key)
+    if disk_cached is None:
         return None
-    try:
-        _SUMMARY_COVER_CACHE.move_to_end(cache_key)
-    except Exception:
-        pass
-    return cached.copy()
+    _put_summary_cover_cache(cache_key, disk_cached, write_disk=False)
+    return disk_cached
 
 
-def _put_summary_cover_cache(cache_key, image):
+def _put_summary_cover_cache(cache_key, image, *, write_disk=True):
     global _SUMMARY_COVER_CACHE_BYTES
     if image is None:
         return False
+    if write_disk:
+        try:
+            _write_summary_cover_disk(cache_key, image)
+        except Exception:
+            pass
     estimated_bytes = _estimate_summary_image_bytes(image)
     if estimated_bytes > SUMMARY_COVER_CACHE_MAX_BYTES:
         return False
@@ -1498,10 +1571,6 @@ def _load_font(size, bold=False):
     cache_key = (int(size), bool(bold))
     cached = _SUMMARY_FONT_CACHE.get(cache_key)
     if cached is not None:
-        try:
-            _SUMMARY_FONT_CACHE.move_to_end(cache_key)
-        except Exception:
-            pass
         return cached
 
     adjusted_size = int(size)
@@ -1520,8 +1589,6 @@ def _load_font(size, bold=False):
         bold=bold,
     )
     _SUMMARY_FONT_CACHE[cache_key] = font
-    while len(_SUMMARY_FONT_CACHE) > SUMMARY_FONT_CACHE_MAX:
-        _SUMMARY_FONT_CACHE.popitem(last=False)
     return font
 
 
@@ -2062,7 +2129,7 @@ def _make_background(size):
     bg_path = os.path.join(MODULE_DIR, "bg.png")
     if os.path.exists(bg_path):
         try:
-            raw = load_image_rgba(bg_path)
+            raw = Image.open(bg_path).convert("RGBA")
             bg = _make_blurred_summary_background(raw, size, blur_radius=24)
         except Exception:
             pass
@@ -2072,7 +2139,10 @@ def _make_background(size):
 def _make_blurred_summary_background(source_image, size, blur_radius=50, overlay=(5, 8, 14, 158)):
     bg = _cover_fit(source_image.convert("RGBA"), size)
     bg = bg.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-    bg = Image.alpha_composite(bg, Image.new("RGBA", size, overlay))
+    try:
+        bg.alpha_composite(Image.new("RGBA", size, overlay))
+    except Exception:
+        bg = Image.alpha_composite(bg, Image.new("RGBA", size, overlay))
     return bg
 
 
@@ -2118,7 +2188,7 @@ async def _load_summary_image(url):
                 image = None
         if image is None:
             raw = await _limited_call(lambda: get_icon(url))
-            image = load_image_rgba(raw)
+            image = Image.open(BytesIO(raw)).convert("RGBA")
             if local_candidates:
                 try:
                     image.save(local_candidates[0])
@@ -2145,17 +2215,10 @@ def _cover_fit(image, size):
 def _rounded_mask(size, radius=8):
     cache_key = (int(size[0]), int(size[1]), int(radius))
     mask = _SUMMARY_MASK_CACHE.get(cache_key)
-    if mask is not None:
-        try:
-            _SUMMARY_MASK_CACHE.move_to_end(cache_key)
-        except Exception:
-            pass
-        return mask
-    mask = Image.new("L", size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
-    _SUMMARY_MASK_CACHE[cache_key] = mask
-    while len(_SUMMARY_MASK_CACHE) > SUMMARY_MASK_CACHE_MAX:
-        _SUMMARY_MASK_CACHE.popitem(last=False)
+    if mask is None:
+        mask = Image.new("L", size, 0)
+        ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
+        _SUMMARY_MASK_CACHE[cache_key] = mask
     return mask
 
 
@@ -3641,7 +3704,12 @@ async def _render_period_image(
     await _prefetch_summary_images(prefetch_urls)
     _render_step("ASSET_PREFETCH_DONE", extra=f"url_candidates={len(prefetch_urls)}")
 
-    canvas = await _make_period_background((width, height), matches)
+    # 底部预留 promo 高度：画布只分配一次，append_dashen_promo 原地绘制，
+    # 省掉一次整图复制（1400x2500 约 13.4MB / 2.6ms）。
+    promo_height = promo_reserve_height(width, compact=False)
+    canvas = await _make_period_background((width, height + promo_height), matches)
+    if promo_height:
+        mark_promo_reserved(canvas, promo_height)
     draw = _summary_draw(canvas)
     _render_step("BACKGROUND_DONE")
 
@@ -4250,7 +4318,11 @@ def _render_season_image(stats, resolved_target):
     draw.text((735, 1295), "暂时搁置。数据管线和方形版式已就绪。", font=_load_font(19), fill=(218, 228, 242))
     draw.text((735, 1328), f"生成时间 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}", font=_load_font(14), fill=(140, 152, 170))
 
-    return canvas.convert("RGB")
+    rgb_canvas = canvas.convert("RGB")
+    if promo_height:
+        # convert() 会新建图像，必须把"底部已预留"的标记带到返回对象上。
+        mark_promo_reserved(rgb_canvas, promo_height)
+    return rgb_canvas
 
 
 async def render_period_conclusion(

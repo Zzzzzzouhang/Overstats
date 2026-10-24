@@ -8,7 +8,6 @@ try:
     from overstats.src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from overstats.src.modules.errors import ModuleError
     from overstats.src.modules.query_tool import load_query_tool
-    from overstats.src.modules.render_base import run_render
     from overstats.src.modules.risk_status import RiskStatus, parse_risk_status
     from overstats.src.modules.dashen_quick_strength.render import (
         COMPETITIVE_STRENGTH_THEME,
@@ -20,7 +19,6 @@ except ModuleNotFoundError:
     from src.modules.bnet_search import BnetSearchModule, BnetSearchResult, bnet_search_module
     from src.modules.errors import ModuleError
     from src.modules.query_tool import load_query_tool
-    from src.modules.render_base import run_render
     from src.modules.risk_status import RiskStatus, parse_risk_status
     from src.modules.dashen_quick_strength.render import (
         COMPETITIVE_STRENGTH_THEME,
@@ -204,10 +202,9 @@ class DashenCompetitiveStrengthModule:
         )
 
     async def render_competitive_strength(self, output: DashenCompetitiveStrengthOutput) -> RenderedImage:
-        """渲染阶段：纯 PIL，受渲染/AI 闸门约束，不占用抓取槽位。"""
+        """渲染阶段：纯 PIL，在事件循环上直接渲染（与上游一致），不占用抓取槽位。"""
         try:
-            return await run_render(
-                render_quick_strength,
+            return render_quick_strength(
                 player_name=output.full_id,
                 bnet_id=output.bnet_id,
                 summary=output.summary.to_dict(),

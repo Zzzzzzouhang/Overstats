@@ -7,11 +7,9 @@ from typing import Any, Dict, Mapping, Sequence
 try:
     from overstats.src.constants.ranks import RANK_ORDER, canonical_rank_name
     from overstats.src.modules.errors import ModuleError
-    from overstats.src.modules.render_base import run_render
 except ModuleNotFoundError:
     from src.constants.ranks import RANK_ORDER, canonical_rank_name
     from src.modules.errors import ModuleError
-    from src.modules.render_base import run_render
 
 from .render import RenderedImage, render_rank_distribution
 from .requests import RankDistributionQuery
@@ -151,8 +149,7 @@ class InternalRankDistributionModule:
 
         image = None
         if render:
-            image = await run_render(
-                render_rank_distribution,
+            image = render_rank_distribution(
                 season=season,
                 total_count=total_count,
                 rows=[row.to_dict() for row in rows],

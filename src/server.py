@@ -46,7 +46,6 @@ try:
     from overstats.src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
     from overstats.src.modules.dashen_team_overview import team_overview_module
     from overstats.src.modules.dashen_team_overview.render import render_overview
-    from overstats.src.modules.render_base import configure_stage_gate, get_stage_limit, run_render
     from overstats.src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
     from overstats.src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
@@ -127,7 +126,6 @@ except ModuleNotFoundError:
     from src.modules.dashen_rank_history import DashenRankHistoryQuery, dashen_rank_history_module
     from src.modules.dashen_team_overview import team_overview_module
     from src.modules.dashen_team_overview.render import render_overview
-    from src.modules.render_base import configure_stage_gate, get_stage_limit, run_render
     from src.modules.dashen_quick_strength import DashenQuickStrengthQuery, dashen_quick_strength_module
     from src.modules.dashen_competitive_strength import (
         DashenCompetitiveStrengthQuery,
@@ -568,7 +566,7 @@ class OverstatsCoreService:
             "profile_image",
             lambda: dashen_profile_module.fetch_profile(query, for_render=True, render_mode=render_mode),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_profile_module.render_profile(output, render_mode=render_mode)
         if not image:
             raise ModuleError(
@@ -591,7 +589,7 @@ class OverstatsCoreService:
             "blizzard_profile_image",
             lambda: blizzard_profile_module.fetch_profile(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await blizzard_profile_module.render_profile(output)
         if not image:
             raise ModuleError(
@@ -626,7 +624,7 @@ class OverstatsCoreService:
             "career_compare",
             lambda: career_compare_module.fetch_compare(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         result = await career_compare_module.render_compare(output)
         return result.image.content
 
@@ -646,7 +644,7 @@ class OverstatsCoreService:
             "hero_compare",
             lambda: dashen_hero_compare_module.fetch_compare(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         result = await dashen_hero_compare_module.render_compare(output)
         return result.image.content
 
@@ -666,7 +664,7 @@ class OverstatsCoreService:
             "hero_treemap_image",
             lambda: dashen_hero_treemap_module.fetch_treemap(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         result = await dashen_hero_treemap_module.render_treemap(output)
         if not result.image:
             raise ModuleError(
@@ -1131,7 +1129,7 @@ class OverstatsCoreService:
             "rank_leaderboard_image",
             lambda: dashen_rank_leaderboard_module.fetch_rank_leaderboard(query),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_rank_leaderboard_module.render_rank_leaderboard(output)
         if not image:
             raise ModuleError(
@@ -1159,7 +1157,7 @@ class OverstatsCoreService:
             "hero_leaderboard_image",
             lambda: dashen_hero_leaderboard_module.fetch_hero_leaderboard(query),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_hero_leaderboard_module.render_hero_leaderboard(output)
         if not image:
             raise ModuleError(
@@ -1240,7 +1238,7 @@ class OverstatsCoreService:
             "match_replies",
             lambda: dashen_match_module.fetch_match_list(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         result = await dashen_match_module.render_match_list_replies(output)
         return {
             "ok": True,
@@ -1281,7 +1279,7 @@ class OverstatsCoreService:
             "match_image",
             lambda: dashen_match_module.fetch_match_list(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_match_module.render_match_list(output)
         if not image:
             raise ModuleError(
@@ -1305,7 +1303,7 @@ class OverstatsCoreService:
             "sameplay_replies",
             lambda: dashen_sameplay_module.fetch_sameplay_list(query),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         result = await dashen_sameplay_module.render_sameplay_list_replies(output)
         return {
             "ok": True,
@@ -1331,7 +1329,7 @@ class OverstatsCoreService:
             "sameplay_image",
             lambda: dashen_sameplay_module.fetch_sameplay_list(query),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_sameplay_module.render_sameplay_list(output)
         if not image:
             raise ModuleError(
@@ -1378,7 +1376,7 @@ class OverstatsCoreService:
                 for_render=True,
             ),
         )
-        # 渲染/AI 阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染/AI 阶段：槽外执行，渲染与 AI 等待均不占用抓取槽位
         result = await dashen_sameplay_module.render_sameplay_detail_replies(fetched)
         return {
             "ok": True,
@@ -1420,7 +1418,7 @@ class OverstatsCoreService:
                 for_render=True,
             ),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         result = await dashen_sameplay_module.render_sameplay_detail(fetched)
         if not result.main_image:
             raise ModuleError(
@@ -1637,7 +1635,7 @@ class OverstatsCoreService:
                 analyze=analyze,
             ),
         )
-        # 渲染/AI 阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染/AI 阶段：槽外执行，渲染与 AI 等待均不占用抓取槽位
         result = await dashen_match_module.render_match_detail_replies(fetched)
         return {
             "ok": True,
@@ -1690,7 +1688,7 @@ class OverstatsCoreService:
             "match_detail_image",
             lambda: dashen_match_module.fetch_match_detail_by_index(query, int(index_value), for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_match_module.render_match_detail(output)
         if not image:
             raise ModuleError(
@@ -1789,7 +1787,7 @@ class OverstatsCoreService:
                 "summary_season_image",
                 lambda: fetch_report(payload.get("token"), role_id, payload.get("season")),
             )
-            # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+            # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
             async with SUMMARY_SEMAPHORE:
                 return await render_report(report, role_id)
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
@@ -1806,7 +1804,7 @@ class OverstatsCoreService:
             f"summary_{scope}_image",
             lambda: dashen_summary_module.fetch_summary(query),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         result = await dashen_summary_module.render_summary(fetched)
         # render_ms comes from worker-reported RENDER_DONE.delta_ms (worker-side render phase only).
         # Note: summary's upstream_ms already includes worker render round-trip (render_summary is an HTTP call).
@@ -1829,8 +1827,8 @@ class OverstatsCoreService:
         # 抓取阶段：占用 dashen 队列槽
         result = await self.dashen_request_queue.run(
             "team_overview_image", lambda: team_overview_module.query(payload.get("base64"), include_avatars=True))
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
-        return await run_render(render_overview, result)
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
+        return render_overview(result)
 
     async def handle_dashen_rank_history(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -1914,7 +1912,7 @@ class OverstatsCoreService:
             "rank_history_image",
             lambda: dashen_rank_history_module.fetch_rank_history(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_rank_history_module.render_rank_history(output)
         if not image:
             raise ModuleError(
@@ -1995,7 +1993,7 @@ class OverstatsCoreService:
             "quick_strength_image",
             lambda: dashen_quick_strength_module.fetch_quick_strength(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_quick_strength_module.render_quick_strength(output)
         if not image:
             raise ModuleError(
@@ -2076,7 +2074,7 @@ class OverstatsCoreService:
             "competitive_strength_image",
             lambda: dashen_competitive_strength_module.fetch_competitive_strength(query, for_render=True),
         )
-        # 渲染阶段：槽外执行，受渲染/AI 闸门（抓取槽位 × 3）约束
+        # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
         image = await dashen_competitive_strength_module.render_competitive_strength(output)
         if not image:
             raise ModuleError(
@@ -2113,7 +2111,7 @@ class OverstatsCoreService:
             result = await shiqu_module.analyze_from_db(query)
         else:
             # 抓取阶段：占用 dashen 队列槽（与其他指令一致，可占满全部槽位）；
-            # LLM 阶段在槽外执行，等待返回与渲染共用 stage 闸门。
+            # LLM 阶段在槽外执行，受全局 LLM 并发槽约束。
             prepared = await self.dashen_request_queue.run(
                 "shiqu_fetch",
                 lambda: shiqu_module.collect_data(query, db=_get_shiqu_ref_db()),
@@ -2159,14 +2157,12 @@ class OverstatsCoreService:
             result = await shiqu_module.generate_verdict(prepared)
         try:
             from overstats.src.modules.dashen_shiqu.render import render_shiqu_image
-            from overstats.src.modules.render_base import run_render
         except ModuleNotFoundError:
             from src.modules.dashen_shiqu.render import render_shiqu_image
-            from src.modules.render_base import run_render
         generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime()
         )
-        rendered = await run_render(render_shiqu_image, result, generated_at)
+        rendered = render_shiqu_image(result, generated_at)
         if not rendered or not rendered.content:
             raise ModuleError(
                 error="render_failed",
@@ -2203,7 +2199,7 @@ class OverstatsCoreService:
             result = await court_module.analyze_from_db(query)
         else:
             # 抓取阶段：占用 dashen 队列槽（与其他指令一致，可占满全部槽位）；
-            # LLM 阶段在槽外执行，等待返回与渲染共用 stage 闸门。
+            # LLM 阶段在槽外执行，受全局 LLM 并发槽约束。
             prepared = await self.dashen_request_queue.run(
                 "court_fetch",
                 lambda: court_module.collect_data(query, db=_get_shiqu_ref_db()),
@@ -2249,14 +2245,12 @@ class OverstatsCoreService:
             result = await court_module.generate_verdict(prepared)
         try:
             from overstats.src.modules.dashen_court.render import render_court_image
-            from overstats.src.modules.render_base import run_render
         except ModuleNotFoundError:
             from src.modules.dashen_court.render import render_court_image
-            from src.modules.render_base import run_render
         generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime()
         )
-        rendered = await run_render(render_court_image, result, generated_at)
+        rendered = render_court_image(result, generated_at)
         if not rendered or not rendered.content:
             raise ModuleError(
                 error="render_failed",
@@ -2355,13 +2349,6 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         f"light_load_threshold={config.dashen_light_load_threshold}"
     )
     print(f"[overstats] database writes enabled={config.enable_database_write}")
-    # 二段闸门：抓取受 dashen_request_queue 槽位控制；渲染与等单局 AI 的容量
-    # = 抓取槽位 × 3（可用 OVERSTATS_STAGE_CONCURRENCY / OVERSTATS_STAGE_MULTIPLIER 调整）。
-    configure_stage_gate(config.dashen_max_concurrent_requests)
-    print(
-        "[overstats] stage gate (render/ai) limit="
-        f"{get_stage_limit()} fetch_slots={config.dashen_max_concurrent_requests}"
-    )
     async_runner = AsyncRunner()
     request_metrics_recorder = RequestMetricsRecorder() if config.enable_database_write else None
     if request_metrics_recorder is not None:

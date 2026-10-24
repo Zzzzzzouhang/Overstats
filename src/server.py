@@ -8,6 +8,7 @@ import contextvars
 import locale
 import threading
 import time
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -2291,9 +2292,24 @@ _db_read_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = context
     "overstats_db_read_hits", default=None
 )
 
-# 当前请求的标识（战网 ID / 监听端口），用于抓取完成日志。
+# 当前请求的标识（战网 ID / 监听端口 / 路径），用于抓取完成与异常日志。
 _req_bnet_var: contextvars.ContextVar[str] = contextvars.ContextVar("overstats_req_bnet", default="")
 _req_port_var: contextvars.ContextVar[int] = contextvars.ContextVar("overstats_req_port", default=0)
+_req_path_var: contextvars.ContextVar[str] = contextvars.ContextVar("overstats_req_path", default="")
+
+
+def log_internal_error(exc: BaseException) -> None:
+    """未捕获异常统一落日志：之前 500 只回包不打印，线上无法定位。"""
+    try:
+        print(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [INTERNAL ERROR] "
+            f"path={_req_path_var.get() or '-'} bnet={_req_bnet_var.get() or '-'} "
+            f"port={_req_port_var.get() or '-'} {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        traceback.print_exc()
+    except Exception:
+        pass
 
 
 def _clock_ms(epoch_seconds: float) -> str:
@@ -2437,6 +2453,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
             try:
                 _req_port_var.set(int(self.server.server_address[1]))
+                _req_path_var.set(path)
             except Exception:
                 pass
             self._perf_handler_start = time.monotonic()
@@ -2484,6 +2501,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             self._set_metrics_context(path if path.startswith("/api/v2/") else None)
             try:
                 _req_port_var.set(int(self.server.server_address[1]))
+                _req_path_var.set(path)
             except Exception:
                 pass
             self._perf_handler_start = time.monotonic()
@@ -2822,6 +2840,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_player_identity_search(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -2834,6 +2855,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -2867,6 +2889,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(service.handle_internal_rank_distribution_image(payload))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -2879,6 +2904,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -2912,6 +2938,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_blizzard_player_search(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -2924,6 +2953,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -2957,6 +2987,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_blizzard_profile(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -2969,6 +3002,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3002,6 +3036,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_blizzard_profile_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3014,6 +3051,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3047,6 +3085,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_auto_route(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3059,6 +3100,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3092,6 +3134,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_match(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3104,6 +3149,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3138,6 +3184,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_match_replies(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3150,6 +3199,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3183,6 +3233,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3195,6 +3248,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3228,6 +3282,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_replies(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3240,6 +3297,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3273,6 +3331,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3285,6 +3346,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3318,6 +3380,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_ow_shop(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3330,6 +3395,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3363,6 +3429,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_result = async_runner.run(self._capture_perf(service.handle_ow_shop_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3375,6 +3444,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3412,6 +3482,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_ow_esports(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3424,6 +3497,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3457,6 +3531,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_ow_esports_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3469,6 +3546,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3502,6 +3580,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_ow_guess_replies(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3514,6 +3595,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3548,6 +3630,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 patch_handler = service.handle_patch_notes_replies if replies else service.handle_patch_notes
                 result = async_runner.run(self._capture_perf(patch_handler(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3560,6 +3645,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3593,6 +3679,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_patch_notes_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3605,6 +3694,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3638,6 +3728,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_ow_hero_perk(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3650,6 +3743,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3683,6 +3777,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_perk_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3695,6 +3792,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3728,6 +3826,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_ow_hero_wiki(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3740,6 +3841,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3773,6 +3875,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_wiki_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3785,6 +3890,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3818,6 +3924,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_ow_hero_pick_rate(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3830,6 +3939,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3863,6 +3973,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_ow_hero_pick_rate_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3875,6 +3988,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3908,6 +4022,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_rank_leaderboard(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3920,6 +4037,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3953,6 +4071,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_rank_leaderboard_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -3965,6 +4086,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -3998,6 +4120,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_hero_leaderboard(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4010,6 +4135,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4043,6 +4169,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_hero_leaderboard_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4055,6 +4184,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4088,6 +4218,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_profile(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4100,6 +4233,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4134,6 +4268,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_profile_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4146,6 +4283,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4173,7 +4311,8 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             except ModuleError as exc:
                 self._send_json(HTTPStatus(exc.status_code), {"ok": False, "error": exc.error, "message": exc.message})
                 return
-            except Exception:
+            except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "career_compare_failed", "message": "生涯对比暂不可用，请稍后重试。"})
                 return
             if render:
@@ -4198,6 +4337,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(service.handle_dashen_hero_compare(payload))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4210,6 +4352,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4243,6 +4386,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(service.handle_dashen_hero_compare_image(payload))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4255,6 +4401,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4288,6 +4435,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_hero_treemap(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4300,6 +4450,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4333,6 +4484,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_hero_treemap_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4345,6 +4499,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4378,6 +4533,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(service.handle_dashen_team_overview(payload))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4390,6 +4548,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4423,6 +4582,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(service.handle_dashen_team_overview_image(payload))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4435,6 +4597,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4468,6 +4631,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_rank_history(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4480,6 +4646,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4513,6 +4680,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_rank_history_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4525,6 +4695,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4558,6 +4729,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_quick_strength(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4570,6 +4744,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4603,6 +4778,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_quick_strength_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4615,6 +4793,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4648,6 +4827,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_shiqu(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4660,6 +4842,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4693,6 +4876,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_shiqu_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4705,6 +4891,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4738,6 +4925,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_court(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4750,6 +4940,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4783,6 +4974,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_court_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4795,6 +4989,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4828,6 +5023,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_competitive_strength(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4840,6 +5038,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4873,6 +5072,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_competitive_strength_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4885,6 +5087,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4918,6 +5121,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_summary(payload, scope=scope)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4930,6 +5136,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -4963,6 +5170,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body, content_type = async_runner.run(self._capture_perf(service.handle_dashen_summary_image(payload, scope=scope)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -4975,6 +5185,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5009,6 +5220,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_match_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -5021,6 +5235,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5054,6 +5269,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_match_detail(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -5066,6 +5284,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5099,6 +5318,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_match_detail_replies(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -5111,6 +5333,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5144,6 +5367,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_match_detail_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -5156,6 +5382,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5189,6 +5416,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -5201,6 +5431,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5234,6 +5465,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 result = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail_replies(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -5246,6 +5480,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5279,6 +5514,9 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 image_body = async_runner.run(self._capture_perf(service.handle_dashen_sameplay_detail_image(payload)))
             except ModuleError as exc:
+                # 5xx 的模块错误（上游 5xx / LLM 失败等）同样要落日志，便于排查。
+                if int(getattr(exc, "status_code", 500) or 500) >= 500:
+                    log_internal_error(exc)
                 self._send_json(
                     HTTPStatus(exc.status_code),
                     {
@@ -5291,6 +5529,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 )
                 return
             except Exception as exc:
+                log_internal_error(exc)
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {
@@ -5417,6 +5656,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 try:
                     summary = endpoint_perf_recorder.read_endpoint_perf_summary(minutes=raw_minutes)
                 except Exception as exc:
+                    log_internal_error(exc)
                     self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {
                         "ok": False, "error": "perf_summary_failed", "message": str(exc),
                     })
@@ -5501,6 +5741,12 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             # 当图片上传 QQ 富媒体接口，触发上传返回 None + 5×30s 重试风暴。
             # 这里统一拦截：空内容一律按 500 JSON 错误返回，让上游得到可读的错误。
             if not body:
+                print(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [EMPTY BODY] "
+                    f"path={_req_path_var.get() or '-'} bnet={_req_bnet_var.get() or '-'} "
+                    f"port={_req_port_var.get() or '-'} 渲染返回 0 字节",
+                    flush=True,
+                )
                 self._send_json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {

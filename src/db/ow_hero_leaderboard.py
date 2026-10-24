@@ -27,6 +27,22 @@ _ROW_FIELDS = (
 )
 
 
+SQLITE_BUSY_TIMEOUT_MS = 15_000
+
+
+def _open_connection(db_path: Any, *, write: bool = False) -> sqlite3.Connection:
+    """统一连接参数：WAL + busy_timeout，避免多实例并发写时直接抛 database is locked。"""
+    connection = sqlite3.connect(str(db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+    try:
+        connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        if write:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:
+        pass
+    return connection
+
+
 def _safe_float(value: Any) -> float:
     try:
         return float(value)
@@ -40,7 +56,7 @@ class OWHeroLeaderboardDB:
 
     def initialize_database(self) -> None:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path, write=True)
         try:
             for table_name in _VALID_TABLES:
                 connection.execute(
@@ -106,7 +122,7 @@ class OWHeroLeaderboardDB:
             return 0
 
         self.initialize_database()
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path, write=True)
         try:
             connection.executemany(
                 f"""
@@ -171,7 +187,7 @@ class OWHeroLeaderboardDB:
         if filters:
             where_sql = " WHERE " + " AND ".join(filters)
 
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path)
         connection.row_factory = sqlite3.Row
         try:
             rows = connection.execute(
@@ -204,7 +220,7 @@ class OWHeroLeaderboardDB:
         validated_table = self._validate_table_name(table_name)
         if not self.db_path.exists():
             return 0
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path)
         try:
             row = connection.execute(f"SELECT COUNT(*) FROM {validated_table}").fetchone()
         finally:

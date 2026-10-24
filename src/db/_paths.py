@@ -18,3 +18,15 @@ def resolve_db_path(filename: str) -> Path:
     else:
         base = Path(__file__).resolve().parent
     return base / filename
+
+
+def resolve_metrics_db_path(filename: str) -> Path:
+    """观测类数据库（request_metrics）单独寻址，便于多开时各实例写各自的文件。
+
+    优先级：OVERSTATS_METRICS_DB_DIR → OVERSTATS_DB_DIR → src/db。
+    业务库（match_stats / shiqu_llm / leaderboard）仍由 resolve_db_path 决定。
+    """
+    metrics_dir = os.environ.get("OVERSTATS_METRICS_DB_DIR")
+    if metrics_dir and metrics_dir.strip():
+        return Path(metrics_dir.strip()) / filename
+    return resolve_db_path(filename)

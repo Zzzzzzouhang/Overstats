@@ -16,9 +16,9 @@ except ModuleNotFoundError:
     from config import is_database_write_enabled
 
 
-from ._paths import resolve_db_path
+from ._paths import resolve_db_path, resolve_metrics_db_path
 
-REQUEST_METRICS_DB_PATH = resolve_db_path("request_metrics.sqlite3")
+REQUEST_METRICS_DB_PATH = resolve_metrics_db_path("request_metrics.sqlite3")
 REQUEST_METRICS_TABLE = "request_url_stats"
 REQUEST_SOURCE_MODULE = "module"
 REQUEST_SOURCE_UPSTREAM = "upstream"
@@ -32,6 +32,21 @@ ENDPOINT_PERF_PERCENTILES = (0.5, 0.95, 0.99)
 # writes stall (disk IO, lock contention, full disk). Best-effort telemetry is
 # simply dropped when the queue is full.
 RECORDER_QUEUE_MAXSIZE = 512
+SQLITE_BUSY_TIMEOUT_MS = 15_000
+
+
+def _open_connection(db_path, *, write: bool = False) -> sqlite3.Connection:
+    """统一连接参数：WAL + busy_timeout，避免多实例/并发写时直接抛 database is locked。"""
+    connection = sqlite3.connect(str(db_path), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
+    try:
+        connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        if write:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:
+        # PRAGMA 失败不应阻断读写，保留默认行为继续。
+        pass
+    return connection
 
 
 @dataclass(frozen=True)
@@ -154,7 +169,7 @@ class RequestMetricsRecorder:
         self._worker_task = None
 
     def _initialize_database(self) -> None:
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path, write=True)
         try:
             connection.execute(
                 f"""
@@ -182,6 +197,14 @@ class RequestMetricsRecorder:
                 return
             try:
                 await asyncio.to_thread(self._write_event, event)
+            except Exception as exc:
+                # 锁冲突/磁盘异常只丢弃这一条，绝不让 worker 退出（否则整个进程 metrics 停摆）。
+                self._dropped += 1
+                if self._dropped == 1 or self._dropped % 1000 == 0:
+                    print(
+                        f"[overstats] request-metrics write failed, dropped {self._dropped} "
+                        f"events: {type(exc).__name__}: {exc}"
+                    )
             finally:
                 self._queue.task_done()
 
@@ -196,7 +219,7 @@ class RequestMetricsRecorder:
         )
         if normalized_row is None:
             return
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path, write=True)
         try:
             connection.execute(
                 f"""
@@ -227,7 +250,7 @@ class RequestMetricsRecorder:
 
     def read_all_module_stats(self) -> List[Dict[str, Any]]:
         """Read existing request_url_stats for module source_type (for /api/v2/metrics)."""
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path)
         connection.row_factory = sqlite3.Row
         try:
             rows = connection.execute(
@@ -438,7 +461,7 @@ class EndpointPerfRecorder:
         self._worker_task = None
 
     def _initialize_database(self) -> None:
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path, write=True)
         try:
             # Field semantics:
             #   total_ms     = handler full duration (body parse + service + response write)
@@ -493,11 +516,19 @@ class EndpointPerfRecorder:
                 return
             try:
                 await asyncio.to_thread(self._write_event, event)
+            except Exception as exc:
+                # 同上：单条写入失败不得终止 worker。
+                self._dropped += 1
+                if self._dropped == 1 or self._dropped % 1000 == 0:
+                    print(
+                        f"[overstats] endpoint-perf write failed, dropped {self._dropped} "
+                        f"events: {type(exc).__name__}: {exc}"
+                    )
             finally:
                 self._queue.task_done()
 
     def _write_event(self, event: _PerfEvent) -> None:
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path, write=True)
         try:
             connection.execute(
                 f"""
@@ -526,7 +557,7 @@ class EndpointPerfRecorder:
         window_minutes = max(1, min(int(minutes or ENDPOINT_PERF_DEFAULT_MINUTES), ENDPOINT_PERF_MAX_MINUTES))
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
 
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path)
         connection.row_factory = sqlite3.Row
         try:
             base_rows = connection.execute(
@@ -608,7 +639,7 @@ class EndpointPerfRecorder:
     def read_endpoint_perf(self, *, limit: int = 100) -> List[Dict[str, Any]]:
         """Recent raw performance samples (for debugging)."""
         limit = max(1, min(int(limit or 100), 1000))
-        connection = sqlite3.connect(self.db_path)
+        connection = _open_connection(self.db_path)
         connection.row_factory = sqlite3.Row
         try:
             rows = connection.execute(

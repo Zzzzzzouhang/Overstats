@@ -23,9 +23,13 @@ def _read_env_int(name: str, default: int) -> int:
         return int(default)
 
 
-# 外部 LLM 端点的全局并发上限（shiqu / court / 单局锐评共享）。
+# 外部 LLM 端点的并发上限。
+# 是区吗（shiqu）使用独立信号量，不与开庭 / 单局锐评抢槽位。
 LLM_SEMAPHORE = asyncio.Semaphore(
     max(1, _read_env_int("OVERSTATS_LLM_MAX_CONCURRENT", 4))
+)
+SHIQU_LLM_SEMAPHORE = asyncio.Semaphore(
+    max(1, _read_env_int("OVERSTATS_SHIQU_LLM_MAX_CONCURRENT", 6))
 )
 
 

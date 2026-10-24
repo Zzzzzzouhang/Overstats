@@ -1058,10 +1058,10 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
         }
 
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
-    from ..analysis_common import LLM_SEMAPHORE, build_async_client, get_analysis_proxy
+    from ..analysis_common import SHIQU_LLM_SEMAPHORE, build_async_client, get_analysis_proxy
     proxy = get_analysis_proxy(cfg.base_url)
-    # 等 LLM 返回不占用抓取槽位，受全局 LLM 并发槽约束。
-    async with LLM_SEMAPHORE:
+    # 等 LLM 返回不占用抓取槽位；使用 shiqu 独立并发槽，不与开庭/锐评抢。
+    async with SHIQU_LLM_SEMAPHORE:
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
 
             async def _do_request() -> Optional[str]:
@@ -1405,8 +1405,8 @@ class ShiquModule:
         调用独立 LLM → 解析结构化结果 → 遥测落库 → 详情缓存写回。
 
         与抓取阶段分离后，多个请求可同时处于本阶段并行发送，
-        并发上限见 analysis_common.LLM_SEMAPHORE（默认 4，可用
-        OVERSTATS_LLM_MAX_CONCURRENT 调整）。
+        并发上限见 analysis_common.SHIQU_LLM_SEMAPHORE（默认 6，可用
+        OVERSTATS_SHIQU_LLM_MAX_CONCURRENT 调整，与开庭/锐评相互独立）。
 
         Args:
             prepared: collect_data 的产物。

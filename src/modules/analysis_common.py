@@ -23,14 +23,34 @@ def _read_env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _dashen_max_concurrent_requests() -> int:
+    """抓取槽位数（config.DASHEN_MAX_CONCURRENT_REQUESTS，可被环境变量覆盖）。"""
+    env_value = os.getenv("OVERSTATS_DASHEN_MAX_CONCURRENT_REQUESTS")
+    if env_value and str(env_value).strip():
+        try:
+            return max(1, int(str(env_value).strip()))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(1, int(getattr(app_config, "DASHEN_MAX_CONCURRENT_REQUESTS", 2) or 2))
+    except (TypeError, ValueError):
+        return 2
+
+
 # 外部 LLM 端点的并发上限。
-# 是区吗（shiqu）使用独立信号量，不与开庭 / 单局锐评抢槽位。
+# 是区吗（shiqu）使用独立信号量，不与开庭 / 单局锐评抢槽位；
+# 默认 = 抓取槽位数的 3 倍（DASHEN_MAX_CONCURRENT_REQUESTS=2 → 6）。
 LLM_SEMAPHORE = asyncio.Semaphore(
     max(1, _read_env_int("OVERSTATS_LLM_MAX_CONCURRENT", 4))
 )
-SHIQU_LLM_SEMAPHORE = asyncio.Semaphore(
-    max(1, _read_env_int("OVERSTATS_SHIQU_LLM_MAX_CONCURRENT", 6))
+SHIQU_LLM_CONCURRENCY = max(
+    1,
+    _read_env_int(
+        "OVERSTATS_SHIQU_LLM_MAX_CONCURRENT",
+        _dashen_max_concurrent_requests() * 3,
+    ),
 )
+SHIQU_LLM_SEMAPHORE = asyncio.Semaphore(SHIQU_LLM_CONCURRENCY)
 
 
 def _normalized_base_url(base_url: str) -> str:

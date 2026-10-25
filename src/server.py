@@ -2296,6 +2296,7 @@ _db_read_acc_var: contextvars.ContextVar[Optional["_PerfAccumulator"]] = context
 _req_bnet_var: contextvars.ContextVar[str] = contextvars.ContextVar("overstats_req_bnet", default="")
 _req_port_var: contextvars.ContextVar[int] = contextvars.ContextVar("overstats_req_port", default=0)
 _req_path_var: contextvars.ContextVar[str] = contextvars.ContextVar("overstats_req_path", default="")
+_req_fetch_end_var: contextvars.ContextVar[float] = contextvars.ContextVar("overstats_fetch_end", default=0.0)
 
 
 def log_internal_error(exc: BaseException) -> None:
@@ -2320,10 +2321,26 @@ def _clock_ms(epoch_seconds: float) -> str:
 def log_fetch_done(label: str, started_at_wall: float, finished_at_wall: float, wait_ms: int) -> None:
     """抓取阶段结束（= 渲染开始）打印一行：时间 / 战网ID / 端口 / 抓取起止。"""
     cost_ms = int((finished_at_wall - started_at_wall) * 1000)
+    _req_fetch_end_var.set(float(finished_at_wall))
     print(
         f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [FETCH DONE] "
         f"bnet={_req_bnet_var.get() or '-'} port={_req_port_var.get() or '-'} task={label} "
         f"fetch={_clock_ms(started_at_wall)}->{_clock_ms(finished_at_wall)} ({cost_ms}ms) wait={wait_ms}ms",
+        flush=True,
+    )
+
+
+def log_render_done(total_ms: int) -> None:
+    """渲染（含 shiqu/court 的 LLM 等待）结束打印一行，与 FETCH DONE 配对。"""
+    fetch_end = float(_req_fetch_end_var.get() or 0.0)
+    if fetch_end <= 0:
+        return
+    finished = time.time()
+    render_ms = max(0, int((finished - fetch_end) * 1000))
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [RENDER DONE] "
+        f"bnet={_req_bnet_var.get() or '-'} port={_req_port_var.get() or '-'} "
+        f"render={_clock_ms(fetch_end)}->{_clock_ms(finished)} ({render_ms}ms) total={int(total_ms)}ms",
         flush=True,
     )
 
@@ -2502,6 +2519,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             try:
                 _req_port_var.set(int(self.server.server_address[1]))
                 _req_path_var.set(path)
+                _req_fetch_end_var.set(0.0)
             except Exception:
                 pass
             self._perf_handler_start = time.monotonic()
@@ -5575,6 +5593,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
                 return result
             finally:
                 self._perf_service_ms = int((time.monotonic() - t0) * 1000)
+                log_render_done(self._perf_service_ms)
                 self._perf_upstream_ms = upstream_acc.total_ms
                 self._perf_upstream_count = upstream_acc.call_count
                 self._perf_queue_wait_ms = queue_wait_acc.total_ms

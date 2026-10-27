@@ -197,19 +197,41 @@ def _normalize_llm_text(text: str) -> str:
     return _add_num_spacing(_to_half_width_punct(text))
 
 
+# 字符宽度缓存：换行算法是 O(n^2)（回填阶段反复重算行宽），逐字调用 textlength
+# 会让一张判定书累积数十万次 FreeType 度量，单次渲染从「几秒」膨胀到「几十秒」。
+# 字体对象由 font_resolver.load_font 的 lru_cache 长期持有，故 (path,size,ch) 稳定。
+_GLYPH_WIDTH_CACHE: Dict[Tuple[str, int, str], float] = {}
+_GLYPH_WIDTH_CACHE_MAX = 30000
+
+
 def _glyph_width(draw, ch: str, font, emoji_on: bool = False, half_font=None) -> float:
     """单字符绘制宽度。
 
     - 空格收敛为半宽（_HALF_SPACE_RATIO）；
+    - 换行符不占宽度（PIL 的 textlength 遇到 \n/\r 会抛 ValueError）；
     - emoji 预留正方形宽度（由 _composite_emoji 合成），无 emoji 字体时占 0（跳过）；
-    - 其余按字体实际度量。
+    - 其余按字体实际度量（带缓存）。
     """
     if ch == " ":
         return max(2, int(font.size * _HALF_SPACE_RATIO))
+    if ch in ("\r", "\n"):
+        return 0
     if _is_emoji(ch):
         return font.size if emoji_on else 0
     f = _char_font(ch, font, half_font)
-    return draw.textlength(ch, font=f)
+    key = (str(getattr(f, "path", "") or ""), int(getattr(f, "size", 0) or 0), ch)
+    cached = _GLYPH_WIDTH_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        w = float(draw.textlength(ch, font=f))
+    except ValueError:
+        # 兜底：PIL 无法度量的字符（多行文本 / 控制字符）按零宽处理，绝不中断渲染。
+        w = 0.0
+    if len(_GLYPH_WIDTH_CACHE) >= _GLYPH_WIDTH_CACHE_MAX:
+        _GLYPH_WIDTH_CACHE.clear()
+    _GLYPH_WIDTH_CACHE[key] = w
+    return w
 
 
 # ── emoji 渲染（离线，无联网）──
@@ -363,6 +385,7 @@ def _draw_text_emoji(
     half_font=None,
 ) -> int:
     """按字符绘制单行文本（水平居中）：emoji 合成图像，数字/小数点用半宽字体；返回结束 x。"""
+    text = text.replace("\r", "").replace("\n", " ")
     widths = [_glyph_width(draw, ch, base_font, emoji_on, half_font) for ch in text]
     x = cx - sum(widths) / 2
     for ch, w in zip(text, widths):
@@ -411,6 +434,16 @@ def _wrap_segments(
     cur_w = 0
     for text, color in segments:
         for ch in text:
+            # LLM 偶尔在长段落里返回 \n：按显式换行处理（换行符本身不参与排版，
+            # 否则会喂给 draw.textlength 并抛 can't measure length of multiline text）。
+            if ch == "\n":
+                if cur:
+                    lines.append((cur, False))
+                cur = []
+                cur_w = 0
+                continue
+            if ch == "\r":
+                continue
             if _is_emoji(ch):
                 f = None if emoji_on else font
             else:
@@ -510,18 +543,22 @@ def _backfill_lines(
         nxt_chars, nxt_full = out[i + 1]
         # 贪心逐字上提。允许略微超出一个字宽容差：绘制端会对「完整行」做两端对齐
         # （slack<0 时负向收紧），所以上一行多提一个字不会超出图片，反而能消除行尾大留白。
+        # 行宽用增量维护（此前每次上提都整行重算，文本长时是 O(n^2) 的主要热点）。
+        cur_w = _line_width(cur_chars, draw, font, emoji_on, half_font)
         while nxt_chars:
             w = _glyph_width(draw, nxt_chars[0][0], font, emoji_on, half_font)
-            if _line_width(cur_chars, draw, font, emoji_on, half_font) + w > max_width + font.size:
+            if cur_w + w > max_width + font.size:
                 break
             cur_chars.append(nxt_chars.pop(0))
+            cur_w += w
             # 若提完后下一行新首字符是「行首禁则符号」，必须把它也一并带走
             # （禁则符号单独悬在下一行行首比当前行略微超出更糟）。放宽两个字宽容差，
             # 允许上一行末尾多带禁则符号（如「神、」整体连回上一行）。
             if nxt_chars and _is_line_start_forbidden(nxt_chars[0][0]):
                 w2 = _glyph_width(draw, nxt_chars[0][0], font, emoji_on, half_font)
-                if _line_width(cur_chars, draw, font, emoji_on, half_font) + w2 <= max_width + 2 * font.size:
+                if cur_w + w2 <= max_width + 2 * font.size:
                     cur_chars.append(nxt_chars.pop(0))
+                    cur_w += w2
         out[i][0] = cur_chars
         out[i][1] = True
         if not nxt_chars:

@@ -1058,10 +1058,25 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
         }
 
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
-    from ..analysis_common import SHIQU_LLM_SEMAPHORE, build_async_client, get_analysis_proxy
+    from ..analysis_common import (
+        SHIQU_LLM_CONCURRENCY,
+        SHIQU_LLM_SEMAPHORE,
+        build_async_client,
+        get_analysis_proxy,
+    )
     proxy = get_analysis_proxy(cfg.base_url)
     # 等 LLM 返回不占用抓取槽位；使用 shiqu 独立并发槽，不与开庭/锐评抢。
+    # 记录「排队等槽」耗时：只有在并发槽被打满时才会出现等待，因此这行日志是
+    # 判断「LLM 并发到底有没有用」的直接证据——不打印就说明瓶颈在上游模型本身。
+    _sem_t0 = time.perf_counter()
     async with SHIQU_LLM_SEMAPHORE:
+        _sem_wait_ms = int((time.perf_counter() - _sem_t0) * 1000)
+        if _sem_wait_ms >= 1000:
+            print(
+                f"[shiqu] LLM 并发槽已满，排队 {_sem_wait_ms}ms "
+                f"（上限 {SHIQU_LLM_CONCURRENCY}，可用 OVERSTATS_SHIQU_LLM_MAX_CONCURRENT 调整）",
+                flush=True,
+            )
         async with build_async_client(timeout=cfg.timeout_seconds, proxy_url=proxy) as client:
 
             async def _do_request() -> Optional[str]:

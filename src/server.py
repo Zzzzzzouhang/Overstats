@@ -2172,7 +2172,10 @@ class OverstatsCoreService:
         generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime()
         )
-        rendered = render_shiqu_image(result, generated_at)
+        # PIL 渲染是同步 CPU 密集操作，必须丢到线程池：AsyncRunner 只有一个事件循环，
+        # 在工作协程里直接渲染会把其他请求正在等待的 LLM 流式响应一起卡住，
+        # 表现为「LLM 并发不起作用」（in_progress 长期上不去、各请求排队变慢）。
+        rendered = await asyncio.to_thread(render_shiqu_image, result, generated_at)
         if not rendered or not rendered.content:
             raise ModuleError(
                 error="render_failed",
@@ -2260,7 +2263,8 @@ class OverstatsCoreService:
         generated_at = str(result.get("generated_at") or "").strip() or time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime()
         )
-        rendered = render_court_image(result, generated_at)
+        # 同 shiqu：同步渲染不能在事件循环线程里跑，否则阻塞并发中的 LLM 调用。
+        rendered = await asyncio.to_thread(render_court_image, result, generated_at)
         if not rendered or not rendered.content:
             raise ModuleError(
                 error="render_failed",

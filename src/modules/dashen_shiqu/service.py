@@ -1131,20 +1131,13 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
 
 
 # ── 主流程 ──
-
-# shiqu 数据抓取步并发上限。与上游 datamsapi 的 domain 信号量（默认 2）对齐：
-# 模块级 Semaphore 跨所有 shiqu 请求共享，把提交侧并发压在 2，避免无谓地把
-# 远超真实在飞上限（domain=2）的任务塞进队列，也降低抖动期扇出放大雪崩的风险。
-SHIQU_MATCH_CONCURRENCY = int(os.getenv("OVERSTATS_SHIQU_MATCH_CONCURRENCY", "2"))
-_SHIQU_FETCH_SEMAPHORE: "Optional[asyncio.Semaphore]" = None
-
-
-def _shiqu_fetch_semaphore() -> "asyncio.Semaphore":
-    """懒加载模块级并发信号量，绑定到运行中的事件循环，避免启动期创建。"""
-    global _SHIQU_FETCH_SEMAPHORE
-    if _SHIQU_FETCH_SEMAPHORE is None:
-        _SHIQU_FETCH_SEMAPHORE = asyncio.Semaphore(max(1, SHIQU_MATCH_CONCURRENCY))
-    return _SHIQU_FETCH_SEMAPHORE
+#
+# 【已移除】此处原有一道「模块级共享信号量」闸门（历史变量名 SHIQU_MATCH_CONCURRENCY），
+# 它跨所有并发的 shiqu 抓取共享且默认只有 2，会把整条流水线的有效并行度压回 2，
+# 成为外层 dashen 槽位怎么调都上不去的隐形天花板。现已删除，
+# 抓取 fanout 交由下游 apiclient 的 per-domain 信号量统一约束
+# （DATAMSAPI_MAX_CONCURRENT_REQUESTS，继承自 config.DASHEN_MAX_CONCURRENT_REQUESTS），
+# 即全链路只剩「dashen 队列槽 + domain 槽」两级控制，不再嵌套。
 
 
 # ── 抓取阶段轮次闸 ──
@@ -1177,28 +1170,25 @@ class ShiquModule:
     async def _collect_preset_details(
         self, customer_token: str, entries: List[dict], match_count: int
     ) -> List[dict]:
-        """并发获取对局详情（受模块级 Semaphore 限流），仅保留预设/6v6 模式。
+        """并发获取对局详情，仅保留预设/6v6 模式。
 
         严格复用 overstats 的 DashenMatchModule.query_match_detail：
         内部通过 DashenMatchRequests.get_match_detail 选择 query_match_info /
         fight_query_match_info，并用 render._extract_match_detail_data 提取根数据。
         模式判定优先取详情根数据 gameMode（与原版 _get_match_mode 一致）。
 
-        将原本的串行逐条 await 改为带 Semaphore 的并发 gather（对齐 quick_strength
-        的 match_concurrency 模式）：既提升抓取速度，又通过模块级信号量把全局并发
-        压在 SHIQU_MATCH_CONCURRENCY 以内，避免多查询叠加打满上游共享通道。
+        原本的串行逐条 await 已改为并发 gather。此处不再叠加模块级 Semaphore——
+        该闸门已移除，并发控制统一交给下游 apiclient 的 per-domain 信号量。
         """
-        sem = _shiqu_fetch_semaphore()
 
         async def _fetch_one(e: Any) -> Optional[dict]:
             if not isinstance(e, dict):
                 return None
             match_id = str(e.get("matchId") or "")
             try:
-                async with sem:
-                    detail_output = await self.match_module.query_match_detail(
-                        customer_token, e, render=False
-                    )
+                detail_output = await self.match_module.query_match_detail(
+                    customer_token, e, render=False
+                )
             except Exception as exc:
                 logger.warning(f"[shiqu] 拉取对局 {match_id} 详情失败: {exc}")
                 return None
@@ -1227,14 +1217,14 @@ class ShiquModule:
         return details
 
     async def _enrich_teammate_details(self, details: List[dict], customer_token: str) -> None:
-        """并发补齐队友多英雄 heroList（受模块级 Semaphore 限流）。
+        """并发补齐队友多英雄 heroList。
 
         用队友各自 token + 比赛 match_id 重新拉取同局详情，补齐 _heroList。
         复用 overstats 的 DashenMatchModule.query_match_detail（按 match_id 直查），
         与原版 _fetch_match_by_token_match_id 的意图一致，但走项目内部模块而非 HTTP。
-        改为带 Semaphore 的并发 gather，避免队友数量多时一次性打满上游通道。
+        改为并发 gather 以避免串行放大延迟；并发上限不再由模块级闸门控制，
+        统一下沉到 apiclient 的 per-domain 信号量。
         """
-        sem = _shiqu_fetch_semaphore()
         tasks = []
         for m in details:
             source = m.get("source_match") or {}
@@ -1257,10 +1247,9 @@ class ShiquModule:
                     peer: dict = p,
                 ) -> None:
                     try:
-                        async with sem:
-                            detail_output = await self.match_module.query_match_detail(
-                                tok, mid, render=False
-                            )
+                        detail_output = await self.match_module.query_match_detail(
+                            tok, mid, render=False
+                        )
                         tm_root = _extract_match_detail_data(detail_output.detail.payload)
                         hl = tm_root.get("heroList") or []
                         if hl:

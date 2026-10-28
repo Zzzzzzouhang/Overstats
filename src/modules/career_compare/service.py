@@ -9,11 +9,11 @@ import httpx
 from ...constants import iter_hero_alias_pairs
 from ..bnet_search import bnet_search_module
 from ..dashen_hero_treemap.mini_program import (
-    MODE_TYPES, MiniProgramHeroTreemap, resolve_account_id, validate_xcxtoken,
+    MODE_TYPES, MiniProgramHeroTreemap, encode_account_id, resolve_account_id, validate_xcxtoken,
 )
 from ..dashen_hero_treemap.requests import normalize_treemap_mode
 from ..errors import ModuleError
-from .metrics import collect_metrics, compare_radar, hero_hours, radar_dimensions, rows
+from .metrics import collect_metrics, compare_radar, hero_hours, number, radar_dimensions, rows
 
 
 @dataclass(frozen=True)
@@ -50,10 +50,26 @@ def _top_hero(hero):
     # Only use the upstream population benchmark; never substitute player values or maxima.
     chart = hero.get("hexagon_chart") or {}
     dimensions = [{**d, "value": d.get("top20")} for d in rows(chart.get("dimensions"))]
+    radar_top20 = {d.get("title"): number(d.get("top20")) for d in dimensions}
+    per_ten_axes = {"消灭": "消灭", "助攻": "助攻", "对英雄伤害量": "伤害", "治疗量": "治疗"}
+
+    def benchmark_item(item, field):
+        value = item.get("top20")
+        # These four radar axes match the hero's per-ten-minute summary rows.
+        # Do not apply them to lifetime totals, maxima or hero-specific statistics.
+        if value is None and field == "summary" and str(item.get("item_type")) == "3":
+            label = str(item.get("item_name") or "").strip()
+            label = label.removeprefix("每10分钟").removeprefix("每十分钟")
+            fallback = radar_top20.get(per_ten_axes.get(label))
+            if fallback is not None and fallback >= 0:
+                value = f"{fallback:.2f}"
+        # Player-only comments (e.g. wins/played) do not describe the benchmark.
+        return {**item, "item_value": value, "item_comment": ""}
+
     return {"hero_id": hero.get("hero_id"), "hero_name": hero.get("hero_name"),
             "hero_role_type": hero.get("hero_role_type"),
             "hexagon_chart": {"dimensions": dimensions},
-            **{field: [{**item, "item_value": item.get("top20")} for item in rows(hero.get(field))]
+            **{field: [benchmark_item(item, field) for item in rows(hero.get(field))]
                for field in ("simple_summary", "summary", "hero_specific_summary")}}
 
 
@@ -62,6 +78,10 @@ class CareerCompareModule:
         self.search_module = search_module or bnet_search_module
         self.adapter = MiniProgramHeroTreemap(search_module=self.search_module, transport=transport, icons=icons)
         self.transport = transport
+
+    async def fetch_player(self, client, target, token, mode):
+        """Return the full lifetime hero list before comparison's top-three selection."""
+        return await self._player(client, target, token, mode)
 
     async def _player(self, client, target, token, mode):
         target, account_id, encoded = await resolve_account_id(self.search_module, target)
@@ -74,6 +94,9 @@ class CareerCompareModule:
         if not isinstance(payload.get("hero_summaries"), list):
             raise ModuleError(error="mini_program_invalid_response", message="小程序未返回英雄生涯列表。", status_code=502)
         heroes = rows(payload["hero_summaries"])
+        if len(heroes) != len(payload["hero_summaries"]):
+            raise ModuleError(error="mini_program_invalid_response",
+                              message="小程序英雄列表含有异常条目，暂不能生成完整生涯结果。", status_code=502)
         # Older profile responses provide the detailed hero metrics and six-axis chart.
         # Quick play there is lifetime; competitive entries are often individual seasons.
         # Only explicitly total competitive entries may supplement a lifetime comparison.
@@ -99,6 +122,39 @@ class CareerCompareModule:
                     raise
                 notes.append("详细统计暂不可用，仅显示已返回的生涯统计。")
         return {"player": identity, "heroes_raw": heroes, "notes": notes}
+
+    async def _complete_hero(self, client, side, hero, token, mode):
+        """Fill missing fields from explicitly scoped lifetime hero endpoints."""
+        account_id = side["player"]["bnet_id"]
+        encoded = encode_account_id(account_id)
+        params = {"account_id": encoded, "season_id": "total",
+                  "type": MODE_TYPES[mode], "hero_id": hero["hero_id"]}
+        endpoints = []
+        if not hero.get("summary") or not hero.get("hero_specific_summary"):
+            endpoints.append(("summary", ("summary", "hero_specific_summary")))
+        if not rows((hero.get("hexagon_chart") or {}).get("dimensions")):
+            endpoints.append(("hexagon", ("hexagon_chart",)))
+        for endpoint, fields in endpoints:
+            try:
+                detail = await self.adapter._get_data(
+                    client, f"/season/total/hero/{endpoint}", params, token)
+                if "basic_info" in detail:
+                    _identity(detail, encoded, side["player"]["display_name"], account_id)
+                basic = detail.get("hero_basic_info") or {}
+                returned_id = basic.get("hero_id", detail.get("hero_id"))
+                if returned_id is not None and str(returned_id) != str(hero["hero_id"]):
+                    raise ModuleError(error="mini_program_target_mismatch",
+                                      message="小程序返回的英雄与查询目标不一致。", status_code=502)
+                if not detail.get("found_no_data"):
+                    for key in fields:
+                        if detail.get(key) and (not hero.get(key) or key == "hexagon_chart"):
+                            hero[key] = detail[key]
+                if not any(detail.get(key) for key in fields) or detail.get("found_no_data"):
+                    side["notes"].append("部分英雄详细统计或雷达暂无数据，仅显示已返回的生涯统计。")
+            except ModuleError as exc:
+                if exc.status_code == 401 or exc.error == "mini_program_target_mismatch":
+                    raise
+                side["notes"].append("部分英雄详细统计或雷达暂不可用，仅显示已返回的生涯统计。")
 
     async def fetch_compare(self, query: CareerCompareQuery, *, for_render: bool = False):
         """抓取阶段：双方生涯数据（+ 渲染所需图标）。只含上游请求。"""
@@ -138,6 +194,18 @@ class CareerCompareModule:
             selected = sorted(keys, key=lambda key: (-sum(hero_hours(m.get(key, {})) for m in maps), key))[:3]
         if not selected:
             raise ModuleError(error="career_compare_empty", message="所选模式没有可对比的英雄生涯记录。", status_code=404)
+        # Fetch only the selected hero(s), not every hero in both lifetime lists.
+        async with httpx.AsyncClient(timeout=20, follow_redirects=False, trust_env=False,
+                                     transport=self.transport, headers={"Accept-Encoding": "gzip, deflate"}) as client:
+            results = await asyncio.gather(*(
+                self._complete_hero(client, side, mapping[key], token, mode)
+                for side, mapping in zip(sides[:1] if benchmark else sides, maps)
+                for key in selected if key in mapping), return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        if benchmark:
+            maps[1] = {key: _top_hero(maps[0][key]) for key in selected}
         sections = []
         for key in selected:
             compared = []

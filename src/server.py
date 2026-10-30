@@ -312,6 +312,30 @@ def _build_blizzard_profile_query(payload: Dict[str, object]) -> BlizzardProfile
     )
 
 
+def _build_dashen_profile_query(payload: Dict[str, object]) -> DashenProfileQuery:
+    season_value = payload.get("season")
+    if season_value is None:
+        season_value = payload.get("season_c")
+    season = None
+    if season_value not in (None, "", 0, "0", "auto", "AUTO", "Auto"):
+        try:
+            season = int(season_value)
+        except (TypeError, ValueError) as exc:
+            raise ModuleError(
+                error="invalid_season",
+                message="season must be an integer when provided.",
+                status_code=400,
+                hint='Example: {"bnet_id":"Player#12345","season":22}',
+                details={"season": season_value},
+            ) from exc
+    return DashenProfileQuery(
+        customer_token=str(payload.get("customer_token") or payload.get("customerToken") or "").strip(),
+        bnet_id=str(payload.get("bnet_id") or payload.get("bnetId") or "").strip(),
+        season=season,
+        include_previous_season=_coerce_bool(payload.get("include_previous_season"), True),
+    )
+
+
 def _build_ow_hero_wiki_query(payload: Dict[str, object]) -> OWHeroWikiQuery:
     return OWHeroWikiQuery(
         hero=str(payload.get("hero") or "").strip(),
@@ -537,39 +561,41 @@ class OverstatsCoreService:
         return result.image.content
 
     async def handle_dashen_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
+        if _coerce_bool(payload.get("render"), False):
+            return await self._handle_dashen_profile_replies(payload)
         return await self.dashen_request_queue.run(
             "profile",
             lambda: self._handle_dashen_profile(payload),
         )
 
-    async def handle_dashen_profile_image(self, payload: Dict[str, object]) -> bytes:
-        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
-        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
-        season_value = payload.get("season")
-        if season_value is None:
-            season_value = payload.get("season_c")
-
-        season = None
-        if season_value not in (None, "", 0, "0", "auto", "AUTO", "Auto"):
-            try:
-                season = int(season_value)
-            except (TypeError, ValueError) as exc:
-                raise ModuleError(
-                    error="invalid_season",
-                    message="season must be an integer when provided.",
-                    status_code=400,
-                    hint='Example: {"bnet_id":"Player#12345","season":22}',
-                    details={"season": season_value},
-                ) from exc
-
-        include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
+    async def _handle_dashen_profile_replies(self, payload: Dict[str, object]) -> Dict[str, object]:
+        """JSON 端点 render=true：抓取占槽、渲染槽外，返回身份 meta + 图片 replies。"""
+        query = _build_dashen_profile_query(payload)
         render_mode = _coerce_profile_render_mode(payload)
-        query = DashenProfileQuery(
-            customer_token=customer_token,
-            bnet_id=bnet_id,
-            season=season,
-            include_previous_season=include_previous_season,
+        output = await self.dashen_request_queue.run(
+            "profile_render",
+            lambda: dashen_profile_module.fetch_profile(query, for_render=True, render_mode=render_mode),
         )
+        image = await dashen_profile_module.render_profile(output, render_mode=render_mode)
+        if not image:
+            raise ModuleError(
+                error="render_failed",
+                message="Dashen profile image was not generated.",
+                status_code=500,
+            )
+        card = output.bundle.profile_card.get("data") if isinstance(output.bundle.profile_card, dict) else None
+        card = card if isinstance(card, dict) else {}
+        resolved = output.resolved_bnet
+        identity = str(card.get("bnetId") or (resolved.bnet_id if resolved else "") or "").strip()
+        name = str(card.get("name") or (resolved.full_id if resolved else "") or identity)
+        return {"ok": True, "replies": [
+            {"type": "meta", "meta_type": "ds_profile_player", "data": {"bnet_id": identity, "name": name}},
+            {"type": "image", "base64": base64.b64encode(image.content).decode("ascii")},
+        ]}
+
+    async def handle_dashen_profile_image(self, payload: Dict[str, object]) -> bytes:
+        query = _build_dashen_profile_query(payload)
+        render_mode = _coerce_profile_render_mode(payload)
 
         # 抓取阶段：占用 dashen 队列槽（含头像抓取）
         output = await self.dashen_request_queue.run(
@@ -714,35 +740,10 @@ class OverstatsCoreService:
         return result.image.content
 
     async def _handle_dashen_profile(self, payload: Dict[str, object]) -> Dict[str, object]:
-        bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
-        customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
-        season_value = payload.get("season")
-        if season_value is None:
-            season_value = payload.get("season_c")
+        query = _build_dashen_profile_query(payload)
+        include_previous_season = query.include_previous_season
 
-        season = None
-        if season_value not in (None, "", 0, "0", "auto", "AUTO", "Auto"):
-            try:
-                season = int(season_value)
-            except (TypeError, ValueError) as exc:
-                raise ModuleError(
-                    error="invalid_season",
-                    message="season must be an integer when provided.",
-                    status_code=400,
-                    hint='Example: {"bnet_id":"Player#12345","season":22}',
-                    details={"season": season_value},
-                ) from exc
-
-        include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
-
-        result = await dashen_profile_module.query_profile(
-            DashenProfileQuery(
-                customer_token=customer_token,
-                bnet_id=bnet_id,
-                season=season,
-                include_previous_season=include_previous_season,
-            )
-        )
+        result = await dashen_profile_module.query_profile(query)
         resolved = result.resolved_bnet
         bundle = result.bundle
         return {
@@ -1230,7 +1231,7 @@ class OverstatsCoreService:
         # JSON 端点只取数据（render 仅控制是否附带抓取 risk_status，不出图）
         result = await dashen_match_module.fetch_match_list(
             DashenMatchQuery(
-                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
                 bnet_id=bnet_id,
                 target_count=target_count,
@@ -1265,7 +1266,7 @@ class OverstatsCoreService:
             )
 
         query = DashenMatchQuery(
-            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
             customer_token=customer_token,
             bnet_id=bnet_id,
             target_count=int(payload.get("target_count") or payload.get("limit") or 20),
@@ -1306,7 +1307,7 @@ class OverstatsCoreService:
         include_fight = _coerce_bool(payload.get("include_fight"), True)
         include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
         query = DashenMatchQuery(
-            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
             customer_token=customer_token,
             bnet_id=bnet_id,
             target_count=target_count,
@@ -1585,7 +1586,7 @@ class OverstatsCoreService:
             include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
             result = await dashen_match_module.query_match_detail_by_index(
                 DashenMatchQuery(
-                    filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+                    filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
                     customer_token=customer_token,
                     bnet_id=bnet_id,
                     target_count=target_count,
@@ -1652,7 +1653,7 @@ class OverstatsCoreService:
                     hint='Example: {"bnet_id":"Player#12345","index":0}',
                 )
             query = DashenMatchQuery(
-                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+                filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
                 customer_token=customer_token,
                 bnet_id=bnet_id,
                 target_count=int(payload.get("target_count") or payload.get("limit") or 20),
@@ -1715,7 +1716,7 @@ class OverstatsCoreService:
         include_fight = _coerce_bool(payload.get("include_fight"), True)
         include_previous_season = _coerce_bool(payload.get("include_previous_season"), True)
         query = DashenMatchQuery(
-            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search") if str(payload.get(key) or "").strip()},
+            filters={key: str(payload.get(key) or "").strip() for key in ("map", "hero", "search", "mode") if str(payload.get(key) or "").strip()},
             customer_token=customer_token,
             bnet_id=bnet_id,
             target_count=target_count,

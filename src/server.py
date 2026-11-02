@@ -2379,6 +2379,21 @@ def log_render_done(total_ms: int) -> None:
     )
 
 
+def log_request_received(body_bytes: int) -> None:
+    """收到 HTTP 请求（body 读取+解析完成）立刻打印一行 [RECV]。
+
+    时刻与 FETCH DONE 的 fetch 起点对齐，可看出请求在进入抓取队列前的开销；
+    也与插件侧 [SEND] 行对齐，用于测量 插件→后端 的链路耗时（同机毫秒级可比）。
+    """
+    now = time.time()
+    print(
+        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [RECV] "
+        f"bnet={_req_bnet_var.get() or '-'} port={_req_port_var.get() or '-'} "
+        f"path={_req_path_var.get() or '-'} body={body_bytes}B at={_clock_ms(now)}",
+        flush=True,
+    )
+
+
 def _extract_request_bnet(payload: Any) -> str:
     """从请求体里取战网 ID（不同接口字段名不同，取第一个非空）。"""
     if not isinstance(payload, dict):
@@ -5773,6 +5788,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
             if not isinstance(data, dict):
                 raise ValueError("json body must be an object")
             _req_bnet_var.set(_extract_request_bnet(data))
+            log_request_received(len(raw_body))
             return data
 
         def _decode_body(self, raw_body: bytes) -> str:

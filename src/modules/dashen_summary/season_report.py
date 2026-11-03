@@ -1,4 +1,8 @@
-"""Season report prototype. Intentionally absent from the public UI registry."""
+"""Season report prototype. Intentionally absent from the public UI registry.
+
+入参归一化（bnet_id -> 数字 roleId / 账号 token）在 server 层完成，
+本模块只负责「给定账号 token + roleId」抓取与解析上游报告。
+"""
 from __future__ import annotations
 
 import math
@@ -7,7 +11,6 @@ from pathlib import Path
 
 import httpx
 
-from .engine import SUMMARY_SEMAPHORE
 from ..season_config import get_dashen_current_season
 from ..errors import ModuleError
 from .season_report_ranks import classify_ranks, enrich_rank_queues
@@ -188,11 +191,4 @@ async def render_report(report, role_id):
     return await render(report, role_id)
 
 
-async def query_season_report(payload, *, render=False):
-    role_id = str(payload.get("roleId") or payload.get("role_id") or "").strip()
-    report = await fetch_report(payload.get("token"), role_id, payload.get("season"))
-    if render:
-        async with SUMMARY_SEMAPHORE:
-            return await render_report(report, role_id)
-    return {"ok": True, "scope": "season", "title": "赛季总结", "roleId": role_id,
-            "season": report["season"].get("season"), "summary": report}
+

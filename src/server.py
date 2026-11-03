@@ -29,6 +29,7 @@ try:
     from overstats.src.db.shiqu_llm import shiqu_llm_recorder
     from overstats.src.db.match_stats import IDPoolDB
     from overstats.src.modules.errors import ModuleError
+    from overstats.src.modules.bnet_search import bnet_search_module
     from overstats.src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
         blizzard_player_search_module,
@@ -109,6 +110,7 @@ except ModuleNotFoundError:
     from src.db.shiqu_llm import shiqu_llm_recorder
     from src.db.match_stats import IDPoolDB
     from src.modules.errors import ModuleError
+    from src.modules.bnet_search import bnet_search_module
     from src.modules.blizzard_player_search import (
         BlizzardPlayerSearchQuery,
         blizzard_player_search_module,
@@ -1783,8 +1785,29 @@ class OverstatsCoreService:
 
     async def _handle_dashen_summary(self, payload: Dict[str, object], *, scope: str = "today") -> Dict[str, object]:
         if scope == "season":
-            from .modules.dashen_summary.season_report import query_season_report
-            return await query_season_report(payload)
+            # 与 image 端点同语义：只认 bnet_id，roleId 与账号由后端解析。
+            bnet_id = str(
+                payload.get("bnet_id") or payload.get("bnetId")
+                or payload.get("full_id") or payload.get("fullId") or ""
+            ).strip()
+            if not bnet_id:
+                raise ModuleError(
+                    error="invalid_season_target",
+                    message="请提供 bnet_id。",
+                    status_code=400,
+                )
+            role_id = await self._resolve_season_role_id(bnet_id)
+            # 调用方已在 dashen_request_queue 槽内（见 handle_dashen_summary），
+            # 这里不能再套一层 run：同一任务重复 acquire 会自锁。
+            report = await self._fetch_season_report(role_id, payload.get("season"))
+            return {
+                "ok": True,
+                "scope": "season",
+                "title": "赛季总结",
+                "roleId": role_id,
+                "season": report["season"].get("season"),
+                "summary": report,
+            }
         bnet_id = str(payload.get("bnet_id") or payload.get("bnetId") or "").strip()
         full_id = str(payload.get("full_id") or payload.get("fullId") or "").strip()
         customer_token = str(payload.get("customer_token") or payload.get("customerToken") or "").strip()
@@ -1819,13 +1842,25 @@ class OverstatsCoreService:
 
     async def handle_dashen_summary_image(self, payload: Dict[str, object], *, scope: str = "today") -> tuple[bytes, str]:
         if scope == "season":
-            from .modules.dashen_summary.season_report import fetch_report, render_report
+            from .modules.dashen_summary.season_report import render_report
             from .modules.dashen_summary.engine import SUMMARY_SEMAPHORE
-            role_id = str(payload.get("roleId") or payload.get("role_id") or "").strip()
-            # 抓取阶段：占用 dashen 队列槽
+            # 与今日总结一致的入参语义：调用方只给战网 ID，数字 roleId 与账号 token
+            # 全部由后端解析（账号从凭据池取，与其它 dashen 指令共用冷却状态）。
+            bnet_id = str(
+                payload.get("bnet_id") or payload.get("bnetId")
+                or payload.get("full_id") or payload.get("fullId") or ""
+            ).strip()
+            if not bnet_id:
+                raise ModuleError(
+                    error="invalid_season_target",
+                    message="请提供 bnet_id。",
+                    status_code=400,
+                )
+            role_id = await self._resolve_season_role_id(bnet_id)
+            # 抓取阶段：占用 dashen 队列槽（账号相关失败自动换号，槽内完成）
             report = await self.dashen_request_queue.run(
                 "summary_season_image",
-                lambda: fetch_report(payload.get("token"), role_id, payload.get("season")),
+                lambda: self._fetch_season_report(role_id, payload.get("season")),
             )
             # 渲染阶段：槽外执行，渲染方式与上游一致（循环上直接渲染）
             async with SUMMARY_SEMAPHORE:
@@ -1858,6 +1893,51 @@ class OverstatsCoreService:
                 break
         self._last_summary_render_ms = render_ms
         return result.image_bytes, result.image_media_type
+
+    async def _resolve_season_role_id(self, bnet_id: str) -> str:
+        """赛季报告需要的数字 roleId = bnet 搜索接口返回的 data.bnetId。"""
+        output = await bnet_search_module.search(bnet_id, render=False)
+        role_id = str(getattr(output.result, "bnet_id", "") or "").strip()
+        if not role_id.isdigit():
+            raise ModuleError(
+                error="bnet_not_found",
+                message="未能解析该玩家的数字 ID，请确认战网 ID 是否正确。",
+                status_code=404,
+            )
+        return role_id
+
+    async def _fetch_season_report(self, role_id: str, season: object) -> Dict[str, object]:
+        """抓取赛季报告：账号取自凭据池（轮询 + 失效冷却），账号类失败自动换号。"""
+        from .modules.dashen_summary.season_report import fetch_report
+
+        pool = dashen_api_client.credential_pool
+        if not pool.credentials:
+            raise ModuleError(
+                error="season_report_no_account",
+                message="未配置大神账号 token。",
+                status_code=400,
+            )
+        attempts = min(3, len(pool.credentials))
+        last_exc: Optional[ModuleError] = None
+        for attempt in range(attempts):
+            credential = pool.next_credential()
+            try:
+                return await fetch_report(credential.token, role_id, season)
+            except ModuleError as exc:
+                if exc.error not in {"season_report_unavailable", "season_report_upstream_error"}:
+                    raise
+                if exc.error == "season_report_upstream_error":
+                    # 业务码失败通常意味着该账号 token 失效：冷却它，让其它指令绕开
+                    pool.mark_failure(credential, reason=exc.error)
+                last_exc = exc
+                print(
+                    f"[overstats] season_report account attempt {attempt + 1}/{attempts} failed: "
+                    f"error={exc.error}",
+                    flush=True,
+                )
+        if last_exc is not None:
+            raise last_exc
+        raise ModuleError(error="season_report_unavailable", message="赛季报告暂时无法获取，请稍后重试。", status_code=502)
 
     async def handle_dashen_team_overview(self, payload: Dict[str, object]) -> Dict[str, object]:
         return await self.dashen_request_queue.run(
@@ -2472,21 +2552,39 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
     )
     print(f"[overstats] database writes enabled={config.enable_database_write}")
     async_runner = AsyncRunner()
+
+    def _start_recorder(name: str, coro) -> bool:
+        """启动数据库 recorder；失败降级为「不落库」而不是让进程退出。
+
+        DB 写入是可选增强：sqlite 锁竞争（典型：旧后端实例未退出仍持有写锁，
+        报 database is locked）不应拖垮整个 HTTP 服务。
+        """
+        try:
+            async_runner.run(coro)
+            return True
+        except Exception as exc:
+            print(
+                f"[overstats] {name} disabled: {type(exc).__name__}: {exc} "
+                "（若为 database is locked，请确认没有其它后端实例仍在运行）",
+                flush=True,
+            )
+            return False
+
     request_metrics_recorder = RequestMetricsRecorder() if config.enable_database_write else None
     if request_metrics_recorder is not None:
-        async_runner.run(request_metrics_recorder.start())
+        _start_recorder("request-metrics-recorder", request_metrics_recorder.start())
     endpoint_perf_recorder = EndpointPerfRecorder() if config.enable_database_write else None
     if endpoint_perf_recorder is not None:
-        async_runner.run(endpoint_perf_recorder.start())
+        _start_recorder("endpoint-perf-recorder", endpoint_perf_recorder.start())
     match_detail_recorder = MatchDetailRecorder() if config.enable_database_write else None
     if match_detail_recorder is not None:
-        async_runner.run(match_detail_recorder.start())
+        _start_recorder("match-detail-recorder", match_detail_recorder.start())
     player_identity_recorder = None
     if player_identity_recorder is not None:
         async_runner.run(player_identity_recorder.start())
     if config.enable_database_write:  # shiqu_llm_recorder.start() 在开关关闭时自动 no-op
-        async_runner.run(shiqu_llm_recorder.start())
-        async_runner.run(court_llm_recorder.start())
+        _start_recorder("shiqu-llm-recorder", shiqu_llm_recorder.start())
+        _start_recorder("court-llm-recorder", court_llm_recorder.start())
     # LLM 调用状态定时打印（每 10 秒）：独立于开关，始终在事件循环上运行。
     # 注意：该协程为 while True 死循环，必须用 submit（即发即弃），不能用 run（会阻塞主线程）。
     async_runner.submit(
@@ -2498,7 +2596,7 @@ def create_server(config: APIConfig) -> ThreadingHTTPServer:
         )
     )
     ow_hero_leaderboard_sync_service = OWHeroLeaderboardSyncService()
-    async_runner.run(ow_hero_leaderboard_sync_service.start())
+    _start_recorder("ow-hero-leaderboard-sync", ow_hero_leaderboard_sync_service.start())
     previous_match_detail_recorder = dashen_api_client.match_detail_recorder
     previous_player_identity_recorder = dashen_api_client.player_identity_recorder
     previous_request_metrics_recorder = dashen_api_client.request_metrics_recorder

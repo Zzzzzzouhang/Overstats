@@ -168,8 +168,17 @@ async def fetch_report(token, role_id, season=None):
                         report["icon"] = str(card.get("icon") or report["icon"])
                 except (httpx.HTTPError, ValueError, AttributeError):
                     pass
-    except (httpx.HTTPError, ValueError):
+    except (httpx.HTTPError, ValueError) as exc:
         # Never include the authenticated request URL in errors.
+        # 诊断日志：只记录异常类型与上游状态码（不带 token / URL），
+        # 否则 502 在日志里只剩一句「暂时无法获取」，无法区分超时 / 401 / 限流 / 非 JSON。
+        upstream_status = getattr(getattr(exc, "response", None), "status_code", None)
+        print(
+            f"[overstats] season_report upstream failed: "
+            f"type={type(exc).__name__} status={upstream_status or '-'} "
+            f"season={selected_season} role={role_id}",
+            flush=True,
+        )
         raise ModuleError(error="season_report_unavailable", message="赛季报告暂时无法获取，请稍后重试。", status_code=502) from None
     return report
 

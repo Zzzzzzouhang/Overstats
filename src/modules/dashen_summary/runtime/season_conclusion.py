@@ -1,4 +1,9 @@
-from ...map_modes import draw_map_mode_icon
+from ...map_modes import draw_map_mode_icon as _draw_map_mode_icon, gameplay_mode
+from .season_panels import (
+    build_season_data, draw_rank_panel, draw_season_panel, rank_panel_height, season_chip, season_glow,
+    season_map_wash, season_panel_height,
+)
+from ....constants.ranks import rank_info_score_to_strength
 from ...subroles import draw_subrole_badge, get_subrole
 from ...dashen_promo import append_dashen_promo, mark_promo_reserved, promo_reserve_height
 
@@ -15,7 +20,7 @@ import threading
 import time
 from collections import Counter, OrderedDict, defaultdict
 from functools import partial
-from math import ceil
+from math import atan2, ceil, cos, pi, sin
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -36,7 +41,20 @@ from .match_awards import rates as _award_rates, select_awards, record_key as _a
 from .teammate_awards import accumulate_award_metrics, select_teammate_awards
 from .season_baseline import parse_count_info, hero_baseline, number as _baseline_number
 from .period_activity import hourly_activity, stacked_activity
-from .summary_typography import SummaryDraw
+from .summary_style import (
+    C,
+    RADIUS_CARD,
+    RADIUS_CHIP,
+    RADIUS_TILE,
+    horizontal_gradient,
+    horizontal_scrim,
+    sticker_outline as _sticker_outline,
+    themed,
+    tinted,
+    vertical_scrim,
+    with_alpha,
+)
+from .summary_typography import SmoothDraw, smooth_mask
 from .db import IDPoolDB
 from .ow_config import load_ow_config
 from .perf_log import append_perf_log
@@ -136,6 +154,18 @@ _SUMMARY_PRELOAD_THREAD_STARTED = False
 _SUMMARY_PRELOAD_LOCK = threading.Lock()
 _GROUP_TITLE_DB = IDPoolDB()
 MAX_GROUP_TITLES_PER_PLAYER = 3
+ROLE_ICON_FILES = ("tank.png", "dps.png", "healer.png")
+# Easter egg: the higher the bot share, the more menacing the omnic.
+OMNIC_BOT_TIERS = (
+    (.25, "207165582859042837"),  # Bastion
+    (.5, "207165582859043134"),  # Orisa
+    (1.01, "207165582859043469"),  # Ramattra
+)
+TIMELINE_COLUMNS = 8
+TIMELINE_TILE_W = 150
+TIMELINE_TILE_H = 156
+TIMELINE_GAP = 10
+TIMELINE_RIBBON_H = 26
 GROUP_TITLE_COLOR_RE = re.compile(r"^(?:背景颜色)?#([0-9A-Fa-f]{6})$")
 
 OW_CONFIG = load_ow_config()
@@ -290,13 +320,6 @@ HERO_AVG_RAW_VALUE_GUIDS = {"603482350067646497", "603482350067648623"}
 HERO_AVG_SKIP_VALUE_GUIDS = {"603482350067646497"}
 PERIOD_HIGHLIGHT_EXCLUDED_TEXTS = {"击杀", "助攻", "阵亡", "英雄获胜", "累计游戏时间", "累积游戏时间", "游戏时间"}
 PERIOD_HIGHLIGHT_EXCLUDED_GUIDS = {"603482350067646495", "603482350067648392", "603482350067646506", "603482350067646497", "603482350067648623"}
-PERIOD_HIGHLIGHT_BAND_COLORS = {
-    "above_median": (96, 216, 135),
-    "top20": (90, 169, 255),
-    "top10": (177, 135, 255),
-    "top5": (255, 176, 74),
-    "top2": (255, 220, 120),
-}
 GAME_TIME_GUID = "603482350067646497"
 ATTR_TEXT_BY_GUID = {
     str(item.get("valueGuid")): item.get("valueText", str(item.get("valueGuid")))
@@ -1569,6 +1592,7 @@ def _build_stats(matches, detail_pairs, resolved_target):
 
 
 
+
 def _load_font(size, bold=False):
     cache_key = (int(size), bool(bold))
     cached = _SUMMARY_FONT_CACHE.get(cache_key)
@@ -1590,6 +1614,8 @@ def _load_font(size, bold=False):
         prefer_cjk=True,
         bold=bold,
     )
+    if bold and os.path.basename(getattr(font, "path", "")).lower() == "simhei.ttf":
+        font.emulate_bold = True
     _SUMMARY_FONT_CACHE[cache_key] = font
     return font
 
@@ -1733,23 +1759,40 @@ def _draw_group_title_badges(
 
 def _card(draw, box, title):
     x1, y1, x2, y2 = box
-    draw.rounded_rectangle(box, radius=8, fill=(18, 24, 34, 198), outline=(81, 103, 130, 180), width=1)
-    draw.text((x1 + 18, y1 + 12), title, font=_load_font(26, bold=True), fill=(244, 248, 255))
-    draw.line((x1 + 18, y1 + 50, x2 - 18, y1 + 50), fill=(93, 112, 140, 145), width=1)
+    draw.rounded_rectangle(box, radius=RADIUS_CARD, fill=C.SURFACE, outline=C.STROKE, width=1)
+    draw.polygon([(x1 + 25, y1 + 21), (x1 + 31, y1 + 21), (x1 + 27, y1 + 41), (x1 + 21, y1 + 41)], fill=C.ACCENT)
+    draw.text((x1 + 40, y1 + 17), title, font=_load_font(24, bold=True), fill=C.INK)
 
 
-def _draw_metric(draw, x, y, label, value, color=(255, 210, 105)):
-    draw.text((x, y), str(value), font=_load_font(40, bold=True), fill=color)
-    draw.text((x, y + 48), label, font=_load_font(19), fill=(180, 190, 205))
+def _draw_metric(draw, x, y, label, value, color=None):
+    draw.text((x, y), str(value), font=_load_font(40, bold=True), fill=color or C.ACCENT)
+    draw.text((x, y + 50), label, font=_load_font(17), fill=C.MUTED)
 
 
-def _draw_small_metric(draw, x, y, label, value, color=(246, 248, 255)):
-    draw.text((x, y), str(value), font=_load_font(25, bold=True), fill=color)
-    draw.text((x, y + 30), label, font=_load_font(15), fill=(180, 190, 205))
+def _draw_small_metric(draw, x, y, label, value, color=None):
+    draw.text((x, y), str(value), font=_load_font(25, bold=True), fill=color or C.INK)
+    draw.text((x, y + 30), label, font=_load_font(15), fill=C.MUTED)
+
+
+def _draw_winrate_ring(draw, cx, cy, radius, ratio, color, label):
+    box = (cx - radius, cy - radius, cx + radius, cy + radius)
+    draw.arc(box, 0, 360, fill=with_alpha(color, 46), width=9)
+    if ratio >= 1:
+        draw.arc(box, 0, 360, fill=color, width=9)
+    elif ratio > 0:
+        draw.arc(box, -90, -90 + 360 * ratio, fill=color, width=9)
+    value_font = _fit_text_font(draw, label, radius * 2 - 30, 26, 16, bold=True)
+    draw.text((cx, cy - 2), label, font=value_font, fill=C.INK, anchor="mm")
+    draw.text((cx, cy + 24), "胜率", font=_load_font(13), fill=C.MUTED, anchor="mm")
 
 
 def _summary_draw(canvas, mode="RGBA"):
-    return SummaryDraw(canvas, mode, numeric_font_path=RESOURCE_DIR / "GrotaRoundedExtraBold.otf")
+    return SmoothDraw(
+        canvas,
+        mode,
+        numeric_font_path=RESOURCE_DIR / "GrotaRoundedExtraBold.otf",
+        latin_font_path=RESOURCE_DIR / "en2.ttf",
+    )
 
 
 def _overall_metrics(stats, matches, detail_pairs, target):
@@ -1825,22 +1868,28 @@ def _period_role_time(detail_pairs, target):
 
 
 def _draw_role_time_share(canvas,draw,totals,x=820,y=181,w=500):
-    roles=[("Tank","重装",(125,180,235),"tank.png"),
-           ("Damage","输出",(237,155,133),"dps.png"),
-           ("Support","支援",(131,211,177),"healer.png")]
+    roles=[("Tank","重装",C.ROLE_COLORS["Tank"],"tank.png"),
+           ("Damage","输出",C.ROLE_COLORS["Damage"],"dps.png"),
+           ("Support","支援",C.ROLE_COLORS["Support"],"healer.png")]
     total=sum(totals.values())
-    draw.text((x,y),"职责游玩时间",font=_load_font(16),fill=(189,204,221))
+    draw.text((x,y),"职责游玩时间",font=_load_font(15),fill=C.MUTED)
+    bar_h=14
+    bar_y=y+32
     if total<=0:
-        draw.rounded_rectangle((x,y+61,x+w,y+83),radius=11,fill=(45,58,75))
-        draw.text((x,y+34),"暂无英雄时长",font=_load_font(13),fill=(145,167,191))
+        draw.rounded_rectangle((x,bar_y,x+w,bar_y+bar_h),radius=bar_h/2,fill=with_alpha(C.INK,24))
+        draw.text((x+w,y+1),"暂无英雄时长",font=_load_font(13),fill=C.FAINT,anchor="ra")
         return
     # Legend stays legible even when one role has only a very narrow segment.
-    for i,(role,label,color,asset) in enumerate(roles):
-        xx=x+i*(w/3)
-        _paste_summary_asset(canvas,asset,(int(xx),y+32,22,22))
-        share=totals[role]/total
-        draw.text((xx+29,y+33),f"{label} {share:.0%}",font=_load_font(14),fill=color)
-    bar=Image.new("RGBA",(int(w),24),(45,58,75,255))
+    cursor=x+w
+    for role,label,color,asset in reversed(roles):
+        share=f"{label} {totals[role]/total:.0%}"
+        font=_load_font(14)
+        cursor-=_text_size(draw,share,font)[0]
+        draw.text((cursor,y+2),share,font=font,fill=color)
+        cursor-=24
+        _paste_summary_asset(canvas,asset,(int(cursor),y,20,20))
+        cursor-=16
+    bar=Image.new("RGBA",(int(w),bar_h),(*C.INK[:3],24))
     bar_draw=ImageDraw.Draw(bar)
     active=[(totals[role],color) for role,_,color,_ in roles if totals[role]>0]
     edges=[(0.0,0.0,0.0)]
@@ -1848,7 +1897,7 @@ def _draw_role_time_share(canvas,draw,totals,x=820,y=181,w=500):
     for (left_value,_),(right_value,_) in zip(active,active[1:]):
         cumulative+=left_value
         boundary=cumulative*w/total
-        slant=min(5.0,min(left_value,right_value)*w/total*.25)
+        slant=min(4.0,min(left_value,right_value)*w/total*.25)
         half_gap=min(2.0,min(left_value,right_value)*w/total*.15)
         edges.append((boundary,slant,half_gap))
     edges.append((float(w),0.0,0.0))
@@ -1856,13 +1905,13 @@ def _draw_role_time_share(canvas,draw,totals,x=820,y=181,w=500):
         left,ls,lg=edges[idx]
         right,rs,rg=edges[idx+1]
         bar_draw.polygon([(left+ls+lg,0),(right+rs-rg,0),
-                          (right-rs-rg,23),(left-ls+lg,23)],fill=(*color,255))
-    canvas.paste(bar,(int(x),y+66),_rounded_mask(bar.size,12))
+                          (right-rs-rg,bar_h-1),(left-ls+lg,bar_h-1)],fill=(*color,255))
+    canvas.paste(bar,(int(x),bar_y),_rounded_mask(bar.size,bar_h//2))
 
 
-def _draw_overall_metrics(draw, rows, x, y):
+def _draw_overall_metrics(draw, rows, x, y, cell_w=150, row_h=86):
     for idx,row in enumerate(rows):
-        xx,yy=x+(idx%4)*148,y+(idx//4)*94
+        xx,yy=x+(idx%4)*cell_w,y+(idx//4)*row_h
         if row["total"] is None:
             total,average="—","—"
         elif row["time"]:
@@ -1872,21 +1921,22 @@ def _draw_overall_metrics(draw, rows, x, y):
         else:
             total=_fmt_int(row["total"])
             average=f'{row["average"]:,.1f}'
-        font=_fit_text_font(draw,total,137,26,17,bold=True)
-        draw.text((xx,yy),total,font=font,fill=(241,246,253))
-        small=f"/ {average} 场均"
-        small_font=_fit_text_font(draw,small,137,11,9)
-        draw.text((xx,yy+34),small,font=small_font,fill=(137,166,192))
-        draw.text((xx,yy+59),row["label"],font=_load_font(15),fill=(185,200,216))
+        draw.text((xx,yy),row["label"],font=_load_font(14),fill=C.MUTED)
+        font=_fit_text_font(draw,total,cell_w-14,26,17,bold=True)
+        draw.text((xx,yy+22),total,font=font,fill=C.INK)
+        small=f"场均 {average}"
+        small_font=_fit_text_font(draw,small,cell_w-14,12,9)
+        draw.text((xx,yy+55),small,font=small_font,fill=C.FAINT)
+        if idx%4==0 and idx:
+            draw.line((x,yy-10,x+cell_w*4-14,yy-10),fill=C.HAIRLINE,width=1)
 
 
 def _draw_activity_chart(draw, data, x, y, w, h):
-    palette=[(108,202,228),(241,189,115),(150,216,168),(183,161,229),(237,151,164),(132,169,234),(219,199,142)]
+    palette=C.ACTIVITY_PALETTE
     weekly=data["weekly"]
-    draw.line((x,y-12,x+w,y-12),fill=(66,86,110),width=1)
-    draw.text((x,y),"24小时游戏时间",font=_load_font(18,bold=True),fill=(238,242,248))
+    draw.text((x,y),"24小时游戏时间",font=_load_font(17,bold=True),fill=C.INK)
     caption="7日累计 · 分层" if weekly else "本次对局"
-    draw.text((x+w-128,y+3),caption,font=_load_font(12),fill=(149,173,198))
+    draw.text((x+w,y+3),caption,font=_load_font(12),fill=C.MUTED,anchor="ra")
     if weekly:
         for idx,(day,_) in enumerate(data["series"]):
             xx=x+idx*(w/7)
@@ -1901,17 +1951,17 @@ def _draw_activity_chart(draw, data, x, y, w, h):
     upper=max(30,ceil(maximum/15)*15)
     for tick in (0,upper/2,upper):
         yy=chart_bottom-(chart_bottom-chart_top)*tick/upper
-        draw.line((chart_left,yy,chart_right,yy),fill=(51,69,91),width=1)
-        draw.text((x,yy-8),f"{tick:g}",font=_load_font(10),fill=(139,163,187))
-    draw.text((x,chart_top-22),"累计分钟 / 小时" if weekly else "分钟 / 小时",font=_load_font(10),fill=(139,163,187))
+        draw.line((chart_left,yy,chart_right,yy),fill=C.GRID_MAJOR,width=1)
+        draw.text((x,yy-8),f"{tick:g}",font=_load_font(10),fill=C.AXIS_TEXT)
+    draw.text((x,chart_top-22),"累计分钟 / 小时" if weekly else "分钟 / 小时",font=_load_font(10),fill=C.AXIS_TEXT)
     for hour in range(0,25,4):
         xx=chart_left+(chart_right-chart_left)*hour/24
-        draw.line((xx,chart_top,xx,chart_bottom),fill=(35,50,69),width=1)
+        draw.line((xx,chart_top,xx,chart_bottom),fill=C.GRID_MINOR,width=1)
         label=f"{hour:02d}"
         tw=_text_size(draw,label,_load_font(11))[0]
-        draw.text((xx-tw/2,chart_bottom+9),label,font=_load_font(11),fill=(149,173,198))
+        draw.text((xx-tw/2,chart_bottom+9),label,font=_load_font(11),fill=C.AXIS_LABEL)
     if not data["valid"]:
-        draw.text((chart_left+80,chart_top+30),"暂无有效对局时长",font=_load_font(16),fill=(160,180,202))
+        draw.text((chart_left+80,chart_top+30),"暂无有效对局时长",font=_load_font(16),fill=C.AXIS_EMPTY)
         return
     def curve(values):
         points=[(chart_left,chart_bottom-(chart_bottom-chart_top)*values[0]/upper)]
@@ -1932,17 +1982,17 @@ def _draw_activity_chart(draw, data, x, y, w, h):
                 continue
             lower_curve,upper_curve=curve(lower),curve(upper_values)
             color=palette[index % len(palette)]
-            fill=tuple(int(channel*.55+background*.45) for channel,background in zip(color,(18,24,34)))
+            fill=tuple(int(channel*.55+background*.45) for channel,background in zip(color,C.CHART_BASE))
             draw.polygon([*lower_curve,*reversed(upper_curve)],fill=fill)
             boundaries.append((upper_curve,color))
         for boundary,color in boundaries:
             draw.line(boundary,fill=color,width=2,joint="curve")
         if any(totals):
-            draw.line(curve(totals),fill=(235,242,251),width=2,joint="curve")
+            draw.line(curve(totals),fill=C.CHART_TOTAL,width=2,joint="curve")
     else:
         values=series[0][1]
         smooth=curve(values)
-        draw.polygon([(chart_left,chart_bottom),*smooth,(chart_right,chart_bottom)],fill=(24,47,63))
+        draw.polygon([(chart_left,chart_bottom),*smooth,(chart_right,chart_bottom)],fill=C.CHART_AREA)
         if any(values):
             draw.line(smooth,fill=palette[0],width=3,joint="curve")
             for hour,value in enumerate(values):
@@ -1951,14 +2001,14 @@ def _draw_activity_chart(draw, data, x, y, w, h):
                     yy=chart_bottom-(chart_bottom-chart_top)*value/upper
                     draw.ellipse((xx-2,yy-2,xx+2,yy+2),fill=palette[0])
     if data["valid"]<data["total"]:
-        draw.text((x+w-135,y+h-10),f'时长完整 {data["valid"]}/{data["total"]} 场',font=_load_font(10),fill=(127,151,177))
+        draw.text((x+w,y+h-10),f'时长完整 {data["valid"]}/{data["total"]} 场',font=_load_font(10),fill=C.FAINT,anchor="ra")
 
 
-def _draw_bar(draw, x, y, w, h, ratio, fill, bg=(54, 62, 76, 210)):
+def _draw_bar(draw, x, y, w, h, ratio, fill, bg=None):
     ratio = max(0.0, min(float(ratio or 0), 1.0))
-    draw.rounded_rectangle((x, y, x + w, y + h), radius=4, fill=bg)
+    draw.rounded_rectangle((x, y, x + w, y + h), radius=h / 2, fill=bg or with_alpha(C.INK, 24))
     if ratio > 0:
-        draw.rounded_rectangle((x, y, x + max(h, int(w * ratio)), y + h), radius=4, fill=fill)
+        draw.rounded_rectangle((x, y, x + max(h, int(w * ratio)), y + h), radius=h / 2, fill=fill)
 
 
 def _smooth_polyline(points, steps=14):
@@ -1996,15 +2046,15 @@ def _smooth_polyline(points, steps=14):
 
 
 def _winrate_color(wins, total):
-    return (100, 255, 120) if wins / max(total, 1) >= 0.5 else (255, 100, 100)
+    return C.WIN if wins / max(total, 1) >= 0.5 else C.LOSS
 
 
 def _carry_color(ratio):
     if ratio >= 100:
-        return (255, 215, 0)
+        return C.ACCENT
     if ratio > 80:
-        return (238, 242, 248)
-    return (180, 180, 190)
+        return C.INK
+    return C.MUTED
 
 
 def _carry_baseline(stats):
@@ -2044,9 +2094,7 @@ def _teammate_spotlight_height(stats):
         strong_count = len(stats.get("top3_strongest") or [])
         worst_entries = stats.get("top3_worst") or []
         worst_count = 1 if (worst_entries and all(_num(entry.get("kda")) > 1.0 for entry in worst_entries)) else len(worst_entries)
-        strong_h = 46 + max(1, strong_count) * 38
-        worst_h = 46 + max(1, worst_count) * 38
-        return strong_h + worst_h + 20
+        return 44 + max(1, strong_count, worst_count) * 48 + 6
     return 0
 
 
@@ -2063,11 +2111,7 @@ def _teammate_awards_height(stats):
 
 
 def _hero_ring_color(role_label):
-    return {
-        "Tank": (92, 178, 255, 255),
-        "Damage": (255, 118, 92, 255),
-        "Support": (117, 223, 174, 255),
-    }.get(role_label, (180, 190, 205, 255))
+    return C.ROLE_COLORS.get(role_label, (180, 190, 205))
 
 
 def _draw_top_rows(draw, rows, x, y, w, row_h, label_func, value_func, ratio_func, fill):
@@ -2119,12 +2163,13 @@ async def _make_period_background(size, matches):
     background = build_random_map_background(
         size,
         blur_radius=50,
-        overlay=(5, 8, 14, 166),
-        brightness=0.78,
-        color=0.86,
+        overlay=C.PAGE_OVERLAY,
+        brightness=C.PAGE_BRIGHTNESS,
+        color=C.PAGE_COLOR,
     )
     if background is not None:
-        return background
+        # Long pages must not lose contrast where the source artwork turns bright.
+        return Image.alpha_composite(background, vertical_scrim(size, 0, C.PAGE_FADE))
     return _make_background(size)
 
 
@@ -2182,13 +2227,7 @@ def _cover_fit(image, size):
 
 
 def _rounded_mask(size, radius=8):
-    cache_key = (int(size[0]), int(size[1]), int(radius))
-    mask = _SUMMARY_MASK_CACHE.get(cache_key)
-    if mask is None:
-        mask = Image.new("L", size, 0)
-        ImageDraw.Draw(mask).rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
-        _SUMMARY_MASK_CACHE[cache_key] = mask
-    return mask
+    return smooth_mask(size[0], size[1], radius)
 
 
 def _period_range_text(matches):
@@ -2205,10 +2244,10 @@ def _period_range_text(matches):
 def _result_color(ret):
     ret = _int(ret)
     if ret == 1:
-        return "胜利", (115, 225, 162, 255)
+        return "胜利", C.WIN
     if ret == 0:
-        return "平局", (255, 218, 117, 255)
-    return "战败", (255, 112, 112, 255)
+        return "平局", C.DRAW
+    return "战败", C.LOSS
 
 
 def _hero_icon_url(hero_guid):
@@ -2540,7 +2579,7 @@ def _build_period_stat_highlights(detail_pairs, resolved_target):
                 "raw_value_display": _format_hero_avg_value(raw_value, stat_name),
                 "map_guid": match_map_guid,
                 "band": band,
-                "color": PERIOD_HIGHLIGHT_BAND_COLORS.get(band, (246, 248, 255)),
+                "color": C.BAND_COLORS.get(band, C.INK),
                 "avg_ratio": avg_ratio,
                 "current": current_value,
             })
@@ -2565,7 +2604,7 @@ def _build_period_stat_highlights(detail_pairs, resolved_target):
 
 
 def _summary_winrate_color(total, wins):
-    return (100, 255, 120) if wins / max(total, 1) >= 0.5 else (255, 100, 100)
+    return C.WIN if wins / max(total, 1) >= 0.5 else C.LOSS
 
 
 def _build_period_profile_tag(stats, matches, highlights):
@@ -2747,69 +2786,114 @@ def _daily_win_stats(matches):
 
 def _weather_win_color(day_stats):
     if not day_stats or not day_stats.get("total"):
-        return (40, 46, 58, 170), (120, 132, 150), "-"
+        return with_alpha(C.INK, 12), C.FAINT, "-"
     ratio = day_stats["wins"] / max(day_stats["total"], 1)
     if ratio > 0.65:
-        return (255, 140, 0, 230), (255, 255, 255), "晴"
+        return with_alpha(C.WEATHER_COLORS["晴"], 235), (255, 255, 255), "晴"
     if ratio >= 0.50:
-        return (135, 206, 235, 225), (20, 30, 42), "云"
+        return with_alpha(C.WEATHER_COLORS["云"], 230), (14, 24, 36), "云"
     if ratio >= 0.35:
-        return (105, 112, 124, 220), (255, 255, 255), "阴"
-    return (70, 130, 180, 230), (255, 255, 255), "雨"
+        return with_alpha(C.WEATHER_COLORS["阴"], 230), (255, 255, 255), "阴"
+    return with_alpha(C.WEATHER_COLORS["雨"], 235), (255, 255, 255), "雨"
 
 
 def _summary_rainbow_colors():
-    return [
-        (255, 110, 110),
-        (255, 176, 74),
-        (255, 218, 117),
-        (117, 223, 174),
-        (139, 216, 255),
-        (177, 135, 255),
-    ]
+    return C.RAINBOW
 
 
 def _draw_rainbow_text(draw, x, y, text, font):
     cursor_x = x
     colors = _summary_rainbow_colors()
+    # One face throughout: per-character drawing cannot use the mixed-run layout.
+    font = draw.numeric_font(font.size) or font
     for idx, char in enumerate(str(text or "")):
         draw.text((cursor_x, y), char, font=font, fill=colors[idx % len(colors)])
-        cursor_x += _text_size(draw, char, font)[0]
+        cursor_x += draw.textlength(char, font=font)
     return cursor_x
 
 
-def _draw_rainbow_segments(draw, box, radius=8):
-    x1, y1, x2, y2 = [int(v) for v in box]
+def _rainbow_ring(size):
+    """Conic rainbow sized to ``size``, so a border changes hue all the way around."""
+    width, height = size
     colors = _summary_rainbow_colors()
-    total_w = max(1, x2 - x1)
-    seg_w = max(1, total_w // len(colors))
-    for idx, color in enumerate(colors):
-        seg_x1 = x1 + idx * seg_w
-        seg_x2 = x2 if idx == len(colors) - 1 else min(x2, seg_x1 + seg_w)
-        draw.rounded_rectangle((seg_x1, y1, seg_x2, y2), radius=radius, fill=color)
+    small_w, small_h = max(4, width // 3), max(4, height // 3)
+    pixels = []
+    for py in range(small_h):
+        for px in range(small_w):
+            turn = (atan2(py - small_h / 2, px - small_w / 2) / (2 * pi)) % 1 * len(colors)
+            index = int(turn) % len(colors)
+            amount = turn - int(turn)
+            start, end = colors[index], colors[(index + 1) % len(colors)]
+            pixels.append(tuple(round(a + (b - a) * amount) for a, b in zip(start, end)))
+    ring = Image.new("RGB", (small_w, small_h))
+    ring.putdata(pixels)
+    return ring.resize((width, height), Image.Resampling.BICUBIC)
+
+
+def _draw_rainbow_glow(draw, box, radius=10, spread=7):
+    x1, y1, x2, y2 = [int(v) for v in box]
+    width, height = x2 - x1 + 1, y2 - y1 + 1
+    size = (width + spread * 2, height + spread * 2)
+    mask = Image.new("L", size, 0)
+    mask.paste(smooth_mask(width, height, radius, 4), (spread, spread))
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=3)).point([value * 3 // 4 for value in range(256)])
+    draw.canvas.paste(_rainbow_ring(size), (x1 - spread, y1 - spread), mask)
+
+
+def _draw_rainbow_border(draw, box, radius=10, width=2):
+    x1, y1, x2, y2 = [int(v) for v in box]
+    size = (x2 - x1 + 1, y2 - y1 + 1)
+    draw.canvas.paste(_rainbow_ring(size), (x1, y1), smooth_mask(size[0], size[1], radius, width))
+
+
+def _draw_weather_glyph(draw, label, x, y, size, color):
+    """Small pictogram; ``x, y`` is the top-left of a ``size`` square."""
+    cx, cy = x + size / 2, y + size / 2
+    if label == "晴":
+        core = size * .26
+        draw.ellipse((cx - core, cy - core, cx + core, cy + core), fill=color)
+        for step in range(8):
+            angle = step * pi / 4
+            start, end = core + size * .08, size * .48
+            draw.line((cx + cos(angle) * start, cy + sin(angle) * start, cx + cos(angle) * end, cy + sin(angle) * end), fill=color, width=max(1.4, size * .09))
+        return
+    cloud_y = cy - (size * .08 if label == "雨" else 0)
+    for dx, dy, radius in ((-.2, .06, .2), (.03, -.06, .26), (.26, .08, .17)):
+        px, py, pr = cx + dx * size, cloud_y + dy * size, radius * size
+        draw.ellipse((px - pr, py - pr, px + pr, py + pr), fill=color)
+    draw.rounded_rectangle((cx - size * .38, cloud_y + size * .04, cx + size * .42, cloud_y + size * .26), radius=size * .1, fill=color)
+    if label == "雨":
+        for dx in (-.2, .02, .24):
+            draw.line((cx + dx * size, cloud_y + size * .34, cx + (dx - .07) * size, cloud_y + size * .5), fill=color, width=max(1.4, size * .09))
+
+
+def _weather_calendar_range(daily_stats):
+    end_day = max(daily_stats)
+    start_day = min(daily_stats)
+    start_day -= datetime.timedelta(days=start_day.weekday())
+    total_weeks = ((end_day - start_day).days + 7) // 7
+    return start_day, end_day, total_weeks
 
 
 def _draw_period_weather_calendar(draw, matches, x, y, w, h):
     daily_stats = _daily_win_stats(matches)
     if not daily_stats:
-        draw.text((x, y), "暂无足够日期数据。", font=_load_font(18), fill=(145, 155, 170))
+        draw.text((x, y), "暂无足够日期数据。", font=_load_font(18), fill=C.FAINT)
         return 120
 
-    end_day = max(daily_stats)
-    start_day = end_day - datetime.timedelta(days=41)
-    while start_day.weekday() != 0:
-        start_day -= datetime.timedelta(days=1)
-    total_days = (end_day - start_day).days + 1
-    total_weeks = max(1, (total_days + 6) // 7)
+    start_day, end_day, total_weeks = _weather_calendar_range(daily_stats)
 
-    draw.text((x, y), "最近胜率晴雨表", font=_load_font(18, bold=True), fill=(238, 242, 248))
-    draw.text((x + 166, y + 2), f"{start_day:%m-%d} 至 {end_day:%m-%d}", font=_load_font(14), fill=(160, 174, 194))
+    draw.text((x, y), "赛季胜率晴雨表", font=_load_font(17, bold=True), fill=C.INK)
+    draw.text((x + 150, y + 2), f"{start_day:%m-%d} 至 {end_day:%m-%d}", font=_load_font(14), fill=C.MUTED)
 
     weekdays = ["一", "二", "三", "四", "五", "六", "日"]
-    cell_w, cell_h, gap = 42, 30, 6
-    grid_x, grid_y = x, y + 54
+    legend_w = 150
+    gap = 6
+    cell_w = (w - legend_w - 24 - gap * 6) // 7
+    grid_x, grid_y = x, y + 56
+    cell_h = max(30, (h - 56 + gap) // total_weeks - gap)
     for idx, label in enumerate(weekdays):
-        draw.text((grid_x + idx * (cell_w + gap) + 14, y + 29), label, font=_load_font(12), fill=(150, 164, 184))
+        draw.text((grid_x + idx * (cell_w + gap) + cell_w / 2, y + 32), label, font=_load_font(12), fill=C.FAINT, anchor="ma")
 
     for day_idx in range(total_weeks * 7):
         day = start_day + datetime.timedelta(days=day_idx)
@@ -2819,26 +2903,29 @@ def _draw_period_weather_calendar(draw, matches, x, y, w, h):
         cy = grid_y + row * (cell_h + gap)
         day_stats = daily_stats.get(day)
         fill, text_fill, weather_label = _weather_win_color(day_stats)
-        outline = (255, 218, 117, 210) if day == end_day else (74, 88, 112, 140)
-        draw.rounded_rectangle((cx, cy, cx + cell_w, cy + cell_h), radius=6, fill=fill, outline=outline, width=1)
-        draw.text((cx + 6, cy + 5), f"{day.day}", font=_load_font(13, bold=True), fill=text_fill)
+        draw.rounded_rectangle((cx, cy, cx + cell_w, cy + cell_h), radius=8, fill=fill)
+        if day == end_day:
+            draw.rounded_rectangle((cx - 2, cy - 2, cx + cell_w + 2, cy + cell_h + 2), radius=10, outline=C.INK, width=2)
+        draw.text((cx + 7, cy + 5), f"{day.day}", font=_load_font(12), fill=text_fill)
         if day_stats and day_stats.get("total"):
-            draw.text((cx + 24, cy + 6), str(day_stats["total"]), font=_load_font(10), fill=text_fill)
-        elif weather_label == "-":
-            draw.text((cx + 27, cy + 6), "-", font=_load_font(10), fill=(120, 132, 150))
+            draw.text((cx + cell_w - 7, cy + cell_h - 6), str(day_stats["total"]), font=_load_font(15, bold=True), fill=text_fill, anchor="rs")
+            glyph = min(16, cell_h - 22)
+            if glyph >= 10:
+                _draw_weather_glyph(draw, weather_label, cx + 7, cy + cell_h - glyph - 5, glyph, text_fill)
 
-    legend_x = x + 370
-    legend_y = y + 54
+    legend_x = x + w - legend_w
+    legend_y = y + 56
     legend_items = [
-        ("晴 >65%", (255, 140, 0, 230)),
-        ("多云 50-65%", (135, 206, 235, 225)),
-        ("阴 35-50%", (105, 112, 124, 220)),
-        ("雨 <35%", (70, 130, 180, 230)),
+        ("晴", "晴 >65%"),
+        ("云", "多云 50-65%"),
+        ("阴", "阴 35-50%"),
+        ("雨", "雨 <35%"),
     ]
-    for idx, (label, color) in enumerate(legend_items):
-        yy = legend_y + idx * 28
-        draw.rounded_rectangle((legend_x, yy + 3, legend_x + 18, yy + 21), radius=4, fill=color)
-        draw.text((legend_x + 28, yy), label, font=_load_font(14), fill=(218, 228, 242))
+    for idx, (key, label) in enumerate(legend_items):
+        yy = legend_y + idx * 30
+        draw.rounded_rectangle((legend_x, yy, legend_x + 22, yy + 22), radius=6, fill=C.WEATHER_COLORS[key])
+        _draw_weather_glyph(draw, key, legend_x + 4, yy + 4, 14, (14, 24, 36) if key == "云" else (255, 255, 255))
+        draw.text((legend_x + 32, yy + 2), label, font=_load_font(13), fill=C.TEXT)
 
     ranked_days = sorted(
         ((day, data["wins"], data["total"]) for day, data in daily_stats.items() if data.get("total")),
@@ -2851,11 +2938,12 @@ def _draw_period_weather_calendar(draw, matches, x, y, w, h):
             ranked_days,
             key=lambda item: (item[1] / item[2], -item[2]),
         )[0]
-        draw.text((legend_x, legend_y + 134), "最佳天气", font=_load_font(15, bold=True), fill=(255, 218, 117))
-        draw.text((legend_x, legend_y + 160), f"{best_day:%m-%d}  {best_wins}/{best_total}  {_fmt_pct(best_wins, best_total)}", font=_load_font(14), fill=(218, 228, 242))
-        draw.text((legend_x, legend_y + 190), "低迷天气", font=_load_font(15, bold=True), fill=(139, 216, 255))
-        draw.text((legend_x, legend_y + 216), f"{low_day:%m-%d}  {low_wins}/{low_total}  {_fmt_pct(low_wins, low_total)}", font=_load_font(14), fill=(218, 228, 242))
-    return 54 + total_weeks * (cell_h + gap)
+        draw.line((legend_x, legend_y + 134, x + w, legend_y + 134), fill=C.HAIRLINE, width=1)
+        draw.text((legend_x, legend_y + 150), "最佳天气", font=_load_font(14, bold=True), fill=C.ACCENT)
+        draw.text((legend_x, legend_y + 174), f"{best_day:%m-%d}  {best_wins}/{best_total}  {_fmt_pct(best_wins, best_total)}", font=_load_font(13), fill=C.TEXT)
+        draw.text((legend_x, legend_y + 208), "低迷天气", font=_load_font(14, bold=True), fill=C.INFO)
+        draw.text((legend_x, legend_y + 232), f"{low_day:%m-%d}  {low_wins}/{low_total}  {_fmt_pct(low_wins, low_total)}", font=_load_font(13), fill=C.TEXT)
+    return 56 + total_weeks * (cell_h + gap)
 
 
 def _build_period_highlights(detail_pairs, resolved_target):
@@ -3055,7 +3143,7 @@ async def _build_match_awards(customer_token, matches, detail_pairs, target, all
     return select_awards(records, history)
 
 
-def _paste_summary_asset(canvas, filename, box):
+def _paste_summary_asset(canvas, filename, box, trim=False, on_chip=False):
     """Use the same shipped icons as match and rank-history renders."""
     path = RESOURCE_DIR / filename
     key = f"local:{path}"
@@ -3068,41 +3156,59 @@ def _paste_summary_asset(canvas, filename, box):
         except (OSError, ValueError):
             return False
     x, y, w, h = box
+    if trim and image.getbbox():
+        image = image.crop(image.getbbox())
+    if C.ROLE_ICON and not on_chip and filename in ROLE_ICON_FILES:
+        ink = Image.new("RGBA", image.size, (*C.ROLE_ICON, 255))
+        ink.putalpha(image.getchannel("A"))
+        image = ink
     image.thumbnail((w, h), Image.Resampling.LANCZOS)
+    if C.STICKER and filename.startswith("rank_flat/"):
+        image = _sticker_outline(image, C.STICKER)
     canvas.alpha_composite(image, (int(x+(w-image.width)/2), int(y+(h-image.height)/2)))
     return True
 
 
 def _draw_mode_badge(draw, x, y, match, compact=False, canvas=None):
     competitive = _is_comp(match)
-    color = (239, 184, 103) if competitive else (112, 204, 226)
+    color = C.MODE_COMP if competitive else C.MODE_QUICK
     label = ("竞技" if competitive else "快速") + ("乱斗" if _is_fight(match) else "")
     unknown = not str(match.get("gameMode") or match.get("_seasonSummaryMode") or "")
     if unknown:
-        label, color = "未知", (165, 178, 198)
-    w = 22 if compact else 27 + _text_size(draw, label, _load_font(13))[0]
-    draw.rounded_rectangle((x, y, x + w, y + 24), radius=6, fill=(24,34,48))
+        label, color = "未知", C.CHIP_MUTED
+    w = 24 if compact else 32 + _text_size(draw, label, _load_font(13))[0]
+    draw.rounded_rectangle((x, y, x + w, y + 24), radius=RADIUS_CHIP, fill=C.CHIP)
     asset = "fight.png" if _is_fight(match) else "comp.png" if competitive else None
     pasted = canvas is not None and asset and _paste_summary_asset(canvas, asset, (x+2,y+2,20,20))
     if not pasted:
         if unknown:
-            draw.text((x+6,y+2), "?", font=_load_font(14), fill=color)
+            draw.text((x+7,y+2), "?", font=_load_font(14), fill=color)
         elif competitive:
-            draw.polygon([(x+11,y+4),(x+17,y+12),(x+11,y+20),(x+5,y+12)], outline=color)
+            draw.polygon([(x+12,y+4),(x+18,y+12),(x+12,y+20),(x+6,y+12)], outline=color)
         else:
-            draw.polygon([(x+12,y+3),(x+6,y+13),(x+10,y+13),(x+8,y+21),(x+17,y+10),(x+12,y+10)], fill=color)
+            draw.polygon([(x+13,y+3),(x+7,y+13),(x+11,y+13),(x+9,y+21),(x+18,y+10),(x+13,y+10)], fill=color)
     if not compact:
-        draw.text((x+24,y+3), label, font=_load_font(13), fill=color)
+        draw.text((x+25,y+3), label, font=_load_font(13), fill=color)
     return w
 
 
-def _draw_summary_role(canvas, draw, role, x, y, size=20, label=False):
+def _draw_summary_role(canvas, draw, role, x, y, size=20, label=False, on_chip=False):
     file = {"Tank":"tank.png", "Damage":"dps.png", "Support":"healer.png"}.get(role)
     if file:
-        _paste_summary_asset(canvas, file, (x,y,size,size))
+        _paste_summary_asset(canvas, file, (x,y,size,size), on_chip=on_chip)
     if label or not file:
         text = {"Tank":"重装", "Damage":"输出", "Support":"支援"}.get(role, "未知职责")
-        draw.text((x+size+5,y+2),text,font=_load_font(13),fill=(203,215,230))
+        draw.text((x+size+5,y+2),text,font=_load_font(13),fill=C.TEXT)
+
+
+def draw_map_mode_icon(canvas, value, x, y, size=22):
+    return _draw_map_mode_icon(canvas, value, x, y, size, color=C.MAP_ICON)
+
+
+def _paste_hero_icon(canvas, draw, icon, x, y, size):
+    canvas.paste(icon, (x, y), _rounded_mask((size, size), size // 2))
+    if C.PORTRAIT_EDGE:
+        draw.ellipse((x - 1, y - 1, x + size, y + size), outline=C.PORTRAIT_EDGE, width=1)
 
 
 async def _paste_summary_hero(canvas, draw, hero, box):
@@ -3111,9 +3217,11 @@ async def _paste_summary_hero(canvas, draw, hero, box):
     if image:
         image = _cover_fit(image,(w,h))
         canvas.paste(image,(x,y),_rounded_mask((w,h),8))
+        if C.PORTRAIT_EDGE:
+            draw.rounded_rectangle((x-1,y-1,x+w,y+h),radius=9,outline=C.PORTRAIT_EDGE,width=1)
     else:
-        draw.rounded_rectangle((x,y,x+w,y+h),radius=8,fill=(40,54,73))
-        draw.text((x+4,y+h//3),_hero_name(hero)[:2] if hero else "?",font=_load_font(max(10,min(w//3,20))),fill=(196,213,232))
+        draw.rounded_rectangle((x,y,x+w,y+h),radius=8,fill=C.SURFACE_RAISED)
+        draw.text((x+w/2,y+h/2),_hero_name(hero)[:2] if hero else "?",font=_load_font(max(10,min(w//3,20))),fill=C.TEXT,anchor="mm")
 
 
 def _award_source_text(entry):
@@ -3130,7 +3238,7 @@ def _award_source_text(entry):
 
 async def _draw_award_card(canvas, draw, box, title, entry, breakthrough=False):
     x,y,right,bottom = box
-    color = (126,220,213) if breakthrough else (243,203,126)
+    color = C.TEAL if breakthrough else C.DRAW
     if breakthrough and entry:
         if entry.get("source") == "season":
             title = "最大突破 · 相较赛季"
@@ -3140,72 +3248,82 @@ async def _draw_award_card(canvas, draw, box, title, entry, breakthrough=False):
             title = "当场亮点 · 突破备选"
     _card(draw, box, title)
     if entry is None:
-        draw.text((x+25,y+96),"暂无足够数据进行评选",font=_load_font(24,bold=True),fill=color)
-        draw.text((x+25,y+145),"需至少 3 分钟及包含死亡的三项有效指标",font=_load_font(17),fill=(164,181,202))
+        draw.text((x+40,y+72),"暂无足够数据进行评选",font=_load_font(22,bold=True),fill=color)
+        draw.text((x+40,y+110),"需至少 3 分钟及包含死亡的三项有效指标",font=_load_font(16),fill=C.MUTED)
         return
-    await _paste_remote_cover(canvas,(x+2,y+53,right-2,bottom-2),_map_icon_url(entry["map_guid"]),radius=8,tint=(9,17,29,195))
-    draw.rounded_rectangle((x+1,y+18,x+5,bottom-18),radius=2,fill=color)
     hero = entry["hero_guid"]
-    await _paste_summary_hero(canvas,draw,hero,(x+25,y+76,82,82))
-    draw.rounded_rectangle((x+24,y+75,x+108,y+159),radius=9,outline=color,width=2)
-    label = _truncate_to_width(draw,_hero_name(hero),_load_font(26,bold=True),305)
-    draw.text((x+124,y+76),label,font=_load_font(26,bold=True),fill=(244,248,255))
-    _draw_summary_role(canvas,draw,entry["role"],x+125,y+116,20,label=True)
-    draw_subrole_badge(canvas, hero, x+190, y+114, 24)
-    _draw_mode_badge(draw,right-106,y+77,entry["match"],canvas=canvas)
+    banner = (x+16,y+58,right-16,y+226)
+    if not await _paste_remote_cover(canvas,banner,_map_icon_url(entry["map_guid"]),radius=RADIUS_TILE,tint=None,scrim=C.AWARD_SCRIM):
+        draw.rounded_rectangle((banner[0],banner[1],banner[2]-1,banner[3]-1),radius=RADIUS_TILE,fill=C.SURFACE_RAISED)
+    await _paste_summary_hero(canvas,draw,hero,(x+32,y+74,96,96))
+    draw.rounded_rectangle((x+31,y+73,x+129,y+171),radius=9,outline=color,width=2)
+    label = _truncate_to_width(draw,_hero_name(hero),_load_font(26,bold=True),300)
+    draw.text((x+146,y+74),label,font=_load_font(26,bold=True),fill=C.INK)
+    _draw_summary_role(canvas,draw,entry["role"],x+147,y+114,20,label=True)
+    draw_subrole_badge(canvas, hero, x+216, y+112, 24)
+    if _is_comp(entry["match"]):
+        _draw_summary_rank(canvas,draw,entry.get("rank_info") or entry["match"].get("rankInfo"),x+250,y+114,22)
+    mode_w = 32 + _text_size(draw, ("竞技" if _is_comp(entry["match"]) else "快速") + ("乱斗" if _is_fight(entry["match"]) else ""), _load_font(13))[0]
+    _draw_mode_badge(draw,right-32-mode_w,y+72,entry["match"],canvas=canvas)
     dt = datetime.datetime.fromtimestamp(entry["timestamp"]/1000)
     result,result_color = _result_color(entry["result"])
-    map_name = _truncate_to_width(draw,_map_name(entry["map_guid"]),_load_font(18),304)
-    draw_map_mode_icon(canvas, entry["map_guid"], x+25, y+177, 20)
-    draw.text((x+51,y+177),map_name,font=_load_font(18),fill=(226,235,245))
-    draw.text((x+25,y+207),f'{dt:%m-%d %H:%M} · {_fmt_time(entry["seconds"])} · {result}',font=_load_font(15),fill=result_color)
-    draw.text((right-118,y+143),_award_grade(entry["score"]),font=_load_font(56,bold=True),fill=color)
-    draw.text((right-118,y+208),"综合评价",font=_load_font(14),fill=(197,211,229))
-    if _is_comp(entry["match"]):
-        _draw_summary_rank(canvas,draw,entry.get("rank_info") or entry["match"].get("rankInfo"),x+238,y+116,22)
+    map_name = _truncate_to_width(draw,_map_name(entry["map_guid"]),_load_font(16),300)
+    draw_map_mode_icon(canvas, entry["map_guid"], x+146, y+145, 20)
+    draw.text((x+171,y+146),map_name,font=_load_font(16),fill=C.TEXT)
+    draw.text((x+32,y+190),f'{dt:%m-%d %H:%M} · {_fmt_time(entry["seconds"])} · {result}',font=_load_font(15),fill=result_color)
+    grade_font = draw.numeric_font(64) or _load_font(56,bold=True)
+    draw.text((right-74,y+142),_award_grade(entry["score"]),font=grade_font,fill=color,anchor="mm")
+    draw.text((right-74,y+194),"综合评价",font=_load_font(13),fill=C.TEXT,anchor="ma")
     heroes = [h for h in entry.get("heroes",[hero]) if h != hero]
-    draw.text((x+25,y+250),"本局还使用" if heroes else "本局主英雄",font=_load_font(13),fill=(173,193,215))
+    draw.text((x+32,y+246),"本局还使用" if heroes else "本局主英雄",font=_load_font(13),fill=C.MUTED)
     for i,h in enumerate((heroes or [hero])[:8]):
-        await _paste_summary_hero(canvas,draw,h,(x+115+i*39,y+239,32,32))
+        await _paste_summary_hero(canvas,draw,h,(x+122+i*38,y+238,32,32))
     if len(heroes)>8:
-        draw.text((x+430,y+249),f"+{len(heroes)-8}",font=_load_font(13),fill=color)
+        draw.text((x+430,y+246),f"+{len(heroes)-8}",font=_load_font(13),fill=color)
     feature_rows = entry.get("feature_evidence",[])[:2]
+    evidence_y = y+284
     for i,ev in enumerate(feature_rows):
-        name=_truncate_to_width(draw,ev["label"],_load_font(16),245)
+        name=_truncate_to_width(draw,ev["label"],_load_font(15),245)
         if ev["unit"]=="ratio":
-            text=f'{name} {ev["value"]:.0%} · +{(ev["value"]-ev["baseline"])*100:.1f} 个百分点'
+            value=f'{ev["value"]:.0%} · +{(ev["value"]-ev["baseline"])*100:.1f} 个百分点'
         else:
             unit=" / 10分钟" if ev["unit"]=="per10" else " / 场"
-            text=f'{name} {ev["value"]:.1f}{unit} · +{ev["change"]:.0%}'
-        draw.text((x+25,y+286+i*28),text,font=_load_font(16),fill=(151,235,214))
+            value=f'{ev["value"]:.1f}{unit} · +{ev["change"]:.0%}'
+        row_y=evidence_y+i*30
+        draw.text((x+32,row_y),name,font=_load_font(15),fill=C.TEAL)
+        draw.text((right-32,row_y),value,font=_load_font(15),fill=C.TEAL,anchor="ra")
     for i,ev in enumerate(entry["evidence"][:3-len(feature_rows)]):
         unit=" / 场" if ev.get("unit")=="per_game" else " / 10分钟"
-        text=f'{AWARD_METRICS[ev["key"]][0]} {ev["value"]:.1f}{unit} · 参照 {ev["baseline"]:.1f}'
-        draw.text((x+25,y+286+(i+len(feature_rows))*28),text,font=_load_font(16),fill=(225,234,246))
-    draw.line((x+25,bottom-65,right-25,bottom-65),fill=(79,101,127),width=1)
-    draw.text((x+25,bottom-49),_award_source_text(entry),font=_load_font(14),fill=(181,201,222))
+        row_y=evidence_y+(i+len(feature_rows))*30
+        draw.text((x+32,row_y),AWARD_METRICS[ev["key"]][0],font=_load_font(15),fill=C.TEXT)
+        draw.text((right-32,row_y),f'{ev["value"]:.1f}{unit} · 参照 {ev["baseline"]:.1f}',font=_load_font(15),fill=C.INK,anchor="ra")
+    draw.line((x+32,bottom-54,right-32,bottom-54),fill=C.HAIRLINE,width=1)
+    draw.text((x+32,bottom-42),_award_source_text(entry),font=_load_font(13),fill=C.MUTED)
     if feature_rows:
-        draw.text((x+25,bottom-27),"特色提升对比个人赛季同英雄数据",font=_load_font(12),fill=(154,177,204))
+        draw.text((right-32,bottom-42),"特色提升对比个人赛季同英雄数据",font=_load_font(12),fill=C.FAINT,anchor="ra")
 
 
-def _draw_summary_rank(canvas,draw,rank_info,x,y,size=18):
+def _draw_summary_rank(canvas,draw,rank_info,x,y,size=18,font_size=None,align_right=False):
     rank_info=rank_info or {}
     name=get_rank_name(rank_info)
     tier=get_rank_sub_tier(rank_info)
     raw_strength=raw_rank_score_to_strength(get_rank_score(rank_info))
     label=f"{rank_name_cn(name)}{tier}" if name else strength_score_to_rank(raw_strength,chinese=True) if raw_strength is not None else "段位未知"
     level=rank_info_to_icon_level(rank_info)
+    font=_load_font(font_size or (12 if size<=18 else 14))
+    if align_right:
+        # ``x`` is the right edge; the icon sits against the measured label.
+        x-=_text_size(draw,label,font)[0]+size+C.RANK_SHIFT
     if level:
-        _paste_summary_asset(canvas,f"rank_flat/{level}.png",(x,y,size,size))
-    draw.text((x+size+3,y+2),label,font=_load_font(12 if size<=18 else 14),fill=(220,224,240))
-
+        _paste_summary_asset(canvas,f"rank_flat/{level}_pure.png",(x,y,size,size),trim=True)
+    draw.text((x+size+3,y+(size-_text_size(draw,label,font)[1])/2-1 if align_right else y+2),label,font=font,fill=C.RANK_TEXT)
 
 
 def _performance_style(entry):
     if not entry:
         return "—", (90,109,133)
     grade=_award_grade(entry["score"])
-    return grade, {"S":(243,195,109),"A":(153,219,163),"B":(105,198,204),"C":(164,147,203),"D":(187,146,149)}[grade]
+    return grade, C.GRADE_COLORS[grade]
 
 
 def _human_ratio(entries):
@@ -3220,27 +3338,88 @@ def _human_ratio(entries):
     return human, len(valid)
 
 
-def _draw_human_ratio(draw, entries, total, x, y, w):
+def _draw_human_glyph(draw, x, y, size, color):
+    head = size * .3
+    cx = x + size / 2
+    draw.ellipse((cx - head, y + 1, cx + head, y + 1 + head * 2), fill=color)
+    draw.rounded_rectangle((x + size * .12, y + size * .64, x + size * .88, y + size), radius=size * .17, fill=color)
+
+
+def _draw_bot_glyph(draw, x, y, size, color):
+    cx = x + size / 2
+    draw.line((cx, y + 1, cx, y + size * .24), fill=color, width=2)
+    draw.ellipse((cx - 3, y - 1, cx + 3, y + 5), fill=color)
+    draw.rounded_rectangle((x + size * .08, y + size * .24, x + size * .92, y + size), radius=size * .16, fill=color)
+    eye = size * .09
+    for ex in (x + size * .33, x + size * .67):
+        draw.ellipse((ex - eye, y + size * .5 - eye, ex + eye, y + size * .5 + eye), fill=(14, 20, 30))
+    draw.rounded_rectangle((x + size * .3, y + size * .74, x + size * .7, y + size * .83), radius=1, fill=(14, 20, 30))
+
+
+def _omnic_for_share(bot_share):
+    return next(hero for limit, hero in OMNIC_BOT_TIERS if bot_share < limit)
+
+
+async def _draw_omnic_portrait(canvas, draw, bot_share, x, y, size):
+    image = await _load_summary_image(_hero_icon_url(_omnic_for_share(bot_share)))
+    if not image:
+        _draw_bot_glyph(draw, x + 5, y + 5, size - 10, C.BOT)
+        return
+    draw.ellipse((x - 2, y - 2, x + size + 1, y + size + 1), fill=tinted(C.BOT, .35), outline=C.BOT, width=2)
+    canvas.paste(_cover_fit(image, (size, size)), (x, y), _rounded_mask((size, size), size // 2))
+
+
+async def _draw_human_ratio(canvas, draw, entries, total, x, y, w):
     human, count = _human_ratio(entries)
-    green, pink = (112, 210, 172), (245, 111, 145)
-    draw.text((x,y), "你是人类吗？", font=_load_font(18,bold=True), fill=(228,238,249))
+    draw.text((x,y), "你是人类吗？", font=_load_font(17,bold=True), fill=C.INK)
     coverage = f"已评价 {count}/{total} 场"
-    draw.text((x+w-_text_size(draw,coverage,_load_font(12))[0],y+4),coverage,font=_load_font(12),fill=(145,163,185))
-    by=y+31
-    draw.rounded_rectangle((x,by,x+w,by+18),radius=9,fill=(49,61,78))
+    draw.text((x+w,y+4),coverage,font=_load_font(12),fill=C.MUTED,anchor="ra")
+    top,height=y+28,60
+    center=top+height//2
+    draw.rounded_rectangle((x,top,x+w,top+height),radius=RADIUS_TILE,fill=C.SURFACE_SUNKEN,outline=C.STROKE,width=1)
+    human_color=C.HUMAN if count else C.FAINT
+    bot_color=C.BOT if count else C.FAINT
+    _draw_human_glyph(draw,x+16,center-17,34,human_color)
     if count:
-        split=x+w*human/count
-        draw.rounded_rectangle((x,by,x+w,by+18),radius=9,fill=green if human==count else pink)
-        if 0<human<count:
-            draw.rounded_rectangle((x,by,split,by+18),radius=9,fill=green)
-            if split-x>9:
-                draw.rectangle((split-9,by,split,by+18),fill=green)
-        left=f"人类 {human/count:.1%}"
-        right=f"人机 {1-human/count:.1%}"
+        await _draw_omnic_portrait(canvas,draw,1-human/count,x+w-58,center-22,44)
     else:
-        left,right="人类 —","人机 —"
-    draw.text((x,by+24),left,font=_load_font(15,bold=True),fill=green)
-    draw.text((x+w-_text_size(draw,right,_load_font(15,bold=True))[0],by+24),right,font=_load_font(15,bold=True),fill=pink)
+        _draw_bot_glyph(draw,x+w-50,center-17,34,bot_color)
+    side=190
+    draw.text((x+60,center-19),"人类",font=_load_font(12),fill=C.MUTED)
+    draw.text((x+w-68,center-19),"人机",font=_load_font(12),fill=C.MUTED,anchor="ra")
+    if count:
+        left=f"{human/count:.1%}"
+        right=f"{1-human/count:.1%}"
+    else:
+        left,right="—","—"
+    value_font=_load_font(22,bold=True)
+    draw.text((x+60,center-3),left,font=value_font,fill=C.HUMAN_TEXT if count else C.FAINT)
+    draw.text((x+w-68,center-3),right,font=value_font,fill=C.BOT_TEXT if count else C.FAINT,anchor="ra")
+    bar_x,bar_w=x+side,w-side*2
+    bar_h=24
+    bar_y=center-bar_h//2
+    if not count:
+        draw.rounded_rectangle((bar_x,bar_y,bar_x+bar_w,bar_y+bar_h),radius=7,fill=with_alpha(C.INK,24))
+        return
+    # Both sides brighten toward the seam, so contrast peaks at the transition.
+    seam=round(bar_w*human/count)
+    bar=Image.new("RGB",(bar_w,bar_h))
+    if seam>0:
+        bar.paste(horizontal_gradient((seam,bar_h),C.HUMAN_DEEP,C.HUMAN),(0,0))
+    if seam<bar_w:
+        bar.paste(horizontal_gradient((bar_w-seam,bar_h),C.BOT,C.BOT_DEEP),(seam,0))
+    step=bar_w/count
+    if step>=6:
+        pen=ImageDraw.Draw(bar)
+        for index in range(1,count):
+            notch=round(index*step)
+            pen.rectangle((notch-1,0,notch,bar_h),fill=C.NOTCH)
+    draw.canvas.paste(bar,(bar_x,bar_y),_rounded_mask(bar.size,7))
+    if 0<human<count:
+        seam_x=bar_x+seam
+        draw.rounded_rectangle((seam_x-7,center-25,seam_x+7,center+25),radius=7,fill=with_alpha(C.SEAM,C.SEAM_GLOW[0]))
+        draw.rounded_rectangle((seam_x-4,center-25,seam_x+4,center+25),radius=4,fill=with_alpha(C.SEAM,C.SEAM_GLOW[1]))
+        draw.rounded_rectangle((seam_x-2,center-25,seam_x+1,center+25),radius=2,fill=C.SEAM)
 
 
 def _daily_result_series(matches):
@@ -3273,94 +3452,173 @@ def _daily_result_series(matches):
 
 def _draw_daily_results(draw, matches, x, y, w, h):
     rows = _daily_result_series(matches)
-    green,pink,gold=(112,210,172),(245,111,145),(243,195,109)
-    draw.text((x,y),"每日胜负",font=_load_font(17,bold=True),fill=(229,239,249))
-    legend="胜 / 负 · 累计净胜场"
-    draw.text((x+w-_text_size(draw,legend,_load_font(12))[0],y+4),legend,font=_load_font(12),fill=gold)
+    draw.text((x,y),"每日胜负",font=_load_font(17,bold=True),fill=C.INK)
+    legend_font=_load_font(12)
+    cursor=x+w
+    for label,color,line in (("累计净胜场",C.DRAW,True),("负",C.LOSS,False),("胜",C.WIN,False)):
+        cursor-=_text_size(draw,label,legend_font)[0]
+        draw.text((cursor,y+4),label,font=legend_font,fill=color)
+        if line:
+            cursor-=22
+            draw.line((cursor,y+11,cursor+16,y+11),fill=color,width=2)
+        else:
+            cursor-=16
+            draw.rounded_rectangle((cursor,y+6,cursor+10,y+16),radius=2,fill=color)
+        cursor-=14
     if not rows:
-        draw.text((x,y+50),"暂无数据",font=_load_font(14),fill=(145,163,185))
+        draw.text((x,y+50),"暂无数据",font=_load_font(14),fill=C.FAINT)
         return
-    left,right=x+25,x+w-38
-    top,bottom=y+35,y+h-27
-    center=(top+bottom)/2
-    half=(bottom-top)/2
-    peak=max(1,max(max(row[1],row[2],abs(row[3])) for row in rows))
-    draw.line((left,center,right,center),fill=(104,125,148),width=1)
-    draw.text((x,center-6),"0",font=_load_font(10),fill=(164,177,197))
-    draw.text((x,top),str(peak),font=_load_font(10),fill=green)
-    draw.text((x,bottom-10),str(-peak),font=_load_font(10),fill=pink)
+    left,right=x+30,x+w-30
     step=(right-left)/len(rows)
-    points=[]
+    scale_font=_load_font(10)
+
+    # Net total and daily counts have different ranges, so each gets its own panel.
+    net_top=y+36
+    net_h=int((h-36-24)*.46)
+    net_bottom=net_top+net_h
+    bars_top=net_bottom+16
+    bars_bottom=y+h-22
+    nets=[row[3] for row in rows]
+    high,low=max(0,max(nets)),min(0,min(nets))
+    span=max(1,high-low)
+    net_zero=net_top+net_h*high/span
+    points=[(left+(i+.5)*step,net_top+net_h*(high-net)/span) for i,net in enumerate(nets)]
+    if len(points)>1:
+        first_x,last_x=points[0][0],points[-1][0]
+        draw.polygon([(first_x,net_zero),*[(px,min(py,net_zero)) for px,py in points],(last_x,net_zero)],fill=with_alpha(C.WIN,64))
+        draw.polygon([(first_x,net_zero),*[(px,max(py,net_zero)) for px,py in points],(last_x,net_zero)],fill=with_alpha(C.LOSS,64))
+    draw.line((left,net_zero,right,net_zero),fill=(*C.INK,46),width=1)
+    draw.text((left-6,net_zero),"0",font=scale_font,fill=C.MUTED,anchor="rm")
+    if high>0:
+        draw.text((left-6,net_top),f"+{high}",font=scale_font,fill=C.WIN,anchor="rm")
+    if low<0:
+        draw.text((left-6,net_bottom),str(low),font=scale_font,fill=C.LOSS,anchor="rm")
+    if len(points)>1:
+        draw.line(points,fill=C.DRAW,width=2)
+    end_x,end_y=points[-1]
+    draw.ellipse((end_x-4,end_y-4,end_x+4,end_y+4),fill=C.DRAW)
+    draw.text((end_x+8,end_y),f"{nets[-1]:+d}",font=_load_font(13,bold=True),fill=C.DRAW,anchor="lm")
+
+    peak=max(1,max(max(row[1],row[2]) for row in rows))
+    center=(bars_top+bars_bottom)/2
+    half=(bars_bottom-bars_top)/2
     for i,(day,win,loss,net_wins) in enumerate(rows):
         cx=left+(i+.5)*step
-        bw=max(.5,step*.68)
+        bw=max(1,step*.68)
         if win:
-            height = half*win/peak
-            draw.rounded_rectangle((cx-bw/2,center-height,cx+bw/2,center),
-                                   radius=min(3,bw/2,height/2),fill=green)
+            height = max(2,half*win/peak)
+            draw.rounded_rectangle((cx-bw/2,center-height,cx+bw/2,center-1),
+                                   radius=min(3,bw/2,height/2),fill=C.WIN)
         if loss:
-            height = half*loss/peak
-            draw.rounded_rectangle((cx-bw/2,center,cx+bw/2,center+height),
-                                   radius=min(3,bw/2,height/2),fill=pink)
-        points.append((cx,center-half*net_wins/peak))
-    if len(points)>1: draw.line(points,fill=gold,width=2)
-    cx,cy=points[-1]
-    draw.ellipse((cx-3,cy-3,cx+3,cy+3),fill=gold)
-    for i in sorted({0,len(rows)//2,len(rows)-1}):
-        text=f"{rows[i][0]:%m/%d}"
-        tx=left+(i+.5)*step-_text_size(draw,text,_load_font(10))[0]/2
-        draw.text((tx,bottom+9),text,font=_load_font(10),fill=(154,174,196))
+            height = max(2,half*loss/peak)
+            draw.rounded_rectangle((cx-bw/2,center+1,cx+bw/2,center+height),
+                                   radius=min(3,bw/2,height/2),fill=C.LOSS)
+    draw.line((left,center,right,center),fill=(*C.INK,46),width=1)
+    draw.text((left-6,bars_top),str(peak),font=scale_font,fill=C.WIN,anchor="rm")
+    draw.text((left-6,bars_bottom),str(peak),font=scale_font,fill=C.LOSS,anchor="rm")
+
+    ticks=sorted({round(part*(len(rows)-1)/4) for part in range(5)})
+    for i in ticks:
+        tick_x=left+(i+.5)*step
+        draw.line((tick_x,net_top,tick_x,bars_bottom),fill=C.HAIRLINE,width=1)
+        draw.text((tick_x,bars_bottom+8),f"{rows[i][0]:%m/%d}",font=scale_font,fill=C.FAINT,anchor="ma")
+
+
+def _timeline_runs(matches):
+    """Group consecutive results, breaking on the same outcomes as the streak summary."""
+    runs=[]
+    for index,match in enumerate(matches):
+        ret=_int(match.get("matchRet"))
+        state=1 if ret==1 else -1 if ret==-1 else 0
+        if runs and state and runs[-1]["state"]==state:
+            runs[-1]["count"]+=1
+        else:
+            runs.append({"state":state,"start":index,"count":1})
+    return runs
+
+
+def _draw_streak_ribbons(draw,matches,x,y):
+    pitch_x=TIMELINE_TILE_W+TIMELINE_GAP
+    pitch_y=TIMELINE_TILE_H+TIMELINE_GAP+TIMELINE_RIBBON_H
+    radius=9
+    for run in _timeline_runs(matches):
+        color={1:C.WIN,-1:C.LOSS}.get(run["state"],C.DRAW)
+        index,remaining=run["start"],run["count"]
+        streak=remaining>=2
+        while remaining:
+            row,col=divmod(index,TIMELINE_COLUMNS)
+            span=min(remaining,TIMELINE_COLUMNS-col)
+            left=x+col*pitch_x
+            right=left+span*TIMELINE_TILE_W+(span-1)*TIMELINE_GAP-1
+            top=y+row*pitch_y+TIMELINE_TILE_H+6
+            if streak:
+                draw.rounded_rectangle((left,top,right,top+18),radius=radius,fill=color)
+                # Square ends mark a streak that carries over a row break.
+                if index>run["start"]:
+                    draw.rectangle((left,top,left+radius,top+18),fill=color)
+                if remaining>span:
+                    draw.rectangle((right-radius,top,right,top+18),fill=color)
+                if index==run["start"]:
+                    label=f'{run["count"]}{"连胜" if run["state"]==1 else "连败"}'
+                    draw.text((left+12,top+9),label,font=_load_font(13,bold=True),fill=C.STREAK_TEXT,anchor="lm")
+            else:
+                draw.rounded_rectangle((left+4,top+7,right-4,top+11),radius=2,fill=with_alpha(color,120))
+            index+=span
+            remaining-=span
 
 
 async def _draw_match_timeline(canvas,draw,box,matches,streak_text,awards=None):
     x,y,right,bottom=box
     _card(draw,box,"对局时间线")
-    _draw_mode_badge(draw,right-192,y+17,{"gameMode":"QuickPlay"},canvas=canvas)
-    _draw_mode_badge(draw,right-104,y+17,{"gameMode":"Sport"},canvas=canvas)
-    for i,(label,color) in enumerate([("S",(243,195,109)),("A",(153,219,163)),("B",(105,198,204)),("C",(164,147,203)),("D",(187,146,149))]):
-        xx=x+235+i*90
-        draw.rounded_rectangle((xx,y+24,xx+12,y+36),radius=3,outline=color,width=2)
-        draw.text((xx+19,y+20),label,font=_load_font(13),fill=(180,197,217))
+    _draw_mode_badge(draw,right-176,y+19,{"gameMode":"QuickPlay"},canvas=canvas)
+    _draw_mode_badge(draw,right-92,y+19,{"gameMode":"Sport"},canvas=canvas)
+    for i,(label,color) in enumerate(C.GRADE_COLORS.items()):
+        xx=x+210+i*44
+        draw.rounded_rectangle((xx,y+24,xx+14,y+38),radius=4,outline=color,width=2)
+        draw.text((xx+20,y+22),label,font=_load_font(13),fill=C.MUTED)
     awards=awards or {}
     evaluated={_award_key(r):r for r in awards.get("evaluated",[])}
     records={_award_key(r):r for r in awards.get("records",[])}
     for i,match in enumerate(matches):
-        row,col=divmod(i,8)
-        left,top=x+24+col*158,y+65+row*142
+        row,col=divmod(i,TIMELINE_COLUMNS)
+        left,top=x+24+col*(TIMELINE_TILE_W+TIMELINE_GAP),y+64+row*(TIMELINE_TILE_H+TIMELINE_GAP+TIMELINE_RIBBON_H)
+        tile_right,tile_bottom=left+TIMELINE_TILE_W-1,top+TIMELINE_TILE_H-1
         key=str(match.get("matchId") or match.get("beginTs") or "")
         entry=evaluated.get(key)
         record=records.get(key) or entry or {}
         label,border=_performance_style(entry)
-        draw.rounded_rectangle((left,top,left+148,top+132),radius=10,fill=(22,33,48))
-        await _paste_remote_cover(canvas,(left+2,top+2,left+146,top+70),_map_icon_url(match.get("mapGuid")),radius=8,tint=(8,15,26,105))
-        hero=record.get("hero_guid") or match.get("heroGuid")
-        await _paste_summary_hero(canvas,draw,hero,(left+10,top+30,35,35))
-        dt=datetime.datetime.fromtimestamp(_num(match.get("beginTs"))/1000)
-        draw.text((left+10,top+9),f'{dt:%H:%M}',font=_load_font(16,bold=True),fill=(246,249,255))
-        _draw_mode_badge(draw,left+117,top+7,match,compact=True,canvas=canvas)
-        _draw_summary_role(canvas,draw,record.get("role") or _role_label(hero),left+119,top+45,18)
-        draw_subrole_badge(canvas, hero, left+96, top+44, 20)
-        name=_truncate_to_width(draw,_map_name(match.get("mapGuid")),_load_font(14),106)
-        draw_map_mode_icon(canvas, match.get("mapGuid"), left+8, top+75, 18)
-        draw.text((left+30,top+75),name,font=_load_font(14),fill=(220,231,245))
         result,color=_result_color(match.get("matchRet"))
-        draw.text((left+10,top+99),result,font=_load_font(14),fill=color)
-        draw.text((left+89,top+95),label,font=_load_font(20,bold=True),fill=border)
+        draw.rounded_rectangle((left,top,tile_right,tile_bottom),radius=RADIUS_TILE,fill=tinted(color,C.TILE_TINT))
+        await _paste_remote_cover(canvas,(left+3,top+3,tile_right-2,top+76),_map_icon_url(match.get("mapGuid")),radius=8,tint=C.TILE_COVER_TINT)
+        hero=record.get("hero_guid") or match.get("heroGuid")
+        await _paste_summary_hero(canvas,draw,hero,(left+9,top+36,36,36))
+        dt=datetime.datetime.fromtimestamp(_num(match.get("beginTs"))/1000)
+        draw.rounded_rectangle((left+8,top+8,left+60,top+31),radius=RADIUS_CHIP,fill=C.CHIP)
+        draw.text((left+34,top+19),f'{dt:%H:%M}',font=_load_font(15,bold=True),fill=C.CHIP_TEXT,anchor="mm")
+        _draw_mode_badge(draw,tile_right-32,top+8,match,compact=True,canvas=canvas)
+        draw.rounded_rectangle((tile_right-61,top+45,tile_right-8,top+71),radius=RADIUS_CHIP,fill=C.CHIP)
+        _draw_summary_role(canvas,draw,record.get("role") or _role_label(hero),tile_right-30,top+49,18,on_chip=True)
+        draw_subrole_badge(canvas, hero, tile_right-57, top+48, 20)
+        name=_truncate_to_width(draw,_map_name(match.get("mapGuid")),_load_font(13),TIMELINE_TILE_W-40)
+        draw_map_mode_icon(canvas, match.get("mapGuid"), left+8, top+82, 18)
+        draw.text((left+30,top+83),name,font=_load_font(13),fill=C.TEXT)
+        draw.text((left+10,top+105),result,font=_load_font(15,bold=True),fill=color)
+        draw.text((tile_right-10,top+102),label,font=draw.numeric_font(24) or _load_font(20,bold=True),fill=border,anchor="ra")
+        draw.text((left+10,top+133),f'{dt:%m/%d}',font=_load_font(12),fill=C.MUTED)
         if _is_comp(match):
-            _draw_summary_rank(canvas,draw,record.get("rank_info") or match.get("rankInfo"),left+10,top+113,16)
-        else:
-            draw.text((left+10,top+115),f'{dt:%m/%d}',font=_load_font(11),fill=(142,164,190))
-        draw.rounded_rectangle((left,top,left+148,top+132),radius=10,outline=border,width=2 if entry else 1)
-    draw.text((x+25,bottom-112),streak_text,font=_load_font(13),fill=(166,186,208))
+            _draw_summary_rank(canvas,draw,record.get("rank_info") or match.get("rankInfo"),tile_right-9,top+123,28,font_size=15,align_right=True)
+        draw.rounded_rectangle((left,top,tile_right,tile_bottom),radius=RADIUS_TILE,outline=with_alpha(border,235 if entry else 90),width=2 if entry else 1)
+    _draw_streak_ribbons(draw,matches,x+24,y+64)
+    draw.text((x+24,bottom-126),streak_text,font=_load_font(13),fill=C.MUTED)
 
-    _draw_human_ratio(draw, list(evaluated.values()), len(matches), x+25, bottom-84, right-x-50)
+    await _draw_human_ratio(canvas, draw, list(evaluated.values()), len(matches), x+24, bottom-102, right-x-48)
 
 
-async def _paste_remote_cover(canvas, box, url, radius=8, tint=(8, 12, 20, 125)):
+async def _paste_remote_cover(canvas, box, url, radius=8, tint=(8, 12, 20, 125), scrim=None):
     x1, y1, x2, y2 = box
     width = int(x2 - x1)
     height = int(y2 - y1)
-    cache_key = (str(url or "").strip(), width, height, int(radius), tuple(tint or ()))
+    cache_key = (str(url or "").strip(), width, height, int(radius), tuple(tint or ()), tuple(scrim or ()), C.NAME)
     cached_cover = _get_cached_summary_cover_copy(cache_key)
     if cached_cover is not None:
         canvas.paste(cached_cover, (x1, y1), _rounded_mask(cached_cover.size, radius))
@@ -3372,6 +3630,8 @@ async def _paste_remote_cover(canvas, box, url, radius=8, tint=(8, 12, 20, 125))
     image = _cover_fit(image, (width, height))
     if tint:
         image = Image.alpha_composite(image, Image.new("RGBA", image.size, tint))
+    if scrim:
+        image = Image.alpha_composite(image, horizontal_scrim(image.size, scrim))
     _put_summary_cover_cache(cache_key, image)
     canvas.paste(image, (x1, y1), _rounded_mask(image.size, radius))
     return True
@@ -3379,25 +3639,24 @@ async def _paste_remote_cover(canvas, box, url, radius=8, tint=(8, 12, 20, 125))
 
 async def _draw_teammate_spotlight(draw, canvas, box, title, entries, color, is_worst=False):
     x1, y1, x2, y2 = box
-    draw.rounded_rectangle(box, radius=8, fill=(28, 36, 50, 185), outline=color, width=1)
-    draw.text((x1 + 14, y1 + 10), title, font=_load_font(16, bold=True), fill=color)
-    draw.line((x1 + 12, y1 + 34, x2 - 12, y1 + 34), fill=(55, 60, 75), width=1)
+    draw.rounded_rectangle(box, radius=RADIUS_TILE, fill=C.SURFACE_SUNKEN, outline=with_alpha(color, 90), width=1)
+    draw.text((x1 + 14, y1 + 11), title, font=_load_font(15, bold=True), fill=color)
 
     if is_worst and entries and all(_num(entry.get("kda")) > 1.0 for entry in entries):
-        draw.text((x1 + 16, y1 + 52), "队友都挺能打", font=_load_font(15, bold=True), fill=(100, 255, 180))
+        draw.text(((x1 + x2) / 2, (y1 + 34 + y2) / 2), "队友都挺能打", font=_load_font(15, bold=True), fill=C.WIN, anchor="mm")
         return
     if not entries:
-        draw.text((x1 + 16, y1 + 52), "暂无记录", font=_load_font(14), fill=(145, 155, 170))
+        draw.text((x1 + 14, y1 + 52), "暂无记录", font=_load_font(14), fill=C.FAINT)
         return
 
     for idx, entry in enumerate(entries[:3]):
-        row_y = y1 + 42 + idx * 34
+        row_y = y1 + 42 + idx * 48
         hero_icon = await _load_summary_image(_hero_icon_url(entry.get("heroGuid")))
         if hero_icon:
-            hero_icon = _cover_fit(hero_icon, (24, 24))
-            canvas.paste(hero_icon, (x1 + 14, row_y + 3), _rounded_mask((24, 24), 12))
+            hero_icon = _cover_fit(hero_icon, (34, 34))
+            _paste_hero_icon(canvas, draw, hero_icon, x1 + 12, row_y + 4, 34)
         else:
-            draw.ellipse((x1 + 14, row_y + 3, x1 + 38, row_y + 27), fill=(55, 65, 82, 210))
+            draw.ellipse((x1 + 12, row_y + 4, x1 + 46, row_y + 38), fill=C.SURFACE_RAISED)
 
         name_font = _load_font(14, bold=True)
         risk_font = _load_font(8, bold=True)
@@ -3410,15 +3669,15 @@ async def _draw_teammate_spotlight(draw, canvas, box, title, entries, color, is_
             padding_y=2,
             max_width=90,
         )
-        name_max_width = max(92, 210 - risk_width - (6 if risk_width else 0))
+        name_max_width = max(92, x2 - x1 - 68 - risk_width - (6 if risk_width else 0))
         name_text = _truncate_to_width(draw, entry.get("name"), name_font, name_max_width)
-        draw.text((x1 + 46, row_y + 1), name_text, font=name_font, fill=(246, 248, 255))
+        draw.text((x1 + 54, row_y + 2), name_text, font=name_font, fill=C.INK)
         if risk_width:
             name_width = _text_size(draw, name_text, name_font)[0]
             draw_risk_status_badge(
                 draw,
-                x1 + 46 + name_width + 6,
-                row_y + max(1, int((28 - risk_height) / 2)),
+                x1 + 54 + name_width + 6,
+                row_y + 2 + max(0, int((20 - risk_height) / 2)),
                 entry.get("risk_status"),
                 font=risk_font,
                 compact=True,
@@ -3428,48 +3687,43 @@ async def _draw_teammate_spotlight(draw, canvas, box, title, entries, color, is_
             )
 
         kda_text = f"KDA {_num(entry.get('kda')):.2f}"
-        map_text = _truncate_to_width(draw, _map_name(entry.get("mapGuid")), _load_font(12), max(80, x2 - x1 - 320))
-        kda_w = _text_size(draw, kda_text, _load_font(12, bold=True))[0]
-        draw.text((x2 - 16 - kda_w, row_y + 2), kda_text, font=_load_font(12, bold=True), fill=(255, 218, 117))
-        draw_map_mode_icon(canvas, entry.get("mapGuid"), x1 + 44, row_y + 18, 16)
-        draw.text((x1 + 64, row_y + 18), map_text, font=_load_font(12), fill=(160, 174, 194))
-
-        if idx < min(len(entries[:3]), 3) - 1:
-            draw.line((x1 + 12, row_y + 32, x2 - 12, row_y + 32), fill=(48, 52, 65), width=1)
+        kda_font = _load_font(13, bold=True)
+        kda_w = _text_size(draw, kda_text, kda_font)[0]
+        map_text = _truncate_to_width(draw, _map_name(entry.get("mapGuid")), _load_font(12), max(60, x2 - x1 - 92 - kda_w))
+        draw.text((x2 - 14, row_y + 23), kda_text, font=kda_font, fill=C.DRAW, anchor="ra")
+        draw_map_mode_icon(canvas, entry.get("mapGuid"), x1 + 53, row_y + 23, 16)
+        draw.text((x1 + 72, row_y + 23), map_text, font=_load_font(12), fill=C.MUTED)
 
 
 def _draw_party_summary(draw, stats, x, y, w):
     party_names = {1: "单排", 2: "双排", 3: "三排", 4: "四排", 5: "五排"}
-    draw.text((x, y), "队伍人数", font=_load_font(14, bold=True), fill=(255, 218, 117))
+    draw.text((x, y), "队伍人数", font=_load_font(14, bold=True), fill=C.ACCENT)
     max_party = max(stats["party"].values() or [1])
-    cell_w = w / 5
+    gap = 12
+    cell_w = (w - gap * 4) / 5
     for idx, size in enumerate(range(1, 6)):
         total = stats["party"][size]
         wins = stats["party_wins"][size]
-        cell_x = x + idx * cell_w
-        draw.text((cell_x, y + 24), party_names[size], font=_load_font(12), fill=(170, 182, 200))
-        _draw_bar(draw, cell_x, y + 43, cell_w - 16, 7, total / max_party if total else 0, (255, 198, 92, 230))
-        value = f"{total}场"
+        cell_x = x + idx * (cell_w + gap)
+        draw.text((cell_x, y + 24), f"{party_names[size]} {total}场", font=_load_font(12), fill=C.TEXT if total else C.FAINT)
+        _draw_bar(draw, cell_x, y + 46, cell_w, 6, total / max_party if total else 0, C.ACCENT)
         if total:
-            value += f" {_fmt_pct(wins, total)}"
-        draw.text((cell_x + 42, y + 24), value, font=_load_font(12), fill=_summary_winrate_color(total, wins) if total else (120, 132, 150))
+            draw.text((cell_x + cell_w, y + 24), _fmt_pct(wins, total), font=_load_font(12), fill=_summary_winrate_color(total, wins), anchor="ra")
 
 
 def _draw_teammate_fun_awards(draw, stats, x, y, w):
     awards = _teammate_fun_awards(stats)
     if not awards:
         return
-    draw.text((x, y), "一些奇怪的金牌", font=_load_font(14, bold=True), fill=(255, 218, 117))
+    draw.text((x, y), "一些奇怪的金牌", font=_load_font(14, bold=True), fill=C.ACCENT)
     selection_text = f"本次精选 {len(awards)} 项"
-    selection_font = _load_font(11)
-    selection_w = _text_size(draw, selection_text, selection_font)[0]
-    draw.text((x + w - selection_w, y + 2), selection_text, font=selection_font, fill=(170, 182, 200))
+    draw.text((x + w, y + 2), selection_text, font=_load_font(11), fill=C.MUTED, anchor="ra")
 
     cell_gap = 8
     cell_w = int((w - cell_gap) / 2)
     cell_h = 64
     start_y = y + 24
-    kind_fill = {"好友": (117, 223, 174, 220), "路人": (139, 216, 255, 210)}
+    kind_color = {"好友": C.WIN, "路人": C.INFO}
 
     for idx, award in enumerate(awards):
         col = idx % 2
@@ -3478,19 +3732,21 @@ def _draw_teammate_fun_awards(draw, stats, x, y, w):
         y1 = int(start_y + row * 72)
         x2 = x1 + cell_w
         y2 = y1 + cell_h
-        draw.rounded_rectangle((x1, y1, x2, y2), radius=8, fill=(33, 35, 46, 215), outline=(65, 70, 90), width=1)
+        draw.rounded_rectangle((x1, y1, x2, y2), radius=RADIUS_TILE, fill=C.SURFACE_SUNKEN, outline=C.STROKE, width=1)
         kind_w = _text_size(draw, award["kind"], _load_font(10, bold=True))[0]
         badge_x2 = x2 - 10
         badge_x1 = badge_x2 - kind_w - 12
         title = _truncate_to_width(draw, award["title"], _load_font(14, bold=True), badge_x1 - x1 - 18)
-        draw.text((x1 + 10, y1 + 7), title, font=_load_font(14, bold=True), fill=(246, 248, 255))
-        draw.rounded_rectangle((badge_x1, y1 + 7, badge_x2, y1 + 23), radius=4, fill=kind_fill.get(award["kind"], (139, 216, 255, 210)))
-        draw.text((badge_x1 + 6, y1 + 8), award["kind"], font=_load_font(10, bold=True), fill=(18, 24, 34))
-        draw.text((x1 + 10, y1 + 28), _truncate_to_width(draw, award["name"], _load_font(13, bold=True), cell_w - 20), font=_load_font(13, bold=True), fill=(218, 228, 242))
-        value = _truncate_to_width(draw, award["value"], _load_font(11), cell_w - 20)
-        draw.text((x1 + 10, y1 + 46), value, font=_load_font(11), fill=(170, 182, 200))
+        draw.text((x1 + 12, y1 + 7), title, font=_load_font(14, bold=True), fill=C.INK)
+        color = kind_color.get(award["kind"], C.INFO)
+        draw.rounded_rectangle((badge_x1, y1 + 8, badge_x2, y1 + 24), radius=4, fill=tinted(color, .3))
+        draw.text(((badge_x1 + badge_x2) / 2, y1 + 16), award["kind"], font=_load_font(10, bold=True), fill=color, anchor="mm")
+        draw.text((x1 + 12, y1 + 27), _truncate_to_width(draw, award["name"], _load_font(13, bold=True), cell_w - 22), font=_load_font(13, bold=True), fill=C.TEXT)
+        value = _truncate_to_width(draw, award["value"], _load_font(11), cell_w - 22)
+        draw.text((x1 + 12, y1 + 46), value, font=_load_font(11), fill=C.MUTED)
 
 
+@themed
 async def _render_period_image(
     stats,
     resolved_target,
@@ -3553,16 +3809,24 @@ async def _render_period_image(
     hero_top_rows = hero_rows_all[:5]
     other_heroes = hero_rows_all[5:]
     other_hero_rows = (len(other_heroes) + 2) // 3 if other_heroes else 0
-    hero_other_height = 48 + other_hero_rows * 62 if other_heroes else 0
+    hero_other_height = 34 + other_hero_rows * 58 if other_heroes else 0
 
     width = 1400
+    page_left, page_right = 40, 1360
+    column_w, column_gap, section_gap = 650, 20, 20
+    right_x = page_left + column_w + column_gap
+    card_pad, card_head = 24, 62
+    left_inner, left_end = page_left + card_pad, page_left + column_w - card_pad
+    right_inner, right_end = right_x + card_pad, page_right - card_pad
+    inner_w = column_w - card_pad * 2
+
     measure_draw = _summary_draw(Image.new("RGBA", (width, 320), (0, 0, 0, 0)))
     name_font = _load_font(44, bold=True)
-    title_font = _load_font(22, bold=True)
+    title_font = _load_font(20)
     risk_badge_font = _load_font(16, bold=True)
     display_name = _truncate_to_width(measure_draw, display_name, name_font, 420)
-    name_x = 190
-    name_y = 70
+    name_x = 200
+    name_y = 58
     name_w, name_h = _text_size(measure_draw, display_name, name_font)
     risk_badge_x = name_x + name_w + 16
     risk_badge_max_width = max(96, min(250, 802 - risk_badge_x))
@@ -3582,8 +3846,8 @@ async def _render_period_image(
     player_titles = _get_group_titles_safe(resolved_target.get("bnet_id"))
     badges_bottom = max(name_y + name_h, risk_badge_y + risk_badge_height)
     if player_titles:
-        badge_center_y = 92 if identity_end_x <= 450 else 178
-        badge_start_x = identity_end_x + 16 if badge_center_y == 92 else name_x
+        badge_center_y = name_y + 22 if identity_end_x <= 450 else name_y + 76
+        badge_start_x = identity_end_x + 16 if badge_center_y == name_y + 22 else name_x
         _, _, title_badges_bottom = _draw_group_title_badges(
             measure_draw,
             player_titles,
@@ -3602,57 +3866,108 @@ async def _render_period_image(
             row_gap=8,
         )
         badges_bottom = max(badges_bottom, title_badges_bottom)
-    subtitle_y = max(128, int(badges_bottom) + 12)
-    profile_y = subtitle_y + 38
-    period_y = profile_y + 38
-    header_line_y = period_y + 32
-    top_y1 = max(340, header_line_y + 64)
-    hero_card_h = max(308, 78 + len(hero_top_rows) * 64 + hero_other_height + 24)
-    stats_highlight_rows = (len(stat_highlights) + 2) // 3 if stat_highlights else 0
-    stats_highlight_h = 38 + stats_highlight_rows * 94 if stat_highlights else 0
-    stats_card_h = max(405, 390 + stats_highlight_h)
-    top_section_h = max(hero_card_h, stats_card_h)
+    subtitle_y = max(110, int(badges_bottom) + 8)
+    profile_y = subtitle_y + 32
+    period_y = profile_y + 42
+    header_line_y = period_y + 30
+    header_top = 32
+    header_bottom = max(262, header_line_y + 44)
+    top_y1 = header_bottom + section_gap
 
-    mid_y1 = top_y1 + top_section_h + 30
-    map_rows = sorted(map_win_rows.items(), key=lambda item: (item[1]["total"], item[1]["wins"]), reverse=True)
-    map_card_h = max(310, 78 + len(map_rows) * 58 + 20)
-    team_rows_h = 78 + (len(contact_rows) * 28 if contact_rows else 40)
-    team_card_h = max(
-        295,
-        team_rows_h
-        + (party_summary_height + 12 if party_summary_height else 0)
-        + (teammate_spotlight_height + 12 if teammate_spotlight_height else 0)
-        + (teammate_awards_height + 12 if teammate_awards_height else 0)
-        + 20,
-    )
-    mid_section_h = max(map_card_h, team_card_h)
-
-    timeline_y1 = mid_y1 + mid_section_h + 30
-    sorted_matches = sorted(matches, key=lambda item: item.get("beginTs") or 0)
-    timeline_rows = max(1, (len(sorted_matches) + 7) // 8) if sorted_matches else 1
-    timeline_h = 195 + timeline_rows * 142
-    quick_dist_y1 = timeline_y1 + timeline_h + 30
-    quick_dist_h = 455
-    bottom_y1 = quick_dist_y1 + quick_dist_h + 30
+    # The two columns stack independently, so a tall card never leaves its
+    # neighbour empty. Remaining slack is absorbed by loosening row spacing.
+    map_rows = sorted(stats["maps"].items(), key=lambda item: (item[1]["total"], item[1]["wins"]), reverse=True)
+    map_columns = 2 if len(map_rows) > 6 else 1
+    map_lines = max(1, (len(map_rows) + map_columns - 1) // map_columns)
     highlight_rows_total = 5 + max(1, len(data_king_text))
-    weather_source_matches = all_matches if all_matches else matches
+    hero_lines = max(1, len(hero_top_rows))
+    hero_base, map_base, highlight_base = 60, 52, 48
+
+    stats_highlight_rows = (len(stat_highlights) + 2) // 3 if stat_highlights else 0
+    stats_highlight_h = 32 + stats_highlight_rows * 108 if stat_highlights else 32
+    metric_base, contact_base = 86, 30
+    team_body_h = (
+        28
+        + (len(contact_rows) * contact_base if contact_rows else 40)
+        + (party_summary_height + 16 if party_summary_height else 0)
+        + (teammate_spotlight_height + 16 if teammate_spotlight_height else 0)
+        + (teammate_awards_height + 16 if teammate_awards_height else 0)
+    )
+    left_natural = (
+        card_head + hero_lines * hero_base + hero_other_height + 18
+        + section_gap + card_head + map_lines * map_base + 14
+        + section_gap + card_head + highlight_rows_total * highlight_base + 14
+    )
+    right_natural = (
+        card_head + 3 * metric_base + 8 + stats_highlight_h + 18
+        + section_gap + card_head + team_body_h + 20
+    )
+    slack = abs(left_natural - right_natural)
+    hero_extra = map_extra = highlight_extra = metric_extra = contact_extra = 0
+    if left_natural < right_natural:
+        extra = min(16, slack // (hero_lines + map_lines + highlight_rows_total))
+        hero_extra = map_extra = highlight_extra = extra
+        slack -= extra * (hero_lines + map_lines + highlight_rows_total)
+        highlight_extra += min(12, slack // highlight_rows_total)
+    else:
+        metric_extra = min(12, slack // 6)
+        slack -= metric_extra * 3
+        if contact_rows:
+            contact_extra = min(8, slack // len(contact_rows))
+            slack -= contact_extra * len(contact_rows)
+
+    hero_pitch = hero_base + hero_extra
+    map_pitch = map_base + map_extra
+    highlight_pitch = highlight_base + highlight_extra
+    metric_pitch = metric_base + metric_extra
+    contact_pitch = contact_base + contact_extra
+
+    hero_card_h = card_head + hero_lines * hero_pitch + hero_other_height + 18
+    map_card_h = card_head + map_lines * map_pitch + 14
+    highlight_card_h = card_head + highlight_rows_total * highlight_pitch + 14
+    overall_card_h = card_head + 3 * metric_pitch + 8 + stats_highlight_h + 18
+    team_card_h = card_head + team_body_h + len(contact_rows) * contact_extra + 20
+    left_total = hero_card_h + map_card_h + highlight_card_h + section_gap * 2
+    right_total = overall_card_h + team_card_h + section_gap
+    columns_h = max(left_total, right_total)
+    highlight_card_h += columns_h - left_total
+    team_card_h += columns_h - right_total
+
+    map_y1 = top_y1 + hero_card_h + section_gap
+    highlight_y1 = map_y1 + map_card_h + section_gap
+    team_y1 = top_y1 + overall_card_h + section_gap
+
+    timeline_y1 = top_y1 + columns_h + section_gap
+    sorted_matches = sorted(matches, key=lambda item: item.get("beginTs") or 0)
+    timeline_rows = max(1, (len(sorted_matches) + TIMELINE_COLUMNS - 1) // TIMELINE_COLUMNS) if sorted_matches else 1
+    timeline_h = 206 + timeline_rows * (TIMELINE_TILE_H + TIMELINE_GAP + TIMELINE_RIBBON_H)
+    quick_dist_y1 = timeline_y1 + timeline_h + section_gap
+    awards = match_awards or {}
+    quick_dist_h = 440 if awards.get("best") or awards.get("breakthrough") else 160
+    bottom_y1 = quick_dist_y1 + quick_dist_h + section_gap
+    weather_source_matches = all_matches if all_matches is not None else matches
+    season_data = build_season_data(weather_source_matches, matches, gameplay_mode,
+                                    rank_info_score_to_strength, _canonical_hero_guid)
+    season_map_marks = {guid: i+1 for i, (guid, _) in enumerate(season_data["maps"])}
+    season_hero_marks = {guid: i+1 for i, (guid, _) in enumerate(season_data["heroes"])}
+    rank_y1 = bottom_y1
+    rank_h = card_head + rank_panel_height() + 16 if season_data["show_trend"] else 0
+    if rank_h:
+        bottom_y1 += rank_h + section_gap
     weather_daily_stats = _daily_win_stats(weather_source_matches)
     if weather_daily_stats:
-        weather_end_day = max(weather_daily_stats)
-        weather_start_day = weather_end_day - datetime.timedelta(days=41)
-        while weather_start_day.weekday() != 0:
-            weather_start_day -= datetime.timedelta(days=1)
-        weather_total_days = (weather_end_day - weather_start_day).days + 1
-        weather_total_weeks = max(1, (weather_total_days + 6) // 7)
+        _, _, weather_total_weeks = _weather_calendar_range(weather_daily_stats)
     else:
         weather_total_weeks = 6
-    weather_panel_h = max(286, 54 + weather_total_weeks * 36)
+    daily_chart_h = 250
     activity_height = 280 if period_scope_text == "本周" else 252
-    activity_offset = 67 + weather_panel_h + 25 + 200
-    bottom_h = max(428, 96 + highlight_rows_total * 52, activity_offset + activity_height + 24)
-    footer_y = bottom_y1 + bottom_h + 18
+    weather_panel_h = max(daily_chart_h + 18 + activity_height, 56 + weather_total_weeks * 42)
+    bottom_h = card_head + weather_panel_h + 22
+    season_panel_y = bottom_y1 + bottom_h + section_gap
+    season_panel_h = card_head + season_panel_height() + 18
+    footer_y = season_panel_y + season_panel_h + 14
 
-    height = footer_y + 30
+    height = footer_y + 34
     _render_step(
         "LAYOUT_READY",
         extra=(
@@ -3676,6 +3991,7 @@ async def _render_period_image(
         prefetch_urls.append(_hero_icon_url(entry.get("heroGuid")))
     for record in (match_awards or {}).get("records", []):
         prefetch_urls.extend(_hero_icon_url(hero) for hero in record.get("heroes", []))
+    prefetch_urls.extend(_hero_icon_url(hero) for _, hero in OMNIC_BOT_TIERS)
     await _prefetch_summary_images(prefetch_urls)
     _render_step("ASSET_PREFETCH_DONE", extra=f"url_candidates={len(prefetch_urls)}")
 
@@ -3688,14 +4004,22 @@ async def _render_period_image(
     draw = _summary_draw(canvas)
     _render_step("BACKGROUND_DONE")
 
-    avatar = await _load_summary_image(resolved_target.get("icon_url"))
-    if avatar:
-        avatar = _cover_fit(avatar, (110, 110))
-        canvas.paste(avatar, (55, 55), _rounded_mask((110, 110), 55))
-    else:
-        draw.ellipse((55, 55, 165, 165), fill=(28, 36, 50, 220), outline=(96, 126, 160, 180), width=2)
+    header_box = (page_left, header_top, page_right, header_bottom)
+    banner_map = map_rows[0][0] if map_rows else None
+    if not await _paste_remote_cover(canvas, header_box, _map_icon_url(banner_map), radius=RADIUS_CARD, tint=None, scrim=C.BANNER_SCRIM):
+        draw.rounded_rectangle((page_left, header_top, page_right - 1, header_bottom - 1), radius=RADIUS_CARD, fill=C.SURFACE)
+    draw.rounded_rectangle((page_left, header_top, page_right - 1, header_bottom - 1), radius=RADIUS_CARD, outline=C.STROKE, width=1)
 
-    draw.text((name_x, name_y), display_name, font=name_font, fill=(255, 255, 255))
+    avatar = await _load_summary_image(resolved_target.get("icon_url"))
+    avatar_x, avatar_y, avatar_size = 66, 62, 112
+    draw.ellipse((avatar_x - 6, avatar_y - 6, avatar_x + avatar_size + 5, avatar_y + avatar_size + 5), outline=C.ACCENT, width=3)
+    if avatar:
+        avatar = _cover_fit(avatar, (avatar_size, avatar_size))
+        canvas.paste(avatar, (avatar_x, avatar_y), _rounded_mask((avatar_size, avatar_size), avatar_size // 2))
+    else:
+        draw.ellipse((avatar_x, avatar_y, avatar_x + avatar_size - 1, avatar_y + avatar_size - 1), fill=C.SURFACE_RAISED)
+
+    draw.text((name_x, name_y), display_name, font=name_font, fill=C.INK)
     if risk_badge_width:
         draw_risk_status_badge(
             draw,
@@ -3727,167 +4051,219 @@ async def _render_period_image(
             row_gap=8,
         )
     subtitle_text = f"{display_suffix} · {visual_title_text}" if display_suffix else visual_title_text
-    draw.text((name_x, subtitle_y), subtitle_text, font=title_font, fill=(180, 180, 200))
-    profile_label = f"{period_scope_text}画像："
-    draw.text((name_x, profile_y), profile_label, font=_load_font(24), fill=(220, 220, 220))
-    label_w = _text_size(draw, profile_label, _load_font(24))[0]
-    draw.text((name_x + label_w, profile_y), profile_tag, font=_load_font(24), fill=(255, 215, 0))
-    draw.text((name_x, period_y), period_text, font=_load_font(20), fill=(165, 178, 198))
-    header_line = _truncate_to_width(draw, header_line, _load_font(18), 590)
-    draw.text((name_x, header_line_y), header_line, font=_load_font(18), fill=(165, 178, 198))
+    draw.text((name_x, subtitle_y), subtitle_text, font=title_font, fill=C.MUTED)
+    profile_label = f"{period_scope_text}画像"
+    profile_font = _load_font(20)
+    label_w = _text_size(draw, profile_label, profile_font)[0]
+    tag_font = _load_font(20, bold=True)
+    tag_w = _text_size(draw, profile_tag, tag_font)[0]
+    draw.rounded_rectangle((name_x, profile_y, name_x + label_w + tag_w + 40, profile_y + 34), radius=8, fill=tinted(C.ACCENT, .2))
+    draw.text((name_x + 12, profile_y + 7), profile_label, font=profile_font, fill=C.TEXT)
+    draw.text((name_x + label_w + 26, profile_y + 7), profile_tag, font=tag_font, fill=C.ACCENT)
+    draw.text((name_x, period_y), period_text, font=_load_font(17), fill=C.TEXT)
+    header_line = _truncate_to_width(draw, header_line, _load_font(16), 590)
+    draw.text((name_x, header_line_y), header_line, font=_load_font(16), fill=C.MUTED)
 
-    metric_y = 72
-    _draw_metric(draw, 820, metric_y, "总场次", stats["total"], (139, 216, 255))
-    _draw_metric(draw, 980, metric_y, "胜率", _fmt_pct(stats["wins"], stats["total"]), _summary_winrate_color(stats["total"], stats["wins"]))
-    _draw_metric(draw, 1150, metric_y, "KDA", f"{kda:.2f}", (165, 235, 185))
+    kpi_x = 830
+    ring_center_y = header_top + 84
+    win_ratio = stats["wins"] / max(stats["total"], 1)
+    _draw_winrate_ring(draw, kpi_x + 56, ring_center_y, 56, win_ratio, _summary_winrate_color(stats["total"], stats["wins"]), _fmt_pct(stats["wins"], stats["total"]))
+    _draw_metric(draw, kpi_x + 160, ring_center_y - 44, "总场次", stats["total"], C.INFO)
+    _draw_metric(draw, kpi_x + 320, ring_center_y - 44, "KDA", f"{kda:.2f}", C.WIN)
     role_time = _period_role_time(detail_pairs, resolved_target)
-    _draw_role_time_share(canvas, draw, role_time)
+    _draw_role_time_share(canvas, draw, role_time, kpi_x, ring_center_y + 76, page_right - 28 - kpi_x)
     _render_step("HEADER_DONE")
 
-    _card(draw, (50, top_y1, 665, top_y1 + top_section_h), f"{visual_title_text[:2]}常用英雄排行")
+    _card(draw, (page_left, top_y1, page_left + column_w - 1, top_y1 + hero_card_h - 1), f"{visual_title_text[:2]}常用英雄排行")
     if not hero_top_rows:
-        draw.text((75, top_y1 + 72), "暂无英雄数据", font=_load_font(18), fill=(145, 155, 170))
-    hero_start_y = top_y1 + 76
+        draw.text((left_inner, top_y1 + card_head + 8), "暂无英雄数据", font=_load_font(18), fill=C.FAINT)
+    hero_start_y = top_y1 + card_head
     max_hero = max([count for _, count in hero_top_rows] or [1])
     for idx, (hero_guid, count) in enumerate(hero_top_rows):
-        row_y = hero_start_y + idx * 64
+        row_y = hero_start_y + idx * hero_pitch
         hero_icon = await _load_summary_image(_hero_icon_url(hero_guid))
         ring_color = _hero_ring_color(_role_label(hero_guid))
-        draw.ellipse((75, row_y, 123, row_y + 48), fill=ring_color, outline=(255, 255, 255, 120), width=1)
+        season_place = season_hero_marks.get(_canonical_hero_guid(hero_guid))
+        if season_place:
+            season_glow(canvas, (left_inner - 3, row_y - 3, left_inner + 51, row_y + 51), C, 27, spread=12, strength=210)
+        draw.ellipse((left_inner, row_y, left_inner + 48, row_y + 48), fill=tinted(ring_color, .35), outline=ring_color, width=2)
         if hero_icon:
             hero_icon = _cover_fit(hero_icon, (44, 44))
-            canvas.paste(hero_icon, (77, row_y + 2), _rounded_mask((44, 44), 22))
-        draw.text((135, row_y + 1), _hero_name(hero_guid), font=_load_font(20, bold=True), fill=(238, 242, 248))
-        medal_x = 135 + _text_size(draw, _hero_name(hero_guid), _load_font(20, bold=True))[0] + 10
+            _paste_hero_icon(canvas, draw, hero_icon, left_inner + 3, row_y + 3, 44)
+        text_x = left_inner + 62
+        hero_name_font = _load_font(19, bold=True)
+        hero_label = _truncate_to_width(draw, _hero_name(hero_guid), hero_name_font, left_end - text_x - 260)
+        draw.text((text_x, row_y + 2), hero_label, font=hero_name_font, fill=C.INK)
+        medal_x = text_x + _text_size(draw, hero_label, hero_name_font)[0] + 12
+        if season_place:
+            chip_width = draw.textlength(f"赛季#{season_place}", font=_load_font(13, bold=True)) + 14
+            chip_x = left_end - 160 - chip_width
+            season_chip(draw, chip_x, row_y + 13, season_place, _load_font, C)
+        else:
+            chip_x = left_end - 160
         medal_data = stats["hero_medals"].get(str(hero_guid), {})
         for medal_text, medal_value, medal_color in (
-            ("K", medal_data.get("K", 0), (255, 50, 50)),
-            ("H", medal_data.get("H", 0), (255, 215, 0)),
-            ("D", medal_data.get("D", 0), (180, 80, 255)),
-            ("M", medal_data.get("M", 0), (200, 200, 200)),
+            ("K", medal_data.get("K", 0), C.LOSS),
+            ("H", medal_data.get("H", 0), C.DRAW),
+            ("D", medal_data.get("D", 0), C.MEDAL_D),
+            ("M", medal_data.get("M", 0), C.MEDAL_M),
         ):
             if medal_value <= 0:
                 continue
             label = f"{medal_text}×{medal_value}"
             medal_font = _load_font(13, bold=True)
             label_w = _text_size(draw, label, medal_font)[0]
-            draw.rounded_rectangle((medal_x, row_y + 2, medal_x + label_w + 14, row_y + 22), radius=4, fill=medal_color)
-            luminance = 0.299 * medal_color[0] + 0.587 * medal_color[1] + 0.114 * medal_color[2]
-            draw.text((medal_x + 7, row_y + 4), label, font=medal_font, fill=(20, 20, 20) if luminance > 140 else (255, 255, 255))
-            medal_x += label_w + 19
+            if medal_x + label_w + 20 > chip_x - 8:
+                break
+            draw.rounded_rectangle((medal_x, row_y + 3, medal_x + label_w + 14, row_y + 23), radius=RADIUS_CHIP, fill=tinted(medal_color, .32))
+            draw.text((medal_x + 7, row_y + 13), label, font=medal_font, fill=medal_color, anchor="lm")
+            medal_x += label_w + 20
         wins = hero_win_rows.get(str(hero_guid), {}).get("wins", 0)
         total = hero_win_rows.get(str(hero_guid), {}).get("total", count)
-        _draw_bar(draw, 135, row_y + 32, 480, 6, count / max_hero, (0, 160, 255, 230), bg=(50, 52, 65, 210))
-        draw.text((medal_x + 4, row_y + 3), f"{count}场", font=_load_font(16), fill=(180, 180, 190))
-        draw.text((542, row_y + 3), f"胜率 {int(round((wins / max(total, 1)) * 100))}%", font=_load_font(16), fill=_summary_winrate_color(total, wins))
+        _draw_bar(draw, text_x, row_y + 35, left_end - text_x, 6, count / max_hero, ring_color)
+        rate_font = _load_font(15, bold=True)
+        rate_text = f"胜率 {int(round((wins / max(total, 1)) * 100))}%"
+        draw.text((left_end, row_y + 4), rate_text, font=rate_font, fill=_summary_winrate_color(total, wins), anchor="ra")
+        rate_w = _text_size(draw, rate_text, rate_font)[0]
+        draw.text((left_end - rate_w - 16, row_y + 4), f"{count}场", font=_load_font(15), fill=C.TEXT, anchor="ra")
 
     if other_heroes:
-        compact_title_y = hero_start_y + len(hero_top_rows) * 64 + 8
-        draw.text((75, compact_title_y), "其他上场英雄", font=_load_font(18), fill=(180, 180, 200))
-        compact_y = compact_title_y + 38
-        box_x1, box_x2 = 75, 640
-        box_h = other_hero_rows * 62 + 16
-        draw.rounded_rectangle((box_x1, compact_y, box_x2, compact_y + box_h), radius=8, fill=(33, 35, 46), outline=(65, 70, 90), width=1)
-        cell_w = (box_x2 - box_x1) // 3
+        compact_title_y = hero_start_y + len(hero_top_rows) * hero_pitch + 4
+        draw.text((left_inner, compact_title_y), "其他上场英雄", font=_load_font(15, bold=True), fill=C.MUTED)
+        compact_y = compact_title_y + 28
+        cell_gap = 8
+        cell_w = (inner_w - cell_gap * 2) // 3
         for idx, (hero_guid, count) in enumerate(other_heroes):
             col = idx % 3
             row = idx // 3
-            cell_x = box_x1 + col * cell_w
-            cell_y = compact_y + row * 62 + 8
+            cell_x = left_inner + col * (cell_w + cell_gap)
+            cell_y = compact_y + row * 58
+            draw.rounded_rectangle((cell_x, cell_y, cell_x + cell_w, cell_y + 50), radius=RADIUS_TILE, fill=C.SURFACE_SUNKEN)
+            season_place = season_hero_marks.get(_canonical_hero_guid(hero_guid))
+            if season_place:
+                season_glow(canvas, (cell_x + 5, cell_y + 4, cell_x + 47, cell_y + 46), C, 21, spread=8, strength=200)
             hero_icon = await _load_summary_image(_hero_icon_url(hero_guid))
             if hero_icon:
-                hero_icon = _cover_fit(hero_icon, (42, 42))
-                canvas.paste(hero_icon, (cell_x + 8, cell_y + 4), _rounded_mask((42, 42), 21))
-            draw.text((cell_x + 58, cell_y + 4), f"{count}场", font=_load_font(14), fill=(200, 205, 220))
+                hero_icon = _cover_fit(hero_icon, (38, 38))
+                _paste_hero_icon(canvas, draw, hero_icon, cell_x + 7, cell_y + 6, 38)
+            name_limit = cell_w - 62
+            if season_place:
+                chip_w = draw.textlength(f"赛季#{season_place}", font=_load_font(11, bold=True)) + 14
+                season_chip(draw, cell_x + cell_w - 8 - chip_w, cell_y + 16, season_place, _load_font, C, size=11)
+                name_limit -= chip_w + 6
+            draw.text((cell_x + 54, cell_y + 7), _truncate_to_width(draw, _hero_name(hero_guid), _load_font(13), name_limit), font=_load_font(13), fill=C.TEXT)
             oh_wins = hero_win_rows.get(str(hero_guid), {}).get("wins", 0)
             oh_total = hero_win_rows.get(str(hero_guid), {}).get("total", count)
-            draw.text((cell_x + 58, cell_y + 25), _fmt_pct(oh_wins, oh_total), font=_load_font(14), fill=_summary_winrate_color(oh_total, oh_wins))
-            if col < 2 and idx < len(other_heroes) - 1:
-                split_x = cell_x + cell_w
-                draw.line((split_x, compact_y + 4, split_x, compact_y + box_h - 4), fill=(65, 70, 90), width=1)
+            draw.text((cell_x + 54, cell_y + 28), f"{count}场", font=_load_font(13), fill=C.MUTED)
+            draw.text((cell_x + cell_w - 10, cell_y + 28), _fmt_pct(oh_wins, oh_total), font=_load_font(13), fill=_summary_winrate_color(oh_total, oh_wins), anchor="ra")
     _render_step("HERO_CARD_DONE", extra=f"top={len(hero_top_rows)}; other={len(other_heroes)}")
 
-    _card(draw, (705, top_y1, 1350, top_y1 + top_section_h), "总体数据")
+    _card(draw, (right_x, top_y1, page_right - 1, top_y1 + overall_card_h - 1), "总体数据")
     overall_rows = _overall_metrics(stats, matches, detail_pairs, resolved_target)
-    _draw_overall_metrics(draw, overall_rows, 735, top_y1+73)
-    stats_highlight_y = top_y1 + 378
+    _draw_overall_metrics(draw, overall_rows, right_inner, top_y1 + card_head, inner_w // 4, metric_pitch)
+    stats_highlight_y = top_y1 + card_head + 3 * metric_pitch + 8
     if stat_highlights:
-        draw.text((735, stats_highlight_y), "亮眼表现", font=_load_font(15, bold=True), fill=(255, 218, 117))
-        cell_w = 188
-        cell_h = 84
+        draw.text((right_inner, stats_highlight_y), "亮眼表现", font=_load_font(15, bold=True), fill=C.ACCENT)
         cell_gap_x = 10
         cell_gap_y = 10
+        cell_w = (inner_w - cell_gap_x * 2) // 3
+        cell_h = 98
         for idx, item in enumerate(stat_highlights):
             col = idx % 3
             row = idx // 3
-            cell_x = int(735 + col * (cell_w + cell_gap_x))
-            cell_y = int(stats_highlight_y + 26 + row * (cell_h + cell_gap_y))
+            cell_x = int(right_inner + col * (cell_w + cell_gap_x))
+            cell_y = int(stats_highlight_y + 28 + row * (cell_h + cell_gap_y))
             cell_box = (cell_x, cell_y, cell_x + cell_w, cell_y + cell_h)
-            accent = item.get("color", (246, 248, 255))
-            draw.rounded_rectangle(cell_box, radius=8, fill=(30, 33, 45, 220), outline=accent, width=1)
-            if item.get("band") == "top2":
-                _draw_rainbow_segments(draw, (cell_x + 2, cell_y + 2, cell_x + cell_w - 2, cell_y + 8), radius=6)
+            accent = item.get("color", C.INK)
+            legendary = item.get("band") == "top2"
+            if legendary:
+                _draw_rainbow_glow(draw, cell_box, radius=RADIUS_TILE)
+            cover_box = (cell_x, cell_y, cell_x + cell_w + 1, cell_y + cell_h + 1)
+            if not await _paste_remote_cover(canvas, cover_box, _map_icon_url(item.get("map_guid")), radius=RADIUS_TILE, tint=C.STAT_TINT, scrim=C.STAT_SCRIM):
+                draw.rounded_rectangle(cell_box, radius=RADIUS_TILE, fill=C.SURFACE_RAISED)
+            if legendary:
+                _draw_rainbow_border(draw, cell_box, radius=RADIUS_TILE, width=3)
+            else:
+                draw.rounded_rectangle(cell_box, radius=RADIUS_TILE, outline=with_alpha(accent, 190), width=1)
             hero_icon = await _load_summary_image(_hero_icon_url(item.get("hero_guid")))
             if hero_icon:
-                hero_icon = _cover_fit(hero_icon, (30, 30))
-                canvas.paste(hero_icon, (cell_x + 10, cell_y + 10), _rounded_mask((30, 30), 15))
+                hero_icon = _cover_fit(hero_icon, (32, 32))
+                _paste_hero_icon(canvas, draw, hero_icon, cell_x + 10, cell_y + 9, 32)
             else:
-                draw.ellipse((cell_x + 10, cell_y + 10, cell_x + 40, cell_y + 40), fill=(55, 65, 82, 210))
-            draw.text((cell_x + 48, cell_y + 8), _truncate_to_width(draw, item.get("hero_name"), _load_font(14, bold=True), 86), font=_load_font(14, bold=True), fill=(246, 248, 255))
-            draw.text((cell_x + 48, cell_y + 28), _truncate_to_width(draw, item.get("value_text"), _load_font(11), 90), font=_load_font(11), fill=(170, 182, 200))
+                draw.ellipse((cell_x + 10, cell_y + 9, cell_x + 42, cell_y + 41), fill=C.SURFACE_RAISED)
+            draw.text((cell_x + 50, cell_y + 8), _truncate_to_width(draw, item.get("hero_name"), _load_font(14, bold=True), cell_w - 60), font=_load_font(14, bold=True), fill=C.INK)
+            draw.text((cell_x + 50, cell_y + 27), _truncate_to_width(draw, item.get("value_text"), _load_font(11), cell_w - 60), font=_load_font(11), fill=C.STAT_LABEL)
             raw_value_text = item.get("raw_value_display", item.get("value_display", "-"))
             value_text = item.get("value_display", "-")
-            raw_value_font = _fit_text_font(draw, raw_value_text, 78, 19, 12, bold=True)
-            raw_value_w = _text_size(draw, raw_value_text, raw_value_font)[0]
-            value_x = cell_x + cell_w - 10 - raw_value_w
-            value_y = cell_y + 12
+            raw_value_font = _fit_text_font(draw, raw_value_text, 96, 20, 12, bold=True)
+            value_x = cell_x + 11
+            value_y = cell_y + 47
             if item.get("band") == "top2":
                 _draw_rainbow_text(draw, value_x, value_y, raw_value_text, raw_value_font)
             else:
                 draw.text((value_x, value_y), raw_value_text, font=raw_value_font, fill=accent)
             rate_line = f"{value_text}/10min"
-            rate_font = _fit_text_font(draw, rate_line, 112, 10, 8, bold=False)
-            rate_w = _text_size(draw, rate_line, rate_font)[0]
-            draw.text((cell_x + cell_w - 10 - rate_w, cell_y + 39), rate_line, font=rate_font, fill=(170, 182, 200))
+            rate_font = _fit_text_font(draw, rate_line, cell_w - 118, 11, 8, bold=False)
+            draw.text((cell_x + cell_w - 10, value_y + 8), rate_line, font=rate_font, fill=C.STAT_RATE, anchor="ra")
             map_name = _map_name(item.get("map_guid"))
-            draw_map_mode_icon(canvas, item.get("map_guid"), cell_x + 8, cell_y + 55, 14)
-            draw.text((cell_x + 26, cell_y + 55), _truncate_to_width(draw, map_name, _load_font(10), cell_w - 36), font=_load_font(10), fill=(145, 155, 170))
+            draw_map_mode_icon(canvas, item.get("map_guid"), cell_x + 10, cell_y + 74, 14)
+            draw.text((cell_x + 28, cell_y + 74), _truncate_to_width(draw, map_name, _load_font(10), cell_w - 38), font=_load_font(10), fill=C.STAT_MAP)
     else:
-        draw.text((735, stats_highlight_y), "暂无亮眼表现数据", font=_load_font(15), fill=(190, 204, 222))
+        draw.text((right_inner, stats_highlight_y), "暂无亮眼表现数据", font=_load_font(15), fill=C.MUTED)
     _render_step("SUMMARY_STATS_DONE", extra=f"stat_highlights={len(stat_highlights)}")
 
-    _card(draw, (50, mid_y1, 665, mid_y1 + mid_section_h), "地图足迹")
+    _card(draw, (page_left, map_y1, page_left + column_w - 1, map_y1 + map_card_h - 1), "地图足迹")
     if not map_rows:
-        draw.text((75, mid_y1 + 72), "暂无地图数据", font=_load_font(18), fill=(145, 155, 170))
+        draw.text((left_inner, map_y1 + card_head + 8), "暂无地图数据", font=_load_font(18), fill=C.FAINT)
+    map_gap = 10
+    map_cell_w = (inner_w - map_gap * (map_columns - 1)) // map_columns
     for idx, (map_guid, data) in enumerate(map_rows):
-        row_y = mid_y1 + 76 + idx * 58
-        row_box = (75, row_y, 640, row_y + 50)
-        if not await _paste_remote_cover(canvas, row_box, _map_icon_url(map_guid), radius=8, tint=(8, 12, 20, 145)):
-            draw.rounded_rectangle(row_box, radius=8, fill=(28, 36, 50, 210))
+        row, col = divmod(idx, map_columns)
+        cell_x = left_inner + col * (map_cell_w + map_gap)
+        row_y = map_y1 + card_head + row * map_pitch
+        row_box = (cell_x, row_y, cell_x + map_cell_w, row_y + map_pitch - 8)
+        if not await _paste_remote_cover(canvas, row_box, _map_icon_url(map_guid), radius=RADIUS_TILE, tint=None, scrim=C.MAP_SCRIM):
+            draw.rounded_rectangle((row_box[0], row_box[1], row_box[2] - 1, row_box[3] - 1), radius=RADIUS_TILE, fill=C.SURFACE_RAISED)
+        map_place = season_map_marks.get(str(map_guid))
+        if map_place:
+            season_map_wash(canvas, row_box, C, RADIUS_TILE)
+        center_y = row_y + (map_pitch - 8) // 2
+        cell_right = cell_x + map_cell_w - 14
+        rate_x, count_x = cell_right, cell_right - (64 if map_columns == 1 else 54)
         map_name = _map_name(map_guid)
-        map_font = _fit_text_font(draw, map_name, 274, 18, 12, bold=True)
-        draw_map_mode_icon(canvas, map_guid, 90, row_y + 12, 22)
-        draw.text((118, row_y + 12), map_name, font=map_font, fill=(246, 248, 255))
-        draw.text((402, row_y + 13), f'{data["total"]}场', font=_load_font(16), fill=(218, 228, 242))
-        draw.text((515, row_y + 13), _fmt_pct(data["wins"], data["total"]), font=_load_font(16), fill=_summary_winrate_color(data["total"], data["wins"]))
+        map_chip_size = 10 if map_columns > 1 else 12
+        map_chip_width = (draw.textlength(f"赛季#{map_place}", font=_load_font(map_chip_size, bold=True)) + 14) if map_place else 0
+        name_width = max(24, count_x - 50 - (cell_x + 40) - map_chip_width - (8 if map_place else 0))
+        map_font = _fit_text_font(draw, map_name, name_width, 17, 12, bold=True)
+        map_name = _truncate_to_width(draw, map_name, map_font, name_width)
+        draw_map_mode_icon(canvas, map_guid, cell_x + 12, center_y - 11, 22)
+        draw.text((cell_x + 40, center_y), map_name, font=map_font, fill=C.INK, anchor="lm")
+        if map_place:
+            season_chip(draw, cell_x + 40 + draw.textlength(map_name, font=map_font) + 8, center_y, map_place, _load_font, C, size=map_chip_size)
+        draw.text((count_x, center_y), f'{data["total"]}场', font=_load_font(15), fill=C.TEXT, anchor="rm")
+        draw.text((rate_x, center_y), _fmt_pct(data["wins"], data["total"]), font=_load_font(15, bold=True), fill=_summary_winrate_color(data["total"], data["wins"]), anchor="rm")
     _render_step("MAP_CARD_DONE", extra=f"map_rows={len(map_rows)}")
 
-    _card(draw, (705, mid_y1, 1350, mid_y1 + mid_section_h), "组队")
-    draw.text((735, mid_y1 + 72), "同玩ID", font=_load_font(15, bold=True), fill=(145, 155, 170))
-    draw.text((1032, mid_y1 + 72), "局数", font=_load_font(15, bold=True), fill=(145, 155, 170))
-    draw.text((1105, mid_y1 + 72), "胜率", font=_load_font(15, bold=True), fill=(145, 155, 170))
-    draw.text((1195, mid_y1 + 72), "带飞指数", font=_load_font(15, bold=True), fill=(145, 155, 170))
-    team_table_y = mid_y1 + 108
+    _card(draw, (right_x, team_y1, page_right - 1, team_y1 + team_card_h - 1), "组队")
+    games_x, rate_x, carry_x = right_end - 214, right_end - 112, right_end - 10
+    header_font = _load_font(13, bold=True)
+    draw.text((right_inner + 8, team_y1 + card_head), "同玩ID", font=header_font, fill=C.FAINT)
+    draw.text((games_x, team_y1 + card_head), "局数", font=header_font, fill=C.FAINT, anchor="ra")
+    draw.text((rate_x, team_y1 + card_head), "胜率", font=header_font, fill=C.FAINT, anchor="ra")
+    draw.text((carry_x, team_y1 + card_head), "带飞指数", font=header_font, fill=C.FAINT, anchor="ra")
+    team_table_y = team_y1 + card_head + 26
     if contact_rows:
         for idx, (kind, name, data) in enumerate(contact_rows):
-            row_y = team_table_y + idx * 28
-            row_fill = (29, 41, 57, 255) if idx % 2 == 0 else (20, 29, 42, 255)
-            draw.rounded_rectangle((727, row_y - 1, 1324, row_y + 26), radius=4, fill=row_fill)
+            row_y = team_table_y + idx * contact_pitch
+            row_h = contact_pitch - 3
+            center_y = row_y + row_h // 2
+            if idx % 2 == 0:
+                draw.rounded_rectangle((right_inner, row_y, right_end, row_y + row_h), radius=RADIUS_CHIP, fill=with_alpha(C.INK, 10))
             is_friend = kind == "好友"
-            badge_color = (117, 223, 174, 230) if is_friend else (139, 216, 255, 220)
-            draw.rounded_rectangle((735, row_y + 3, 775, row_y + 21), radius=4, fill=badge_color)
-            draw.text((743, row_y + 3), kind, font=_load_font(11, bold=True), fill=(18, 24, 34))
-            name_font = _load_font(17, bold=True)
+            badge_color = C.WIN if is_friend else C.INFO
+            draw.rounded_rectangle((right_inner + 6, center_y - 9, right_inner + 44, center_y + 9), radius=4, fill=tinted(badge_color, .3))
+            draw.text((right_inner + 25, center_y), kind, font=_load_font(11, bold=True), fill=badge_color, anchor="mm")
+            name_font = _load_font(16, bold=True)
             risk_font = _load_font(8, bold=True)
             risk_width, risk_height, _ = measure_risk_status_badge(
                 draw,
@@ -3898,17 +4274,18 @@ async def _render_period_image(
                 padding_y=2,
                 max_width=84,
             )
-            friend_name_max_width = max(90, 210 - risk_width - (6 if risk_width else 0))
+            friend_name_max_width = max(90, 240 - risk_width - (6 if risk_width else 0))
             friend_name = _truncate_to_width(draw, name, name_font, friend_name_max_width)
-            draw.text((784, row_y), friend_name, font=name_font, fill=(218, 228, 242))
+            name_x_pos = right_inner + 52
+            draw.text((name_x_pos, center_y), friend_name, font=name_font, fill=C.TEXT, anchor="lm")
             friend_name_w = _text_size(draw, friend_name, name_font)[0]
-            title_badge_start_x = 784 + friend_name_w + 8
+            title_badge_start_x = name_x_pos + friend_name_w + 8
             if risk_width:
-                risk_x = 784 + friend_name_w + 6
+                risk_x = name_x_pos + friend_name_w + 6
                 draw_risk_status_badge(
                     draw,
                     risk_x,
-                    row_y + max(1, int((24 - risk_height) / 2)),
+                    center_y - int(risk_height / 2),
                     data.get("risk_status"),
                     font=risk_font,
                     compact=True,
@@ -3921,8 +4298,8 @@ async def _render_period_image(
                 draw,
                 _get_group_titles_safe(data.get("bnet_id")),
                 title_badge_start_x,
-                row_y + 12,
-                1018,
+                center_y,
+                games_x - 34,
                 badge_height=18,
                 badge_gap=4,
                 max_badge_width=62,
@@ -3934,45 +4311,43 @@ async def _render_period_image(
             games = data.get("games", 0)
             wins = data.get("wins", 0)
             carry_ratio = _carry_ratio(data, _carry_baseline(stats))
-            value_font = _load_font(16, bold=True)
-            draw.text((1035, row_y + 1), str(games), font=value_font, fill=(246, 248, 255))
-            draw.text((1105, row_y + 1), _fmt_pct(wins, games), font=value_font, fill=_summary_winrate_color(games, wins))
-            draw.text((1202, row_y + 1), f"{carry_ratio:.0f}%" if carry_ratio is not None else "—", font=value_font, fill=_carry_color(carry_ratio) if carry_ratio is not None else (145,155,170))
+            value_font = _load_font(15, bold=True)
+            draw.text((games_x, center_y), str(games), font=value_font, fill=C.INK, anchor="rm")
+            draw.text((rate_x, center_y), _fmt_pct(wins, games), font=value_font, fill=_summary_winrate_color(games, wins), anchor="rm")
+            draw.text((carry_x, center_y), f"{carry_ratio:.0f}%" if carry_ratio is not None else "—", font=value_font, fill=_carry_color(carry_ratio) if carry_ratio is not None else C.FAINT, anchor="rm")
     else:
-        draw.text((735, team_table_y), "这段时间像个孤狼。", font=_load_font(16), fill=(160, 170, 185))
+        draw.text((right_inner + 8, team_table_y + 4), "这段时间像个孤狼。", font=_load_font(16), fill=C.MUTED)
 
-    current_team_y = team_table_y + (len(contact_rows) * 28 if contact_rows else 40)
+    current_team_y = team_table_y + (len(contact_rows) * contact_pitch if contact_rows else 40) + 2
     if party_summary_height:
-        _draw_party_summary(draw, stats, 735, current_team_y + 10, 585)
-        current_team_y += party_summary_height + 14
+        _draw_party_summary(draw, stats, right_inner, current_team_y + 6, inner_w)
+        current_team_y += party_summary_height + 16
     if teammate_spotlight_height:
         strong_entries = stats.get("top3_strongest") or []
         worst_entries = stats.get("top3_worst") or []
-        strong_h = 46 + max(1, len(strong_entries)) * 38
-        worst_rows = 1 if (worst_entries and all(_num(entry.get("kda")) > 1.0 for entry in worst_entries)) else max(1, len(worst_entries))
-        worst_h = 46 + worst_rows * 38
+        spotlight_gap = 12
+        spotlight_w = (inner_w - spotlight_gap) // 2
         await _draw_teammate_spotlight(
             draw,
             canvas,
-            (735, current_team_y + 8, 1328, current_team_y + 8 + strong_h),
+            (right_inner, current_team_y, right_inner + spotlight_w, current_team_y + teammate_spotlight_height),
             "最强队友",
             strong_entries,
-            (100, 255, 120),
+            C.WIN,
             is_worst=False,
         )
-        worst_y = current_team_y + 8 + strong_h + 10
         await _draw_teammate_spotlight(
             draw,
             canvas,
-            (735, worst_y, 1328, worst_y + worst_h),
+            (right_inner + spotlight_w + spotlight_gap, current_team_y, right_end, current_team_y + teammate_spotlight_height),
             "最差队友",
             worst_entries,
-            (255, 100, 100),
+            C.LOSS,
             is_worst=True,
         )
-        current_team_y = worst_y + worst_h
+        current_team_y += teammate_spotlight_height + 16
     if teammate_awards_height:
-        _draw_teammate_fun_awards(draw, stats, 735, current_team_y + 18, 585)
+        _draw_teammate_fun_awards(draw, stats, right_inner, current_team_y, inner_w)
     _render_step(
         "TEAM_CARD_DONE",
         extra=(
@@ -3981,13 +4356,12 @@ async def _render_period_image(
         ),
     )
 
-    await _draw_match_timeline(canvas, draw, (50, timeline_y1, 1350, timeline_y1 + timeline_h), sorted_matches, streak_text, match_awards)
-    awards = match_awards or {}
-    await _draw_award_card(canvas, draw, (50, quick_dist_y1, 685, quick_dist_y1 + quick_dist_h), f"{period_scope_text}最佳表现", awards.get("best"))
-    await _draw_award_card(canvas, draw, (715, quick_dist_y1, 1350, quick_dist_y1 + quick_dist_h), f"{period_scope_text}最大突破", awards.get("breakthrough"), breakthrough=True)
+    await _draw_match_timeline(canvas, draw, (page_left, timeline_y1, page_right - 1, timeline_y1 + timeline_h - 1), sorted_matches, streak_text, match_awards)
+    await _draw_award_card(canvas, draw, (page_left, quick_dist_y1, page_left + column_w - 1, quick_dist_y1 + quick_dist_h - 1), f"{period_scope_text}最佳表现", awards.get("best"))
+    await _draw_award_card(canvas, draw, (right_x, quick_dist_y1, page_right - 1, quick_dist_y1 + quick_dist_h - 1), f"{period_scope_text}最大突破", awards.get("breakthrough"), breakthrough=True)
     _render_step("MATCH_AWARDS_DONE")
 
-    _card(draw, (50, bottom_y1, 665, bottom_y1 + bottom_h), "高光数据")
+    _card(draw, (page_left, highlight_y1, page_left + column_w - 1, highlight_y1 + highlight_card_h - 1), "高光数据")
     highlight_rows = [
         ("最高KDA", highlights.get("best"), "kda"),
         ("最低KDA", highlights.get("worst"), "kda"),
@@ -3997,40 +4371,34 @@ async def _render_period_image(
     ]
     for entry in data_king_text:
         highlight_rows.append((entry.get("title") or "高光数据王", entry, "data_king"))
+    row_h = highlight_pitch - 6
+    label_x, map_x, value_x = left_inner + 52, left_inner + 176, left_inner + 348
     for idx, (label, entry, value_type) in enumerate(highlight_rows):
-        row_y = bottom_y1 + 72 + idx * 52
+        row_y = highlight_y1 + card_head + idx * highlight_pitch
+        center_y = row_y + row_h // 2
         if value_type == "text":
-            draw.rounded_rectangle((75, row_y, 640, row_y + 38), radius=8, fill=(28, 36, 50, 210))
-            draw.text((90, row_y + 9), f"{label}：{entry}", font=_load_font(15), fill=(218, 228, 242))
-            continue
-        if value_type == "data_king":
-            if not entry:
-                draw.text((75, row_y + 8), f"{label}：暂无有效详情", font=_load_font(16), fill=(145, 155, 170))
-                continue
-            row_box = (75, row_y, 640, row_y + 42)
-            if not await _paste_remote_cover(canvas, row_box, _map_icon_url(entry.get("map_guid")), radius=8, tint=(8, 12, 20, 165)):
-                draw.rounded_rectangle(row_box, radius=8, fill=(28, 36, 50, 210))
-            hero_icon = await _load_summary_image(_hero_icon_url(entry.get("hero_guid")))
-            if hero_icon:
-                hero_icon = _cover_fit(hero_icon, (30, 30))
-                canvas.paste(hero_icon, (90, row_y + 6), _rounded_mask((30, 30), 15))
-            draw.text((132, row_y + 10), label, font=_load_font(16, bold=True), fill=(246, 248, 255))
-            draw_map_mode_icon(canvas, entry.get("map_guid"), 258, row_y + 11, 18)
-            draw.text((282, row_y + 11), _short_name(_map_name(entry.get("map_guid")), 10), font=_load_font(15), fill=(218, 228, 242))
-            value_line = f"{entry.get('label')} {entry.get('value_text')}"
-            value_line = _truncate_to_width(draw, value_line, _load_font(15), 180)
-            draw.text((450, row_y + 11), value_line, font=_load_font(15), fill=(255, 218, 117))
+            draw.rounded_rectangle((left_inner, row_y, left_end, row_y + row_h), radius=RADIUS_TILE, fill=C.SURFACE_RAISED)
+            draw.text((left_inner + 14, center_y), f"{label}：{entry}", font=_load_font(15), fill=C.TEXT, anchor="lm")
             continue
         if not entry:
-            draw.text((75, row_y + 8), f"{label}：暂无详情", font=_load_font(16), fill=(145, 155, 170))
+            suffix = "暂无有效详情" if value_type == "data_king" else "暂无详情"
+            draw.text((left_inner + 14, center_y), f"{label}：{suffix}", font=_load_font(15), fill=C.FAINT, anchor="lm")
             continue
-        row_box = (75, row_y, 640, row_y + 42)
-        if not await _paste_remote_cover(canvas, row_box, _map_icon_url(entry.get("map_guid")), radius=8, tint=(8, 12, 20, 165)):
-            draw.rounded_rectangle(row_box, radius=8, fill=(28, 36, 50, 210))
+        row_box = (left_inner, row_y, left_end, row_y + row_h)
+        if not await _paste_remote_cover(canvas, row_box, _map_icon_url(entry.get("map_guid")), radius=RADIUS_TILE, tint=None, scrim=C.ROW_SCRIM):
+            draw.rounded_rectangle((row_box[0], row_box[1], row_box[2] - 1, row_box[3] - 1), radius=RADIUS_TILE, fill=C.SURFACE_RAISED)
         hero_icon = await _load_summary_image(_hero_icon_url(entry.get("hero_guid")))
         if hero_icon:
-            hero_icon = _cover_fit(hero_icon, (30, 30))
-            canvas.paste(hero_icon, (90, row_y + 6), _rounded_mask((30, 30), 15))
+            hero_icon = _cover_fit(hero_icon, (32, 32))
+            _paste_hero_icon(canvas, draw, hero_icon, left_inner + 10, center_y - 16, 32)
+        draw.text((label_x, center_y), label, font=_load_font(15, bold=True), fill=C.INK, anchor="lm")
+        draw_map_mode_icon(canvas, entry.get("map_guid"), map_x, center_y - 9, 18)
+        draw.text((map_x + 23, center_y), _short_name(_map_name(entry.get("map_guid")), 10), font=_load_font(14), fill=C.TEXT, anchor="lm")
+        if value_type == "data_king":
+            value_line = f"{entry.get('label')} {entry.get('value_text')}"
+            value_line = _truncate_to_width(draw, value_line, _load_font(14), left_end - value_x - 12)
+            draw.text((left_end - 12, center_y), value_line, font=_load_font(14), fill=C.DRAW, anchor="rm")
+            continue
         result_text, color = _result_color(entry.get("result"))
         if value_type == "kda":
             value = f'KDA {entry["kda"]:.2f}'
@@ -4038,27 +4406,44 @@ async def _render_period_image(
             value = f'Fleta {entry["fleta"]:.2f}%'
         else:
             value = _fmt_time(entry["game_time"])
-        draw.text((132, row_y + 10), label, font=_load_font(16, bold=True), fill=(246, 248, 255))
-        draw_map_mode_icon(canvas, entry.get("map_guid"), 258, row_y + 11, 18)
-        draw.text((282, row_y + 11), _short_name(_map_name(entry.get("map_guid")), 10), font=_load_font(15), fill=(218, 228, 242))
-        value_font = _fit_text_font(draw, value, 133, 15, 11)
-        draw.text((450, row_y + 11), value, font=value_font, fill=(255, 218, 117))
-        draw.text((595, row_y + 11), result_text, font=_load_font(15), fill=color)
+        value_font = _fit_text_font(draw, value, 150, 15, 11)
+        draw.text((value_x, center_y), value, font=value_font, fill=C.DRAW, anchor="lm")
+        draw.text((left_end - 12, center_y), result_text, font=_load_font(14, bold=True), fill=color, anchor="rm")
     _render_step("HIGHLIGHT_CARD_DONE", extra=f"rows={len(highlight_rows)}")
 
-    _card(draw, (705, bottom_y1, 1350, bottom_y1 + bottom_h), "胜率晴雨表")
-    _draw_period_weather_calendar(draw, weather_source_matches, 735, bottom_y1 + 67, 585, weather_panel_h)
-    _draw_daily_results(draw, weather_source_matches, 735, bottom_y1 + 67 + weather_panel_h + 15, 585, 180)
+    if rank_h:
+        _card(draw, (page_left, rank_y1, page_right - 1, rank_y1 + rank_h - 1), "赛季竞技段位")
+        draw_rank_panel(draw, season_data, (page_left + card_pad, rank_y1 + card_head,
+                        page_right - card_pad, rank_y1 + card_head + rank_panel_height()), _load_font, C, strength_score_to_rank)
+    _card(draw, (page_left, season_panel_y, page_right - 1, season_panel_y + season_panel_h - 1), "赛季统计")
+    legend_right = page_right - card_pad
+    legend_y = season_panel_y + 31
+    legend_font = _load_font(13)
+    legend_text = "赛季常用地图 / 英雄"
+    draw.text((legend_right, legend_y), legend_text, font=legend_font, fill=C.MUTED, anchor="rm")
+    chip_w = draw.textlength("赛季#1", font=_load_font(12, bold=True)) + 14
+    season_chip(draw, legend_right - draw.textlength(legend_text, font=legend_font) - 10 - chip_w, legend_y, 1, _load_font, C, size=12)
+    draw_season_panel(canvas, draw, season_data, (page_left + card_pad, season_panel_y + card_head,
+                      page_right - card_pad, season_panel_y + card_head + season_panel_height()),
+                      _load_font, C, _map_name, _truncate_to_width)
+    _card(draw, (page_left, bottom_y1, page_right - 1, bottom_y1 + bottom_h - 1), "胜率晴雨表")
+    calendar_w = 620
+    charts_x = page_left + card_pad + calendar_w + 36
+    charts_w = page_right - card_pad - charts_x
+    panel_y = bottom_y1 + card_head
+    _draw_period_weather_calendar(draw, weather_source_matches, page_left + card_pad, panel_y, calendar_w, weather_panel_h)
+    draw.line((charts_x - 18, panel_y, charts_x - 18, panel_y + weather_panel_h), fill=C.HAIRLINE, width=1)
+    _draw_daily_results(draw, weather_source_matches, charts_x, panel_y, charts_w, daily_chart_h)
     durations = {str(m.get("matchId") or m.get("beginTs") or ""):_detail_root(d).get("gameTimeSec") for m,d in detail_pairs if _detail_root(d).get("gameTimeSec") is not None}
     activity = hourly_activity(matches, durations, weekly=period_scope_text=="本周")
-    _draw_activity_chart(draw, activity, 735, bottom_y1 + activity_offset, 585, activity_height)
+    _draw_activity_chart(draw, activity, charts_x, panel_y + daily_chart_h + 18, charts_w, activity_height)
     _render_step(
         "WEATHER_DONE",
         extra=f"source_matches={len(weather_source_matches or [])}; weeks={weather_total_weeks}",
     )
 
     footer = f"生成时间 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    draw.text((50, footer_y), footer, font=_load_font(14), fill=(130, 145, 166))
+    draw.text((page_right, footer_y), footer, font=_load_font(13), fill=C.FAINT, anchor="ra")
     result_image = canvas.convert("RGB")
     _render_step("CONVERT_DONE")
     return result_image

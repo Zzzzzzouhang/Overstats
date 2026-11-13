@@ -173,6 +173,14 @@ def _add_num_spacing(text: str) -> str:
     return _NUM_SPACING_RE.sub(" ", text)
 
 
+def _safe_int(value, default: int = 0) -> int:
+    """容错取整数：score/games 可能来自历史 normalized_json 或脏数据（字符串/None/浮点）。"""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _truncate_teammate_id(name: str) -> str:
     """截断队友 ID 用于显示：
 
@@ -696,7 +704,7 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
     f_body = load_font(32, prefer_cjk=True)
     f_small = load_font(18, prefer_cjk=True)
 
-    score = int(result.get("score", 0) or 0)
+    score = _safe_int(result.get("score"), 0)
     score = max(0, min(100, score))
     verdict = str(result.get("verdict") or "")
     target_id = str(result.get("target_id") or "未知玩家")
@@ -728,6 +736,8 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
     # 逐局点评
     blocks.append(("h2", "逐局点评"))
     for item in result.get("match_comments") or []:
+        if not isinstance(item, dict):
+            continue
         idx = str(item.get("index", "?"))
         res = str(item.get("result", "未知"))
         # 逐局多英雄名之间的分隔符统一用半角「/」（LLM 常返回「源氏、半藏」）。
@@ -753,11 +763,13 @@ def render_shiqu_image(result: Dict[str, Any], generated_at: str = "") -> Render
     mates = result.get("teammate_comments") or []
     if mates:
         for item in mates:
+            if not isinstance(item, dict):
+                continue
             name = _truncate_teammate_id(item.get("name", "未知队友"))
-            tm_score = int(item.get("score", 0) or 0)
+            tm_score = _safe_int(item.get("score"), 0)
             games = item.get("games")
             # (共xx局)：删掉「同」字；局数最多两位（>99 截断为 99）
-            games_disp = min(int(games), 99) if games is not None else None
+            games_disp = min(_safe_int(games, 0), 99) if games is not None else None
             games_text = _add_num_spacing(_to_half_width_punct(f"（共{games_disp}局）")) if games_disp is not None else ""
             tm_verdict = str(item.get("verdict") or "")
             tm_comment = _normalize_llm_text(str(item.get("comment") or ""))

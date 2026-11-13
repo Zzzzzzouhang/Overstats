@@ -38,6 +38,10 @@ class ShiquLLMConfig:
     # LLM 失败重试次数。0 = 仅调用 1 次（不重试）；N = 初始 1 次 + 重试 N 次。
     retry: int = 0
 
+    # 强制 JSON 输出（response_format=json_object）。默认 True；
+    # 个别网关不支持该字段会直接 400，可用 OVERSTATS_SHIQU_LLM_JSON_MODE=0 关闭。
+    json_mode: bool = True
+
     @property
     def chat_url(self) -> str:
         base = str(self.base_url or "").rstrip("/")
@@ -56,6 +60,7 @@ _ENV_TO_FIELD = {
     "SHIQU_LLM_STREAM": "stream",
     "SHIQU_LLM_TIMEOUT": "timeout_seconds",
     "SHIQU_LLM_RETRY": "retry",
+    "SHIQU_LLM_JSON_MODE": "json_mode",
 }
 
 
@@ -89,6 +94,7 @@ def get_shiqu_llm_config() -> ShiquLLMConfig:
         stream=_parse_bool(_get("SHIQU_LLM_STREAM", "true")),
         timeout_seconds=int(_get("SHIQU_LLM_TIMEOUT", "300") or 300),
         retry=int(_get("SHIQU_LLM_RETRY", "0") or 0),
+        json_mode=_parse_bool(_get("SHIQU_LLM_JSON_MODE", "true")),
     )
 
 

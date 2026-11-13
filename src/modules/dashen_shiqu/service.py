@@ -36,10 +36,12 @@ try:
     from overstats.src.modules.font_resolver import resolve_resource_dir
     from overstats.src.db.shiqu_llm import shiqu_llm_recorder
     from .stat_db import (
-        build_broad_reference_map,
+        build_reference_bands,
+        is_rate_stat,
         load_stat_name_map,
         normalize_stat_value,
         should_skip_prompt_stat,
+        stat_index,
     )
     from ..llm_call_status import shiqu_llm_status
 except ModuleNotFoundError:  # pragma: no cover
@@ -56,10 +58,12 @@ except ModuleNotFoundError:  # pragma: no cover
     from src.modules.font_resolver import resolve_resource_dir
     from src.db.shiqu_llm import shiqu_llm_recorder
     from .stat_db import (
-        build_broad_reference_map,
+        build_reference_bands,
+        is_rate_stat,
         load_stat_name_map,
         normalize_stat_value,
         should_skip_prompt_stat,
+        stat_index,
     )
     from src.modules.llm_call_status import shiqu_llm_status
 
@@ -128,7 +132,7 @@ for _hero_name, _allowed in _ALLOWED_SPECIAL_BY_HERO.items():
 
 # 压缩提示词：英雄片段字段短键映射（中文统计名 → 短键）。
 # 与 prompt 中「字段说明」严格对应：h英雄 t时长 k消灭 d阵亡 f最后一击
-# s单独消灭 acc命中率 cr暴击率 heal治疗 save拯救。ref 同义。
+# s单独消灭 acc命中率 cr暴击率 heal治疗 save拯救（除 h/t 外均为 0-100 参考指数）。
 _STAT_TEXT_TO_SHORT = {
     "消灭": "k", "阵亡": "d", "最后一击": "f", "单独消灭": "s",
     "武器命中率": "acc", "暴击命中率": "cr", "治疗量": "heal", "拯救玩家": "save",
@@ -144,6 +148,8 @@ for _txt, _short in _STAT_TEXT_TO_SHORT.items():
         _STAT_GUID_TO_SHORT[_g] = _short
 # 用 guids 反查，避免重复映射
 _STAT_SHORT_TO_GUID = {v: k for k, v in _STAT_GUID_TO_SHORT.items()}
+# 阵亡「越低越好」：指数按 100-百分位翻转，保证所有字段统一成「越大越好」
+_REVERSE_SHORTS = {"d"}
 
 
 
@@ -171,10 +177,10 @@ def _infer_hero_guid_from_stat_map(stat_map: dict, fallback_hero_guid: str = "",
 
 # 最小 JSON 结构：模型只负责产出「评分 + 点评」，其余（英雄名、胜负、好友名、同场次数）
 # 全部由本地数据填充，避免模型编造/漏填这些本可确定计算的事实字段。
-# 不再使用 response_format / strict —— 只靠 prompt 约束模型输出纯 JSON，解析失败由
-# _extract_json_object 的修复链兜底。键保持短键以压缩输出 token、降低截断概率。
-#   sc=总分(整数0-100)  sum=数据概况(≤100字)  mc=逐局点评数组(每局一条纯文本)
-#   ov=综合评价(≤300字)  tm=好友点评数组(每项 {ts=评分(整数), c=点评})
+# 输出走 response_format=json_object 强制 JSON（网关不支持时用
+# OVERSTATS_SHIQU_LLM_JSON_MODE=0 关闭），解析仍保留 _extract_json_object 的修复链兜底。
+#   sc=总分(整数0-100)  sum=数据概况  mc=逐局点评数组(每局一条纯文本)
+#   ov=综合评价  tm=好友点评数组(每项 {ts=评分(整数), c=点评})
 
 _VERDICT_RULES = [
     {"score_min": 83, "labels": ("你是职业吗？",), "canonical": "你是职业吗？", "emoji": "😱", "class": "god"},
@@ -231,6 +237,11 @@ def _normalize_result(data: dict, target_id: str, matches: Optional[list] = None
     本地填充：英雄名、胜负、好友名与同场次数——这些都是可由对局数据确定的事实，
     不应让模型编造/漏填，从而大幅降低 JSON 解析失败与事实性错误的风险。
     """
+    # 旧版模型输出用长键（score/summary/match_comments/overall_comment/teammate_comments），
+    # use_db 复读历史记录时会走到这里，直接按短键取会得到 0 分，故先做一次结构识别。
+    if "sc" not in data and ("score" in data or "match_comments" in data):
+        return _normalize_legacy_result(data, target_id)
+
     score = _clamp_score(data.get("sc"), 0)
     friends = _compute_friend_list_with_counts(matches or [], target_id)
     # 类型兜底：模型偶尔会把数组误输出成字符串/其它类型，这里统一降级为空数组，
@@ -279,6 +290,54 @@ def _normalize_result(data: dict, target_id: str, matches: Optional[list] = None
         "summary": str(data.get("sum") or "暂无数据概况。").strip(),
         "match_comments": match_comments,
         "overall_comment": str(data.get("ov") or "暂无综合评价。").strip(),
+        "teammate_comments": teammate_comments,
+    }
+
+
+def _normalize_legacy_result(data: dict, target_id: str) -> dict:
+    """把旧版「长键」判定结果补成当前渲染结构（use_db 复读历史记录时用）。
+
+    旧记录本身就是完整渲染结构（score/summary/match_comments/overall_comment/
+    teammate_comments），但没有 verdict，且 teammate_comments 缺 verdict，这里按分数补。
+    """
+    score = _clamp_score(data.get("score"), 0)
+    match_comments = []
+    for item in data.get("match_comments") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index") or (len(match_comments) + 1))
+        except (TypeError, ValueError):
+            idx = len(match_comments) + 1
+        match_comments.append({
+            "index": idx,
+            "result": str(item.get("result") or "未知"),
+            "hero": str(item.get("hero") or "未知英雄"),
+            "comment": str(item.get("comment") or "暂无点评。").strip(),
+        })
+    teammate_comments = []
+    for item in data.get("teammate_comments") or []:
+        if not isinstance(item, dict):
+            continue
+        ts = _clamp_score(item.get("score"), 0)
+        try:
+            games = max(1, int(item.get("games") or 1))
+        except (TypeError, ValueError):
+            games = 1
+        teammate_comments.append({
+            "name": str(item.get("name") or "未知队友"),
+            "score": ts,
+            "verdict": _score_rule(ts)["canonical"],
+            "comment": str(item.get("comment") or "暂无点评。").strip(),
+            "games": games,
+        })
+    return {
+        "target_id": str(data.get("target_id") or target_id),
+        "score": score,
+        "verdict": _score_rule(score)["canonical"],
+        "summary": str(data.get("summary") or "暂无数据概况。").strip(),
+        "match_comments": match_comments,
+        "overall_comment": str(data.get("overall_comment") or "暂无综合评价。").strip(),
         "teammate_comments": teammate_comments,
     }
 
@@ -712,16 +771,27 @@ _KILL_GUID = "603482350067646495"
 _ASSIST_GUID = "603482350067648392"
 _DEATH_GUID = "603482350067646506"
 
+# 时长过短的英雄片段：per-10min 外推会失真（96 秒打 4 杀会外推成 25 杀），
+# 因此只告诉模型「玩过这个英雄」，不给任何指数，也不参与评分。
+_SHORT_SEGMENT_SEC = 180
+_SHORT_SEGMENT_MARK = "短"
+
 
 def _fmt_hero_line(seg, db) -> str:
     """把单个英雄分段格式化为行协议：
 
       h=英雄 t=时长(秒) k=消灭 d=阵亡 f=最后一击 s=单独消灭 acc=命中 cr=暴击 heal=治疗 save=拯救
-      [特殊命中率=val ...] | ref:同义参考值
+      [特殊命中率=指数 ...]
+      h=英雄 t=时长(秒) 短                     ← 时长<180 秒，仅告知玩过该英雄
 
-    英雄自身字段按 per-10min 归一化（与 normalize_stat_value 口径一致）。
-    普通字段用短键；该英雄的特殊命中率字段（ALLOWED_SPECIAL_BY_HERO）以中文名原样给出，
-    避免跨英雄歧义。ref 为同英雄分段参考中位数（build_broad_reference_map），仅含真实出现字段。
+    有参考库时，统计字段一律是 0-100 的「同英雄参考指数」：本地把该场数值（per-10min
+    口径，与 normalize_stat_value 一致）放到该英雄的分位参考分布上换算百分位，
+    50=中位数、100=顶尖、0=垫底；阵亡已翻转，所有字段统一「越大越好」。
+    这样既不给模型原始大数值（治疗量 8000+ 会干扰判断），也不用直接相除
+    （比值在参考值很小时会爆炸，且命中率与治疗量的「同倍偏差」严重程度不同）。
+    参考样本不足的字段记 `?`；完全没有参考库（db 为空）时退化为原始数值。
+    上游对 0 值字段不下发，因此某段缺少「阵亡」时按 0 计（0 死亡是纯正向信号，
+    误判代价小），其余字段缺失照旧省略。
     """
     hg = str(seg.get("hero_guid", ""))
     hn = HERO_DICT.get(hg, {}).get("name", "?")
@@ -729,59 +799,49 @@ def _fmt_hero_line(seg, db) -> str:
     if not entry:
         return f"  h={hn}"
     ut = float(entry.get("userTimeSec", 0) or 0)
+    if ut < _SHORT_SEGMENT_SEC:
+        return f"  h={hn} t={int(round(ut))} {_SHORT_SEGMENT_MARK}"
     sm = entry.get("statMap", {}) or {}
     name_map = seg.get("name_map") or load_stat_name_map()
+    bands = build_reference_bands(db, hg) if db else {}
 
-    common_parts: list = []
-    ref_guids: set = set()
+    def _emit(guid: str, label: str, reverse: bool, default: Optional[float] = None) -> Optional[str]:
+        nm = name_map.get(guid, "")
+        if should_skip_prompt_stat(value_guid=guid, value_text=nm):
+            return None
+        nv = normalize_stat_value(sm.get(guid), ut, value_text=nm, value_guid=guid)
+        if nv is None and default is not None:
+            nv = default
+        if nv is None:
+            return None
+        if not db:
+            return f"{label}={_fmt_compact_num(nv)}"
+        idx = stat_index(nv, bands.get(nm), reverse=reverse, log_scale=not is_rate_stat(nm))
+        return f"{label}={idx if idx is not None else '?'}"
+
+    parts = [f"h={hn}", f"t={int(round(ut))}"]
     for g, short in _STAT_GUID_TO_SHORT.items():
-        if g not in sm:
-            continue
         if not _stat_allowed_for_hero(g, hg):
             continue
-        nm = name_map.get(g, "")
-        if should_skip_prompt_stat(value_guid=g, value_text=nm):
+        # 阵亡缺失 = 0 死亡（上游不下发 0 值字段），按指数最高档计；该段完全没数据时不补
+        death_default = 0.0 if (g == _DEATH_GUID and sm) else None
+        if g not in sm and death_default is None:
             continue
-        nv = normalize_stat_value(sm.get(g), ut, value_text=nm, value_guid=g)
-        if nv is None:
-            continue
-        common_parts.append(f"{short}={_fmt_compact_num(nv)}")
-        ref_guids.add(g)
+        item = _emit(g, short, short in _REVERSE_SHORTS, death_default)
+        if item:
+            parts.append(item)
 
-    special_parts: list = []
+    # 该英雄的特殊命中率字段（ALLOWED_SPECIAL_BY_HERO）以中文名原样给出，避免跨英雄歧义
     for g in _HERO_SPECIAL_ATTR_GUIDS.get(hg, set()):
         if g in _STAT_GUID_TO_SHORT or g not in sm:
             continue
         nm = name_map.get(g, "")
-        if not nm or should_skip_prompt_stat(value_guid=g, value_text=nm):
+        if not nm:
             continue
-        nv = normalize_stat_value(sm.get(g), ut, value_text=nm, value_guid=g)
-        if nv is None:
-            continue
-        special_parts.append(f"{nm}={_fmt_compact_num(nv)}")
-        ref_guids.add(g)
-
-    parts = [f"h={hn}", f"t={int(round(ut))}"] + common_parts + special_parts
-    line = "  " + " ".join(parts)
-
-    if db and ref_guids:
-        ref_map = build_broad_reference_map(db, hg, present_guids=ref_guids)
-        if ref_map:
-            ref_items: list = []
-            for g, short in _STAT_GUID_TO_SHORT.items():
-                if g in ref_guids:
-                    nm = name_map.get(g, "")
-                    if nm in ref_map:
-                        ref_items.append(f"{short}={_fmt_compact_num(ref_map[nm])}")
-            for g in _HERO_SPECIAL_ATTR_GUIDS.get(hg, set()):
-                if g in _STAT_GUID_TO_SHORT or g not in ref_guids:
-                    continue
-                nm = name_map.get(g, "")
-                if nm in ref_map:
-                    ref_items.append(f"{nm}={_fmt_compact_num(ref_map[nm])}")
-            if ref_items:
-                line += " | ref:" + " ".join(ref_items)
-    return line
+        item = _emit(g, nm, False)
+        if item:
+            parts.append(item)
+    return "  " + " ".join(parts)
 
 
 def _compact_label_players(players, *, enemy: bool = False):
@@ -863,7 +923,7 @@ def _fmt_match_block(m: dict, target_id: str, idx: int, db) -> str:
 
     第{i}局|res|map|比分
     {pos}|{p}|{pr}
-      h=... t=... ... | ref:...
+      h=... t=... k=指数 d=指数 ...
     """
     detail_data = (m.get("detail", {}) or {}).get("data") or {}
     source = m.get("source_match", {}) or {}
@@ -957,83 +1017,121 @@ _METAPHOR_CATEGORIES = [
 ]
 
 
-def _build_metaphor_text() -> str:
+def _build_metaphor_text(seed: Optional[str] = None) -> str:
+    """修辞库文本。seed 给定时用确定性打乱（同 seed 输出完全一致），便于整段进缓存。"""
+    rng = random.Random(seed) if seed is not None else random
     cats = list(_METAPHOR_CATEGORIES)
-    random.shuffle(cats)
+    rng.shuffle(cats)
     lines = []
     for cat_name, items in cats:
         items = list(items)
-        random.shuffle(items)
+        rng.shuffle(items)
         lines.append(f"{cat_name}：{'、'.join(items)}。")
     return "\n".join(lines)
 
 
 def _build_system_prompt() -> str:
-    """常驻、与具体对局无关的内容，放入 system（可被 prompt caching 命中）。"""
+    """常驻、与具体对局无关的内容，全部放入 system，供 prompt caching 命中。
+
+    修辞库也放在这里，并且按自然日轮换（同一天内 system 完全一致）：
+    它原本按请求随机打乱、挂在 user prompt 末尾，会让 system 每次都不一样、
+    缓存直接失效；搬到 system 后 system 前缀稳定可缓存，user 只装本局数据。
+    """
+    metaphor = _build_metaphor_text(seed=time.strftime("%Y-%m-%d"))
     return f"""[ROLE] 角色与语气
 你是一位资深竞技游戏玩家兼数据分析师，用「脱口秀式毒舌」风格复盘对局数据。戏谑、犀利、阴阳怪气但不恶意，保持损友亲切感；善用反讽、夸张、反转；大量使用游戏黑话与生活化比喻混搭，可理解并创造新比喻；对好的部分赞赏，差的部分指出。
 
-[CONTEXT] 背景
-守望先锋段位：青铜、白银、黄金、白金、钻石、大师、宗师、英杰。
-
 [OBJECTIVE] 任务
-严格基于提供的原始对局数据，对焦点玩家及其好友复盘点评，只输出一个纯 JSON 对象（禁止 markdown / 代码块 / 注释 / JSON 外任何文字）。英雄名、胜负、好友名、同场次数等本可由数据确定的字段不要输出，由系统本地填充；你只需给出评分与点评。
+严格基于提供的对局参考指数，对焦点玩家及其好友复盘点评。英雄名、胜负、好友名、同场次数等本可由数据确定的字段不要输出，由系统本地填充；你只需给出评分与点评。
 
 [CONSTRAINTS] 硬约束
-1. 只评游戏数据，不评外貌/私生活/人品；不引战、不歧视、不聊外挂代练；不编造数据；不跨职责/跨英雄比较；高光必夸，差局调侃；胜负不影响评分。
-2. 仅描述已发生事件，禁止反事实推演或假设性陈述。
+1. 只评游戏数据，不评外貌/私生活/人品；不引战、不歧视、不聊外挂代练；不跨职责/跨英雄比较；高光必夸，差局调侃。
+2. 数据里只有 0-100 指数，没有原始数值；禁止编造或反推具体数字（如「你打了 8000 治疗」「命中率 42%」），只能描述指数高低与相对强弱。
+3. 仅描述已发生事件，禁止反事实推演或假设性陈述。
 
 [WORKFLOW] 评分规则
-步骤一 职责核心指标：
-坦克参考 单独消灭、最后一击、(伤害减受疗)、阵亡、消灭参与率；
-输出参考 单独消灭、最后一击、伤害、阵亡、消灭参与率；
-辅助参考 最后一击、阵亡、拯救、单独消灭、伤害、治疗、消灭参与率。
-步骤二 对比与评分（score 整数 0-100，基准线55）：
-1. 与同英雄 ref 对比，低于参考扣分，禁止跨英雄比较；
-2. 同一局多英雄，时长<3分钟片段低权重；
-3. 最后一击、单独消灭额外加分；频繁阵亡且贡献低加重扣分；
-4. 综合看英雄数据（如输出伤害低但最后一击高、辅助输出高但治疗少），不跨英雄对比；
-5. 解构无效数据：空有治疗/伤害但消灭参与率极低，判为「无效数据刷子」；
-6. 单独消灭高应赞赏，低不批评；
-7. 比赛胜负不影响评分；
-8. 某局数据异常则不参与评分或低权重，comment 写「数据缺失，无法评价」。
-步骤三 overall_comment：
+步骤一 职责核心指标（全部以指数给出，50=同英雄同段位中位数）：
+坦克 重点 阵亡、最后一击、单独消灭、消灭参与率；
+输出 重点 单独消灭、最后一击、命中率、阵亡、消灭参与率；
+辅助 重点 治疗、拯救、阵亡、最后一击、单独消灭、消灭参与率。
+步骤二 对比与评分（sc 整数 0-100，基准线 55）：
+1. 指数已是同英雄、同段位口径，直接比高低即可；不跨英雄比较，结合时长综合判断，指数高不等于历史级表现；
+2. 英雄行末尾带「短」的表示该英雄只玩了不到 3 分钟（本地判定为样本不足，不给任何指数），不参与评分与对比，最多在点评里提一句换过这个英雄；
+3. 最后一击、单独消灭指数高额外加分（单独消灭高赞赏、低不批评）；阵亡指数低且其余指标平庸加重扣分；
+4. 综合看指数结构（如输出消灭指数高但命中率指数低=吃资源低效）；
+5. 解构无效数据：治疗/消灭指数高但消灭参与率明显偏低，判为「无效数据刷子」；
+6. 胜负以焦点玩家所在阵营为准，且不单独决定加减分，要结合胜负与数据的关系判断：
+   ① 败局且数据非常突出（多个核心指数 75+、明显高于同英雄参考）→ 额外加分并在点评里表扬，定性为「带不动的尽力局」；
+   ② 败局且数据特别低 → 不评价、不额外扣分，一句带过即可，不要落井下石；
+   ③ 胜局但数据明显低于同局同职责队友（坦/输/辅 各自组内比）→ 减分，指出是被带赢的；
+   ④ 胜局且数据明显高于同局队友 → 不加分、不额外表扬，赢了不是数据好的理由。
+7. 某局字段多为「?」或数据异常则该局不参与评分或低权重，mc 写「数据缺失，无法评价」。
+步骤三 ov：
 1. 精准比喻/定性标签概括特点；
 2. 高光与拉胯极端对比；
 3. 细节画面感吐槽/表扬；
 4. 调侃口吻收尾建议。
 步骤四 好友点评：
-1. 覆盖全部好友，score≥50夸，<50调侃；
-2. 仅基于比赛数据，胜负不影响评价；缺数据保守评价。
+1. 覆盖全部好友，ts≥50 夸，<50 调侃。
 
 [OUTPUT] 输出格式
-只输出一个 JSON 对象，禁止 markdown、代码块、注释与 JSON 外的任何文字。字段一律用下方短键（不要长键名）。字符串用中文、简练；禁止英文双引号，引用一律用「」或『』；emoji 按上限使用。不要输出尾随逗号，字符串内的双引号请转义为 \\"。
-顶层对象（全部必填）：
+只输出一个 json 对象，键用下方短键，全部必填：
 - "sc": 整数 0-100（基准 55），焦点玩家总评分
-- "sum": 字符串，数据概况（≥200 字，客观详尽，覆盖段位/职责/整体数据走向）
-- "mc": 数组，逐局点评，第 1 条对应第 1 局、依次排列；每项是该局纯文本点评（≥80 字；异常局写「数据缺失，无法评价」）；长度必须等于对局数
-- "ov": 字符串，综合评价（≥400 字，精准比喻 + 高光与拉胯极端对比 + 细节画面感 + 调侃收尾）
-- "tm": 数组，好友点评，第 1 项对应 friends 列表第 1 位、依次排列；长度必须等于好友数（无好友时输出空数组 []）；每项为 {{"ts": 整数 0-100（≥50 夸、<50 调侃）, "c": 点评（≥60 字）}}
-括号必须配平：mc 与 tm 数组写完最后一项后，先用 ] 闭合数组，再写后面的字段（例如 mc 闭合后才写 ov、tm）。切勿在数组内部直接写 "ov"、"tm" 这类键值对。
-示例（仅格式参考，内容必须按真实数据填写，切勿照抄示例文本）：
-{{"sc":72,"sum":"...","mc":["第1局点评","第2局点评"],"ov":"...","tm":[{{"ts":60,"c":"..."}}]}}"""
+- "sum": 数据概况，≥200 字，覆盖职责与整体走向
+- "mc": 逐局点评数组，长度=对局数，每项 ≥80 字；异常局写「数据缺失，无法评价」
+- "ov": 综合评价，≥400 字：比喻 + 高光/拉胯对比 + 画面感 + 调侃收尾
+- "tm": 好友点评数组，长度=好友数（无好友填 []），每项 {{"ts": 0-100（≥50 夸、<50 调侃）, "c": ≥60 字}}
+mc/tm 写完先闭合 ] 再写后面的键；不要尾随逗号；字符串内不要出现英文双引号，引用用「」。
+
+[修辞库] 每日轮换，可择优取材，也可自创同类比喻（不要堆砌，一段用一两个即可）
+{metaphor}"""
+
+
+def _build_field_legend(use_index: bool = True) -> str:
+    """字段说明（user prompt 顶部）。use_index=False 时说明原始数值口径（参考库不可用的降级模式）。
+
+    注意：玩家行是位置协议（位置|玩家ID|消灭参与率），行里没有 pos=/pr= 这类标签，
+    因此这里按位置逐段说明，避免出现「说明里有、数据里没有」的字段名。
+    """
+    player_line = (
+        "· 玩家行（位置|玩家ID|消灭参与率，例：坦1|*名字|0.597）：位置取 坦/输/辅，"
+        "同职责多人时带序号（坦1、坦2）；玩家ID 前带 * 的是焦点玩家；"
+        "末位是该局消灭参与率，取值 0-1。"
+    )
+    if not use_index:
+        return (
+            "字段说明：\n" + player_line + "\n"
+            "· 英雄行：h=英雄 t=时长(秒)，其后字段为该场原始数值（比率类除外，其余按每 10 分钟归一化）："
+            "k=消灭 d=阵亡 f=最后一击 s=单独消灭 acc=命中率 cr=暴击率 heal=治疗 save=拯救。"
+        )
+    return (
+        "字段说明：\n" + player_line + "\n"
+        "· 英雄行：h=英雄 t=时长(秒)；其后字段均为 0-100 指数（本地把该场数值与该英雄的分段参考分布对齐后换算，"
+        "不是原始数值，也不要反推原始数值）：指数本质是百分位——50=同英雄同段位中位数玩家、100=最好、0=最差，"
+        "60 略好于中位、75=超过 75% 玩家、90=前 10%、95=前 5%、10=后 10%；阵亡等越低越好的项已翻转，"
+        "因此所有指数统一为越大越好。?=参考样本不足。\n"
+        "· 字段：k=消灭 d=阵亡 f=最后一击 s=单独消灭 acc=命中率 cr=暴击率 heal=治疗 save=拯救；"
+        "英雄行可附加该英雄特殊命中率字段（如 螺旋飞弹命中率、辅助攻击模式命中率），以中文名给出，同样是指数。"
+    )
 
 
 def _build_user_prompt(matches: list, target_id: str, db: Optional[IDPoolDB] = None) -> str:
-    """动态内容：焦点玩家、好友、压缩后的行协议比赛数据、修辞库。"""
+    """动态内容：焦点玩家、好友、压缩后的行协议比赛数据。
+
+    修辞库已上移到 system（按天轮换），这里只放本局数据，尽量让 user 前缀稳定。
+    """
     match_text = "\n\n".join(_fmt_match_block(m, target_id, i + 1, db) for i, m in enumerate(matches))
     friend_names = _compute_friend_list(matches, target_id)
     friends_line = ", ".join(friend_names) if friend_names else "无"
+    # db 为 None 时参考库不可用，退化为原始数值（per-10min 归一化），仅作降级兜底
+    legend = _build_field_legend(use_index=db is not None)
     return f"""target_id={target_id}
 
 friends={friends_line}
 
-字段说明：pos=位置 p=玩家ID（*前缀为焦点玩家） pr=消灭参与率；h=英雄 t=时长(秒) k=消灭 d=阵亡 f=最后一击 s=单独消灭 acc=命中率 cr=暴击率 heal=治疗 save=拯救；ref=同英雄参考值，字段同义。英雄行可附加该英雄特殊命中率字段（如 螺旋飞弹命中率、辅助攻击模式命中率），以中文名给出，ref 同义。胜负以焦点玩家所在阵营为准。
+{legend}
 
-{match_text}
-
-[修辞库]
-{_build_metaphor_text()}"""
+{match_text}"""
 
 
 # ── LLM 调用（独立配置）──
@@ -1045,7 +1143,7 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
         return None
 
     def _build_payload() -> dict:
-        return {
+        payload = {
             "model": cfg.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -1056,6 +1154,11 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
             "max_tokens": 35536,
             "stream": cfg.stream,
         }
+        # 强制 JSON 模式：模型只会吐合法 JSON 对象，提示词里就不必再写一堆防跑题的禁令。
+        # 少数网关不认识该字段会返回 400，此时用 OVERSTATS_SHIQU_LLM_JSON_MODE=0 关闭。
+        if cfg.json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
 
     headers = {"Authorization": f"Bearer {cfg.api_key}", "Content-Type": "application/json"}
     from ..analysis_common import (
@@ -1123,9 +1226,9 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
                     logger.error(f"[shiqu] LLM 调用异常: {e}", exc_info=True)
                     return None
 
-            # 不再依赖 response_format / strict：仅凭 prompt 约束模型输出纯 JSON，
-            # 解析失败由 _extract_json_object 的修复链兜底（与 dashen_match 锐评一致）。
-            # 兼容任何不支持 structured outputs 的模型（如 Nemotron 3.5 Lightning 免费版）。
+            # 已在 payload 里启用 response_format=json_object 强制 JSON；不使用 strict/schema，
+            # 这样不支持 structured outputs 的模型也能工作，解析失败仍由
+            # _extract_json_object 的修复链兜底（与 dashen_match 锐评一致）。
             content = await _do_request()
             return content
 
@@ -1387,7 +1490,10 @@ class ShiquModule:
             except Exception as exc:  # pragma: no cover
                 logger.warning(f"[shiqu] 提示词保存失败: {exc}")
 
-        if len(user_prompt.encode("utf-8")) < 10240:
+        # 兜底校验：对局数已在上方按 len(details) < 2 拦过，这里只防「抓到了但数据全空」。
+        # 阈值按「指数 + 短片段」压缩后的口径取 4096 字节（12 局实测约 7.5KB；
+        # 旧版原始数值 + ref 口径约 13~16KB，故原 10240 会让新版合法提示词误判）。
+        if len(user_prompt.encode("utf-8")) < 4096:
             raise ModuleError(
                 error="insufficient_prompt_data",
                 message="数据抓取量异常，可能没有足够的预设/6v6 比赛对局。",

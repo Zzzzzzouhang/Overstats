@@ -3,9 +3,12 @@ from .requests import ShiquQuery
 from .service import ShiquModule, shiqu_module
 from .stat_db import (
     build_broad_reference_map,
+    build_reference_bands,
+    is_rate_stat,
     load_stat_name_map,
     normalize_stat_value,
     should_skip_prompt_stat,
+    stat_index,
 )
 
 __all__ = [
@@ -13,9 +16,12 @@ __all__ = [
     "ShiquModule",
     "ShiquQuery",
     "build_broad_reference_map",
+    "build_reference_bands",
+    "is_rate_stat",
     "load_stat_name_map",
     "normalize_stat_value",
     "render_shiqu_image",
     "shiqu_module",
     "should_skip_prompt_stat",
+    "stat_index",
 ]

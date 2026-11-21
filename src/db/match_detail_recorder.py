@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,18 @@ except ModuleNotFoundError:
         normalize_hero_rank_score,
     )
     from src.modules.query_tool import read_query_tool
+
+
+# 匿名统计的落库日志：每批都会刷一行，默认静默，避免刷屏。
+# 排查队列积压 / 写盘耗时的时候设置 OVERSTATS_ANON_STATS_DEBUG=1 打开。
+_ANON_STATS_DEBUG = os.environ.get("OVERSTATS_ANON_STATS_DEBUG", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+
+def _anon_stats_debug(message: str) -> None:
+    if _ANON_STATS_DEBUG:
+        print(message)
 
 
 @dataclass(frozen=True)
@@ -354,7 +367,7 @@ class MatchDetailRecorder:
             await self._queue.put(event)
             wait_ms = int((time.monotonic() - started) * 1000)
             if wait_ms >= 200:
-                print(f"[anonymous-statistics] enqueue_wait_ms={wait_ms} queued={self._queue.qsize()}")
+                _anon_stats_debug(f"[anonymous-statistics] enqueue_wait_ms={wait_ms} queued={self._queue.qsize()}")
 
     async def close(self) -> None:
         if not self._started or self._closed:
@@ -382,7 +395,10 @@ class MatchDetailRecorder:
                 self.db._warn_once(f"anonymous statistics write failed: {type(exc).__name__}")
             finally:
                 cost_ms = int((time.monotonic() - started) * 1000)
-                print(f"[anonymous-statistics] batch_size={len(batch)} batch_ms={cost_ms} queued={self._queue.qsize()}")
+                _anon_stats_debug(
+                    f"[anonymous-statistics] batch_size={len(batch)} batch_ms={cost_ms} "
+                    f"queued={self._queue.qsize()}"
+                )
                 for _ in batch:
                     self._queue.task_done()
 

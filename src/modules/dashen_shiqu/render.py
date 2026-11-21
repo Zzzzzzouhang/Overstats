@@ -143,6 +143,10 @@ _FULLWIDTH_PUNCT_AFTER_KERN = set("、，。；：！？…—～·」』）】�
 # 负字距比例（相对字号）：用于「全宽标点 + 后随字符」组合的视觉收紧。
 _PUNCT_AFTER_KERN_RATIO = 1 / 3
 
+# 右端对齐时每个字允许的最大偏移（像素）。0 = 严格等字距（行尾允许留白 ≤1 个字）；
+# 1.0 = 每字最多拉/压 1px，足以把「差不到半个字」的行尾补齐，而 32px 字号下 1px 肉眼几乎无感。
+_JUSTIFY_MAX_SHIFT_PX = 1.5
+
 
 def _is_emoji(ch: str) -> bool:
     return bool(ch) and bool(_EMOJI_RE.match(ch))
@@ -540,44 +544,40 @@ def _backfill_lines(
         return lines
     out = [list(item) for item in lines]  # 可变 [(chars, is_full)]
 
-    # 从倒数第二行向上遍历；段落最后一行（is_full=False）不参与作为「被填」的上一行
-    i = len(out) - 2
-    while i >= 0:
+    # 自上而下走一遍（方向很关键）：
+    # 第 i 行从第 i+1 行提字填满，第 i+1 行随即空出一部分，马上轮到它从第 i+2 行提字……
+    # 被提走的字符会顺着这一趟一路传递下去，最后落到段末行，因此**一趟即可收敛**。
+    # 反过来（旧实现自下而上）第 i 行把字提给第 i-1 行后自己空出来，遍历已经往上走了，
+    # 再也不会回头补，于是留下「明明下面还有字、却空着一个字宽」的行尾。
+    i = 0
+    while i < len(out) - 1:
         cur_chars, cur_full = out[i]
         if not cur_full:
-            # 上一行是段末自然行，不往上拉（保持原样），继续看更上面
-            i -= 1
+            # 段末自然行不做填充（保持原样），继续看下一行
+            i += 1
             continue
         nxt_chars, nxt_full = out[i + 1]
-        # 贪心逐字上提。允许略微超出一个字宽容差：绘制端会对「完整行」做两端对齐
-        # （slack<0 时负向收紧），所以上一行多提一个字不会超出图片，反而能消除行尾大留白。
-        # 行宽用增量维护（此前每次上提都整行重算，文本长时是 O(n^2) 的主要热点）。
         cur_w = _line_width(cur_chars, draw, font, emoji_on, half_font)
         while nxt_chars:
             w = _glyph_width(draw, nxt_chars[0][0], font, emoji_on, half_font)
-            if cur_w + w > max_width + font.size:
+            if cur_w + w > max_width:
                 break
             cur_chars.append(nxt_chars.pop(0))
             cur_w += w
-            # 若提完后下一行新首字符是「行首禁则符号」，必须把它也一并带走
-            # （禁则符号单独悬在下一行行首比当前行略微超出更糟）。放宽两个字宽容差，
-            # 允许上一行末尾多带禁则符号（如「神、」整体连回上一行）。
+            # 若提完后下一行新首字符是「行首禁则符号」，一并带走
+            # （禁则符号单独悬在下一行行首更糟），允许略超一个字宽。
             if nxt_chars and _is_line_start_forbidden(nxt_chars[0][0]):
                 w2 = _glyph_width(draw, nxt_chars[0][0], font, emoji_on, half_font)
-                if cur_w + w2 <= max_width + 2 * font.size:
+                if cur_w + w2 <= max_width + font.size:
                     cur_chars.append(nxt_chars.pop(0))
                     cur_w += w2
         out[i][0] = cur_chars
-        out[i][1] = True
         if not nxt_chars:
-            # 下一行被吃空：它原本若是段末行，则当前行降级为段末行
-            out.pop(i + 1)
+            # 下一行被提空：把「段末」身份转移到本行，稍后统一清理空行
             if not nxt_full:
                 out[i][1] = False
-            # 继续向上，看能否把更上面的行也填进来
-        else:
-            out[i + 1][0] = nxt_chars
-            i -= 1
+            out[i + 1][0] = []
+        i += 1
     # 清理被吃空的行
     out = [tuple(item) for item in out if item[0]]
     return out
@@ -612,26 +612,18 @@ def _draw_segments(
             if chars[i - 1][0] in _FULLWIDTH_PUNCT_AFTER_KERN and chars[i][0] != " ":
                 kerns[i] = int(font.size * _PUNCT_AFTER_KERN_RATIO)
         line_w = sum(base_w) - sum(kerns)
-        # 完整行（因溢出断行）做两端对齐：
-        # 仅扩展「词边界」间隙（汉字↔数字 / 汉字↔英文 / 空格）。
-        # 绝不动纯汉字字间隙，也不动英文单词内部（如 K-D、G-P-S）的间距；
-        # 词边界不足（如纯汉字行）则不拉伸，保持左对齐。
-        gap_extra = 0.0
-        expand_pos: set = set()
-        if is_full and n > 1:
+        # 字间距固定：不对字距做任何拉伸/压缩，也不往标点后的空格里塞余量。
+        # 行尾对齐由 _backfill_lines 的「提字」完成（把下一行的字提到本行），
+        # 提不下的部分直接留成行尾空白（最多约一个字宽）；行尾悬挂的标点算在 pad 内。
+        # 若把 _JUSTIFY_MAX_SHIFT_PX 调成 >0，则允许每字最多偏移该像素数来把行拉到右边界
+        # （1px 以内肉眼不可见，代价是不再是严格「等字距」）。
+        extras = [0.0] * n
+        if is_full and n > 1 and _JUSTIFY_MAX_SHIFT_PX > 0:
             slack = max_width - line_w
-            if slack != 0:
-                for i in range(1, n):
-                    if _is_word_gap(chars[i - 1][0], chars[i][0]):
-                        # 记录间隙「前一个字符」的索引：gap_extra 加在 chars[i-1] 的推进上，
-                        # 才能真正加宽 chars[i-1]→chars[i] 这个词边界（而非其后一个间隙）。
-                        expand_pos.add(i - 1)
-                if expand_pos:
-                    # slack>0 拉伸；slack<0 压缩（行被反向回填略超宽时，收回 max_width 不外溢）
-                    gap_extra = slack / len(expand_pos)
-                elif slack < 0:
-                    # 纯汉字行无词边界却被回填略超宽：均匀负向收紧所有字间隙回收到 max_width
-                    gap_extra = slack / (n - 1)
+            if abs(slack) >= 1.0:
+                per = max(-_JUSTIFY_MAX_SHIFT_PX, min(_JUSTIFY_MAX_SHIFT_PX, slack / (n - 1)))
+                for i in range(n - 1):
+                    extras[i] += per
         cx = x
         for i, (ch, color, f) in enumerate(chars):
             dy = int(font.size * 0.06) if _is_emoji(ch) else 0
@@ -641,11 +633,10 @@ def _draw_segments(
                 # emoji：有字体则合成图像；无字体（离线缺失）则跳过，避免豆腐块
                 if emoji_on and f is None:
                     _composite_emoji(img, ch, cx, cy - dy, font.size)
-                cx += base_w[i] + (gap_extra if i in expand_pos else 0.0)
+                cx += base_w[i] + extras[i]
                 continue
             draw.text((cx, cy - dy), ch, font=f, fill=color)
-            adv = base_w[i] + (gap_extra if i in expand_pos else 0.0)
-            cx += adv
+            cx += base_w[i] + extras[i]
         cy += line_h
     return cy
 

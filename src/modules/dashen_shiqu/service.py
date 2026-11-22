@@ -1156,7 +1156,9 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> Optional[str]:
         }
         # 强制 JSON 模式：模型只会吐合法 JSON 对象，提示词里就不必再写一堆防跑题的禁令。
         # 少数网关不认识该字段会返回 400，此时用 OVERSTATS_SHIQU_LLM_JSON_MODE=0 关闭。
-        if cfg.json_mode:
+        # getattr 兜底：旧版 config/shiqu_config.py（auto 部署尚未重新下发）没有该字段，
+        # 直接 cfg.json_mode 会抛 AttributeError 导致整个接口 500。
+        if getattr(cfg, "json_mode", True):
             payload["response_format"] = {"type": "json_object"}
         return payload
 

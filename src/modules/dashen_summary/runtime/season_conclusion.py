@@ -27,7 +27,7 @@ from typing import Any, Dict, Optional
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 from ....constants.backgrounds import build_random_map_background
-from ....constants.ranks import get_rank_score, normalize_raw_rank_bucket, raw_rank_score_to_strength, get_rank_name, get_rank_sub_tier, rank_name_cn, rank_info_to_icon_level, strength_score_to_rank
+from ....constants.ranks import is_unranked_placeholder, display_rank_label, get_rank_score, normalize_raw_rank_bucket, raw_rank_score_to_strength, get_rank_name, get_rank_sub_tier, rank_name_cn, rank_info_to_icon_level, strength_score_to_rank
 
 from .dashen import (
     dashen_api_client,
@@ -37,10 +37,12 @@ from .dashen import (
     get_fight_match_list,
     season,
 )
-from .match_awards import rates as _award_rates, select_awards, record_key as _award_key, grade as _award_grade, METRICS as AWARD_METRICS
+from .match_awards import compare as _compare_award, rates as _award_rates, select_awards, standout_match_keys, record_key as _award_key, grade as _award_grade, METRICS as AWARD_METRICS
 from .teammate_awards import accumulate_award_metrics, select_teammate_awards
 from .season_baseline import parse_count_info, hero_baseline, number as _baseline_number
 from .period_activity import hourly_activity, stacked_activity
+from .summary_perks import PerkCatalog, hero_choices, period_choices, draw_choices
+from ...query_tool import get_cached_asset_path
 from .summary_style import (
     C,
     RADIUS_CARD,
@@ -169,6 +171,7 @@ TIMELINE_RIBBON_H = 26
 GROUP_TITLE_COLOR_RE = re.compile(r"^(?:背景颜色)?#([0-9A-Fa-f]{6})$")
 
 OW_CONFIG = load_ow_config()
+PERK_CATALOG = PerkCatalog(OW_CONFIG)
 
 
 async def _ensure_resolved_target_risk_status(resolved_target):
@@ -1459,6 +1462,14 @@ def _build_stats(matches, detail_pairs, resolved_target):
             stats["party_wins"][party_size] += 1
 
         friends = {str(item) for item in (me.get("friendBnetIds") or [])}
+        lobby = []
+        if not _is_fight(match):
+            for member in (detail.get("teammateList") or []) + (detail.get("enemyList") or []):
+                durations = [( _num(h.get("userTimeSec")), h.get("heroGuid") or h.get("heroId"))
+                             for h in member.get("heroList") or [] if isinstance(h, dict)]
+                main = max(durations, key=lambda item: item[0], default=(0, None))
+                hero = main[1] if main[0] > 0 and main[1] else member.get("heroGuid")
+                lobby.append((member, {"role": _role_label(hero), "rates": _award_rates(member, game_time)}))
         for player in detail.get("teammateList") or []:
             if str(player.get("bnetId")) == str(me.get("bnetId")):
                 continue
@@ -1476,6 +1487,22 @@ def _build_stats(matches, detail_pairs, resolved_target):
             hero_refs.extend(hero.get("heroGuid") or hero.get("heroId")
                              for hero in player.get("heroList") or [] if isinstance(hero, dict))
             contact["heroes"].update(_canonical_hero_guid(hero) for hero in hero_refs if hero)
+            usage = contact.setdefault("hero_usage", Counter())
+            timed = [(h.get("heroGuid") or h.get("heroId"), _num(h.get("userTimeSec")))
+                     for h in player.get("heroList") or [] if isinstance(h, dict)]
+            if any(hero and seconds > 0 for hero, seconds in timed):
+                for hero, seconds in timed:
+                    if hero and seconds > 0:
+                        usage[_canonical_hero_guid(hero)] += seconds
+            elif teammate_hero_guid:
+                usage[_canonical_hero_guid(teammate_hero_guid)] += max(1, game_time)
+            record = next((r for member, r in lobby if member is player), None)
+            if record:
+                peers = [r for member, r in lobby if member is not player and r["role"] == record["role"]]
+                comparison = _compare_award(record, peers, 1, lobby=True)
+                if comparison:
+                    contact["rated_games"] = contact.get("rated_games", 0) + 1
+                    contact["bot_games"] = contact.get("bot_games", 0) + (comparison[0] < 45 - 1e-9)
             teammate_risk_status = None
             if "riskStatus" in player:
                 parsed_teammate_risk = parse_risk_status({"riskStatus": player.get("riskStatus")})
@@ -2255,6 +2282,28 @@ def _hero_icon_url(hero_guid):
     return hero.get("smallIconUrl") or ""
 
 
+def _local_contact_portrait(usage):
+    if not usage:
+        return None
+    hero = HERO_BY_GUID.get(max(usage, key=usage.get), {})
+    for key in ("smallIconUrl", "icon", "ddHeroIcon"):
+        url = hero.get(key)
+        if not url:
+            continue
+        cached = _get_cached_summary_image_copy(url)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256(url.encode()).hexdigest()
+        for path in (QUERY_TOOL_ASSET_DIR / "heroes" / (digest[:24] + ".png"),
+                     RESOURCE_DIR / "cache_img" / (digest + ".png")):
+            try:
+                with Image.open(path) as image:
+                    return image.convert("RGBA")
+            except OSError:
+                continue
+    return None
+
+
 def _canonical_hero_guid(hero_ref):
     hero = HERO_LOOKUP.get(str(hero_ref), {}) or HERO_BY_GUID.get(str(hero_ref), {})
     return str(hero.get("heroGuid") or hero_ref or "")
@@ -2871,7 +2920,7 @@ def _weather_calendar_range(daily_stats):
     end_day = max(daily_stats)
     start_day = min(daily_stats)
     start_day -= datetime.timedelta(days=start_day.weekday())
-    total_weeks = ((end_day - start_day).days + 7) // 7
+    total_weeks = max(6, ((end_day - start_day).days + 7) // 7)
     return start_day, end_day, total_weeks
 
 
@@ -3031,6 +3080,8 @@ def _award_record(match, detail, target, period_start):
         if _role_label(player.get("heroGuid")) == role:
             peers.append({"rates": _award_rates(player, seconds)})
     return {"match": match, "hero_guid": hero, "map_guid": match.get("mapGuid") or root.get("mapGuid"),
+            "kda": {key: me.get(key) for key in ("kill", "assist", "death")},
+            "perk_choices": hero_choices(me, _canonical_hero_guid).get(hero, []),
             "role": role, "heroes": heroes, "hero_details": hero_list, "rank_info": me.get("rankInfo") or me.get("rank_info") or match.get("rankInfo") or {}, "rates": values, "peers": peers, "seconds": seconds,
             "result": _int(match.get("matchRet")), "timestamp": _num(match.get("beginTs")),
             "period_start": period_start, "mode": _mode_label(match),
@@ -3236,6 +3287,49 @@ def _award_source_text(entry):
     }.get(source,"数据不足")
 
 
+async def _prefetch_perk_icons(entries):
+    async def load(url):
+        if _has_cached_summary_image(url):
+            return
+        for category in ("perk", "hero_perks", "misc"):
+            path = get_cached_asset_path(url, category)
+            if path:
+                try:
+                    with Image.open(path) as asset:
+                        _put_summary_image_cache(url, asset.convert("RGBA"))
+                    return
+                except (OSError, ValueError):
+                    continue
+        await _load_summary_image(url)
+    urls = {entry.get("icon") for entry in entries if entry.get("icon")}
+    try:
+        await asyncio.wait_for(asyncio.gather(*(load(url) for url in urls)), timeout=3)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _draw_perk_choices(canvas, draw, entries, x, y, width, counts=False):
+    icons = {}
+    for item in entries[:4]:
+        url = item.get("icon")
+        if not url or url in icons:
+            continue
+        icon = _get_cached_summary_image_copy(url)
+        if icon is None:
+            for category in ("perk", "hero_perks", "misc"):
+                path = get_cached_asset_path(url, category)
+                if path:
+                    try:
+                        with Image.open(path) as asset:
+                            icon = asset.convert("RGBA")
+                        break
+                    except (OSError, ValueError):
+                        continue
+        icons[url] = icon
+    draw_choices(draw, entries, x, y, width, _load_font, C, _truncate_to_width,
+                 counts=counts, canvas=canvas, icons=icons)
+
+
 async def _draw_award_card(canvas, draw, box, title, entry, breakthrough=False):
     x,y,right,bottom = box
     color = C.TEAL if breakthrough else C.DRAW
@@ -3276,11 +3370,13 @@ async def _draw_award_card(canvas, draw, box, title, entry, breakthrough=False):
     draw.text((right-74,y+194),"综合评价",font=_load_font(13),fill=C.TEXT,anchor="ma")
     heroes = [h for h in entry.get("heroes",[hero]) if h != hero]
     draw.text((x+32,y+246),"本局还使用" if heroes else "本局主英雄",font=_load_font(13),fill=C.MUTED)
-    for i,h in enumerate((heroes or [hero])[:8]):
-        await _paste_summary_hero(canvas,draw,h,(x+122+i*38,y+238,32,32))
-    if len(heroes)>8:
-        draw.text((x+430,y+246),f"+{len(heroes)-8}",font=_load_font(13),fill=color)
+    for i,h in enumerate((heroes or [hero])[:3]):
+        await _paste_summary_hero(canvas,draw,h,(x+122+i*36,y+238,32,32))
+    if len(heroes)>3:
+        draw.text((x+234,y+246),f"+{len(heroes)-3}",font=_load_font(13),fill=color)
     feature_rows = entry.get("feature_evidence",[])[:2]
+    await _draw_perk_choices(canvas, draw, PERK_CATALOG.resolve(hero, entry.get("perk_choices") or []),
+                            x+284, y+242, right-x-316)
     evidence_y = y+284
     for i,ev in enumerate(feature_rows):
         name=_truncate_to_width(draw,ev["label"],_load_font(15),245)
@@ -3309,6 +3405,7 @@ def _draw_summary_rank(canvas,draw,rank_info,x,y,size=18,font_size=None,align_ri
     tier=get_rank_sub_tier(rank_info)
     raw_strength=raw_rank_score_to_strength(get_rank_score(rank_info))
     label=f"{rank_name_cn(name)}{tier}" if name else strength_score_to_rank(raw_strength,chinese=True) if raw_strength is not None else "段位未知"
+    label=rank_name_cn("Unranked") if is_unranked_placeholder(rank_info) else display_rank_label(label)
     level=rank_info_to_icon_level(rank_info)
     font=_load_font(font_size or (12 if size<=18 else 14))
     if align_right:
@@ -3578,6 +3675,7 @@ async def _draw_match_timeline(canvas,draw,box,matches,streak_text,awards=None):
         draw.text((xx+20,y+22),label,font=_load_font(13),fill=C.MUTED)
     awards=awards or {}
     evaluated={_award_key(r):r for r in awards.get("evaluated",[])}
+    standouts=standout_match_keys(evaluated.values())
     records={_award_key(r):r for r in awards.get("records",[])}
     for i,match in enumerate(matches):
         row,col=divmod(i,TIMELINE_COLUMNS)
@@ -3588,6 +3686,9 @@ async def _draw_match_timeline(canvas,draw,box,matches,streak_text,awards=None):
         record=records.get(key) or entry or {}
         label,border=_performance_style(entry)
         result,color=_result_color(match.get("matchRet"))
+        tile_box=(left,top,tile_right,tile_bottom)
+        if key in standouts:
+            _draw_rainbow_glow(draw, tile_box, radius=RADIUS_TILE)
         draw.rounded_rectangle((left,top,tile_right,tile_bottom),radius=RADIUS_TILE,fill=tinted(color,C.TILE_TINT))
         await _paste_remote_cover(canvas,(left+3,top+3,tile_right-2,top+76),_map_icon_url(match.get("mapGuid")),radius=8,tint=C.TILE_COVER_TINT)
         hero=record.get("hero_guid") or match.get("heroGuid")
@@ -3603,11 +3704,22 @@ async def _draw_match_timeline(canvas,draw,box,matches,streak_text,awards=None):
         draw_map_mode_icon(canvas, match.get("mapGuid"), left+8, top+82, 18)
         draw.text((left+30,top+83),name,font=_load_font(13),fill=C.TEXT)
         draw.text((left+10,top+105),result,font=_load_font(15,bold=True),fill=color)
+        counts = record.get("kda", {})
+        values = [counts.get(key) if counts.get(key) is not None else match.get(key)
+                  for key in ("kill", "assist", "death")]
+        if any(value is not None for value in values):
+            kda = "/".join(str(_int(value)) if value is not None else "–" for value in values)
+            kda_x = left + 14 + _text_size(draw, result, _load_font(15,bold=True))[0]
+            font = _fit_text_font(draw, kda, tile_right-32-kda_x, 14, 8, bold=False)
+            draw.text((kda_x,top+106),kda,font=font,fill=C.TEXT)
         draw.text((tile_right-10,top+102),label,font=draw.numeric_font(24) or _load_font(20,bold=True),fill=border,anchor="ra")
         draw.text((left+10,top+133),f'{dt:%m/%d}',font=_load_font(12),fill=C.MUTED)
         if _is_comp(match):
             _draw_summary_rank(canvas,draw,record.get("rank_info") or match.get("rankInfo"),tile_right-9,top+123,28,font_size=15,align_right=True)
-        draw.rounded_rectangle((left,top,tile_right,tile_bottom),radius=RADIUS_TILE,outline=with_alpha(border,235 if entry else 90),width=2 if entry else 1)
+        if key in standouts:
+            _draw_rainbow_border(draw, tile_box, radius=RADIUS_TILE, width=3)
+        else:
+            draw.rounded_rectangle(tile_box,radius=RADIUS_TILE,outline=with_alpha(border,235 if entry else 90),width=2 if entry else 1)
     _draw_streak_ribbons(draw,matches,x+24,y+64)
     draw.text((x+24,bottom-126),streak_text,font=_load_font(13),fill=C.MUTED)
 
@@ -3807,6 +3919,13 @@ async def _render_period_image(
 
     hero_rows_all = stats["heroes"].most_common()
     hero_top_rows = hero_rows_all[:5]
+    period_keys = {_award_key({"match": match}) for match in matches}
+    perk_observations = [
+        (_award_key({"match": match}), _resolve_me_player_detail(detail, resolved_target))
+        for match, detail in detail_pairs
+        if not _is_fight(match) and _award_key({"match": match}) in period_keys
+    ]
+    period_perks = period_choices(perk_observations, _canonical_hero_guid)
     other_heroes = hero_rows_all[5:]
     other_hero_rows = (len(other_heroes) + 2) // 3 if other_heroes else 0
     hero_other_height = 34 + other_hero_rows * 58 if other_heroes else 0
@@ -3881,7 +4000,7 @@ async def _render_period_image(
     map_lines = max(1, (len(map_rows) + map_columns - 1) // map_columns)
     highlight_rows_total = 5 + max(1, len(data_king_text))
     hero_lines = max(1, len(hero_top_rows))
-    hero_base, map_base, highlight_base = 60, 52, 48
+    hero_base, map_base, highlight_base = 64, 52, 48
 
     stats_highlight_rows = (len(stat_highlights) + 2) // 3 if stat_highlights else 0
     stats_highlight_h = 32 + stats_highlight_rows * 108 if stat_highlights else 32
@@ -3992,6 +4111,13 @@ async def _render_period_image(
     for record in (match_awards or {}).get("records", []):
         prefetch_urls.extend(_hero_icon_url(hero) for hero in record.get("heroes", []))
     prefetch_urls.extend(_hero_icon_url(hero) for _, hero in OMNIC_BOT_TIERS)
+    perk_entries = []
+    for hero, _ in hero_top_rows:
+        perk_entries.extend(PERK_CATALOG.resolve(hero, period_perks.get(_canonical_hero_guid(hero), {}).get("choices", []))[:4])
+    for entry in (awards.get("best"), awards.get("breakthrough")):
+        if entry:
+            perk_entries.extend(PERK_CATALOG.resolve(entry["hero_guid"], entry.get("perk_choices") or [])[:4])
+    await _prefetch_perk_icons(perk_entries)
     await _prefetch_summary_images(prefetch_urls)
     _render_step("ASSET_PREFETCH_DONE", extra=f"url_candidates={len(prefetch_urls)}")
 
@@ -4092,15 +4218,12 @@ async def _render_period_image(
             _paste_hero_icon(canvas, draw, hero_icon, left_inner + 3, row_y + 3, 44)
         text_x = left_inner + 62
         hero_name_font = _load_font(19, bold=True)
-        hero_label = _truncate_to_width(draw, _hero_name(hero_guid), hero_name_font, left_end - text_x - 260)
+        hero_label = _truncate_to_width(draw, _hero_name(hero_guid), hero_name_font, 120)
         draw.text((text_x, row_y + 2), hero_label, font=hero_name_font, fill=C.INK)
         medal_x = text_x + _text_size(draw, hero_label, hero_name_font)[0] + 12
         if season_place:
-            chip_width = draw.textlength(f"赛季#{season_place}", font=_load_font(13, bold=True)) + 14
-            chip_x = left_end - 160 - chip_width
-            season_chip(draw, chip_x, row_y + 13, season_place, _load_font, C)
-        else:
-            chip_x = left_end - 160
+            season_chip(draw, text_x, row_y + 35, season_place, _load_font, C)
+        chip_x = left_end - 250
         medal_data = stats["hero_medals"].get(str(hero_guid), {})
         for medal_text, medal_value, medal_color in (
             ("K", medal_data.get("K", 0), C.LOSS),
@@ -4120,12 +4243,16 @@ async def _render_period_image(
             medal_x += label_w + 20
         wins = hero_win_rows.get(str(hero_guid), {}).get("wins", 0)
         total = hero_win_rows.get(str(hero_guid), {}).get("total", count)
-        _draw_bar(draw, text_x, row_y + 35, left_end - text_x, 6, count / max_hero, ring_color)
+        _draw_bar(draw, text_x, row_y + 51, left_end - text_x, 6, count / max_hero, ring_color)
         rate_font = _load_font(15, bold=True)
         rate_text = f"胜率 {int(round((wins / max(total, 1)) * 100))}%"
-        draw.text((left_end, row_y + 4), rate_text, font=rate_font, fill=_summary_winrate_color(total, wins), anchor="ra")
+        draw.text((left_end, row_y + 28), rate_text, font=rate_font, fill=_summary_winrate_color(total, wins), anchor="ra")
         rate_w = _text_size(draw, rate_text, rate_font)[0]
-        draw.text((left_end - rate_w - 16, row_y + 4), f"{count}场", font=_load_font(15), fill=C.TEXT, anchor="ra")
+        draw.text((left_end - rate_w - 16, row_y + 28), f"{count}场", font=_load_font(15), fill=C.TEXT, anchor="ra")
+        perk_data = period_perks.get(_canonical_hero_guid(hero_guid), {})
+        choices = PERK_CATALOG.resolve(hero_guid, perk_data.get("choices") or [])
+        await _draw_perk_choices(canvas, draw, choices, medal_x, row_y+1,
+                                left_end-medal_x, counts=True)
 
     if other_heroes:
         compact_title_y = hero_start_y + len(hero_top_rows) * hero_pitch + 4
@@ -4274,9 +4401,13 @@ async def _render_period_image(
                 padding_y=2,
                 max_width=84,
             )
-            friend_name_max_width = max(90, 240 - risk_width - (6 if risk_width else 0))
-            friend_name = _truncate_to_width(draw, name, name_font, friend_name_max_width)
             name_x_pos = right_inner + 52
+            portrait = _local_contact_portrait(data.get("hero_usage"))
+            if portrait is not None:
+                _paste_hero_icon(canvas, draw, _cover_fit(portrait, (24, 24)), name_x_pos, center_y - 12, 24)
+                name_x_pos += 30
+            friend_name_max_width = max(1, min(240, games_x - 42 - name_x_pos) - risk_width - (6 if risk_width else 0))
+            friend_name = _truncate_to_width(draw, name, name_font, friend_name_max_width)
             draw.text((name_x_pos, center_y), friend_name, font=name_font, fill=C.TEXT, anchor="lm")
             friend_name_w = _text_size(draw, friend_name, name_font)[0]
             title_badge_start_x = name_x_pos + friend_name_w + 8
@@ -4311,6 +4442,12 @@ async def _render_period_image(
             games = data.get("games", 0)
             wins = data.get("wins", 0)
             carry_ratio = _carry_ratio(data, _carry_baseline(stats))
+            rated = data.get("rated_games", 0)
+            if rated:
+                bots = data["bot_games"]
+                color = ("#ED5757" if bots == rated else "#F89640" if bots * 100 >= rated * 80
+                         else "#E4C54A" if bots * 100 >= rated * 60 else "#48BE91")
+                draw.rounded_rectangle((carry_x + 5, center_y - 8, carry_x + 8, center_y + 8), radius=2, fill=color)
             value_font = _load_font(15, bold=True)
             draw.text((games_x, center_y), str(games), font=value_font, fill=C.INK, anchor="rm")
             draw.text((rate_x, center_y), _fmt_pct(wins, games), font=value_font, fill=_summary_winrate_color(games, wins), anchor="rm")

@@ -66,6 +66,7 @@ def build_season_data(matches, period, map_mode, rank_score, canonical=lambda x:
     recent_kda, _ = kda(current)
     metrics.insert(1, ("KDA", full_kda, full_kda-recent_kda if full_kda is not None and recent_kda is not None else None, covered, len(rows)))
     trends = defaultdict(list)
+    rank_results = defaultdict(list)
     for m in sorted(rows, key=lambda m: number(m.get("beginTs")) or 0):
         if not competitive(m):
             continue
@@ -75,10 +76,12 @@ def build_season_data(matches, period, map_mode, rank_score, canonical=lambda x:
             continue
         queue = "开放" if "open" in str(m.get("gameMode")).lower() else {"tank":"重装", "dps":"输出", "damage":"输出", "healer":"支援", "support":"支援"}.get(str(m.get("roleType")), "未分类")
         trends[queue].append((ts, score))
+        rank_results[queue].append(m.get("matchRet"))
     period_ts = [ts for ts in (number(m.get("beginTs")) for m in period) if ts and ts > 0]
     return {"total":len(rows), "modes":modes.most_common(), "map_modes":map_modes.most_common(),
             "maps":maps.most_common(3), "heroes":heroes.most_common(3), "metrics":metrics,
             "show_trend":any(competitive(m) for m in period), "trends":dict(trends),
+            "estimated_trends":{q: estimate_rank_progress(v, rank_results[q]) for q, v in trends.items()},
             "period_start":min(period_ts) if period_ts else None, "period_end":max(period_ts) if period_ts else None}
 
 
@@ -292,6 +295,72 @@ RANK_STEP = 500
 RANK_BASE = 500
 
 
+def estimate_rank_progress(rows, results):
+    """Infer post-match progress on a 5-point grid, anchored to observed divisions.
+
+    Minimize departure from +/-20 per match across the whole history. A hidden
+    negative balance is allowed for one loss before demotion; the next win
+    repays it and the next loss carries it into the lower division. Actual
+    division observations take priority when calibration/omitted games conflict.
+    Unknown results start a new inference segment, never count as losses.
+    """
+    if not rows:
+        return []
+    segments, start = [], 0
+    for i in range(1, len(rows)):
+        if number(results[i]) not in (-1, 0, 1, 2):
+            segments.append((start, i))
+            start = i
+    segments.append((start, len(rows)))
+    output = []
+    for start, stop in segments:
+        states, costs, parents = [], [], []
+        for i in range(start, stop):
+            base = rows[i][1]
+            result = number(results[i])
+            # Preserve supplied fractional/continuous scores exactly.
+            candidates = [base] if base % 100 else [base + n for n in range(0, 100, 5)]
+            if i > start and result in (-1, 0, 2) and base == rows[i-1][1] and base > RANK_BASE:
+                candidates = [base + n for n in range(-20, 0, 5)] + candidates
+            if i == start:
+                states = candidates
+                costs = [((v-base-50)/100)**2 for v in states]
+                parents.append((states, [-1]*len(states)))
+                continue
+            expected = 20 if result == 1 else -20 if result in (-1, 2) else 0
+            next_costs, links = [], []
+            previous_base = rows[i-1][1]
+            for value in candidates:
+                options = []
+                for j, previous in enumerate(states):
+                    if value < base:
+                        # Only a first boundary-crossing loss can use protection.
+                        if result == 0:
+                            if previous >= previous_base or value != previous:
+                                continue
+                        elif previous < previous_base or value != previous - 20:
+                            continue
+                    if previous < previous_base and result in (-1, 2) and base >= previous_base:
+                        continue
+                    error = (value - previous - expected) / 20
+                    # A normal demotion must consume existing protection debt.
+                    # Keep exceptional observed jumps possible, with a correction cost.
+                    correction = 25 if base < previous_base and previous >= previous_base else 0
+                    options.append((costs[j] + error*error + correction, j))
+                cost, parent = min(options, default=(float("inf"), 0))
+                next_costs.append(cost)
+                links.append(parent)
+            states, costs = candidates, next_costs
+            parents.append((states, links))
+        index = min(range(len(costs)), key=costs.__getitem__)
+        values = []
+        for candidates, links in reversed(parents):
+            values.append(candidates[index])
+            index = links[index]
+        output.extend((rows[i][0], value) for i, value in zip(range(start, stop), reversed(values)))
+    return output
+
+
 def rank_panel_height():
     return 236
 
@@ -339,9 +408,11 @@ def draw_rank_panel(draw, data, box, font, colors, rank_label):
         lx += draw.textlength(change_text, font=font(13, bold=True)) + 30
     draw.text((right, y + 8), f"{sum(len(rows) for rows in series.values())} 场有段位记录", font=font(12), fill=colors.FAINT, anchor="rm")
 
-    points = [point for rows in series.values() for point in rows]
-    t0, t1 = min(p[0] for p in points), max(p[0] for p in points)
-    low, high = min(p[1] for p in points), max(p[1] for p in points)
+    plotted = {q: data.get("estimated_trends", {}).get(q) or rows for q, rows in series.items()}
+    matches = [(ts, queue, score) for queue in queues for ts, score in plotted[queue]]
+    matches.sort(key=lambda match: match[0])
+    low = min(score for _, _, score in matches)
+    high = max(score for _, _, score in matches)
     # Pad to whole divisions and show at least one tier, so small swings are not exaggerated.
     low = max(RANK_BASE, (low - 60) // 100 * 100)
     high = -(-(high + 60) // 100) * 100
@@ -350,19 +421,23 @@ def draw_rank_panel(draw, data, box, font, colors, rank_label):
         low, high = max(RANK_BASE, int(mid - 200) // 100 * 100), int(mid + 200 + 99) // 100 * 100
     left, plot_right = x + 64, right - 8
     top, end = y + 38 + legend_row * 24, bottom - 24
-    span_t = max(1.0, t1 - t0)
+    last_index = len(matches) - 1
+    match_width = (plot_right - left) / max(1, last_index)
 
-    def px(ts):
-        return left + (ts - t0) / span_t * (plot_right - left)
+    def px(index):
+        return left + index * match_width
 
     def py(score):
         return end - (score - low) / max(1, high - low) * (end - top)
 
     # The reporting period, as a quiet band.
     p0, p1 = data.get("period_start"), data.get("period_end")
-    if p0 and p1 and p1 >= t0 and p0 <= t1:
-        band_left = max(left, px(max(p0, t0)) - 4)
-        band_right = min(plot_right, px(min(p1, t1)) + 4)
+    period_indices = []
+    if p0 is not None and p1 is not None:
+        period_indices = [index for index, (ts, _, _) in enumerate(matches) if p0 <= ts <= p1]
+    if period_indices:
+        band_left = max(left, px(period_indices[0]) - 4)
+        band_right = min(plot_right, px(period_indices[-1]) + 4)
         if band_right - band_left < 10:
             band_left = max(left, band_right - 10)
             band_right = min(plot_right, max(band_right, band_left + 10))
@@ -384,9 +459,21 @@ def draw_rank_panel(draw, data, box, font, colors, rank_label):
             if high - low <= 600:
                 draw.text((left - 10, yy), rank_label(score, chinese=True), font=font(11), fill=colors.FAINT, anchor="rm")
 
+    idle_gap_ms = 3 * 24 * 60 * 60 * 1000
+    lines = defaultdict(list)
+    last_played = {}
+    for index, (ts, queue, score) in enumerate(matches):
+        line = lines[queue]
+        match_x = px(index)
+        if line and ts - last_played[queue] >= idle_gap_ms:
+            # Keep the last rank through the pause, then leave half a slot for the return match.
+            line.append((match_x - match_width / 2, line[-1][1]))
+        line.append((match_x, py(score)))
+        last_played[queue] = ts
+
     for queue in queues:
         color = _queue_color(queue, colors)
-        line = [(px(ts), py(score)) for ts, score in series[queue]]
+        line = lines[queue]
         if len(line) > 1:
             draw.line(line, fill=with_alpha(colors.SCRIM, 200), width=6, joint="curve")
             draw.line(line, fill=color, width=3, joint="curve")
@@ -396,9 +483,16 @@ def draw_rank_panel(draw, data, box, font, colors, rank_label):
         draw.ellipse((ex - 6, ey - 6, ex + 6, ey + 6), fill=colors.SCRIM)
         draw.ellipse((ex - 4, ey - 4, ex + 4, ey + 4), fill=color)
 
-    ticks = 5 if t1 > t0 else 1
-    for idx in range(ticks):
-        ts = t0 + (t1 - t0) * idx / max(1, ticks - 1)
-        anchor = "lm" if idx == 0 else "rm" if idx == ticks - 1 else "mm"
-        draw.text((px(ts), bottom - 8), datetime.datetime.fromtimestamp(ts / 1000).strftime("%m/%d"),
-                  font=font(12), fill=colors.AXIS_TEXT, anchor=anchor)
+    tick_count = min(5, len(matches))
+    date_ticks = {}
+    for tick in range(tick_count):
+        index = round(last_index * tick / max(1, tick_count - 1))
+        date = datetime.datetime.fromtimestamp(matches[index][0] / 1000).strftime("%m/%d")
+        # Keep the final date at the right edge unless the full chart is one day.
+        if index == last_index and date_ticks.get(date) != 0:
+            date_ticks[date] = index
+        else:
+            date_ticks.setdefault(date, index)
+    for date, index in date_ticks.items():
+        anchor = "lm" if index == 0 else "rm" if index == last_index else "mm"
+        draw.text((px(index), bottom - 8), date, font=font(12), fill=colors.AXIS_TEXT, anchor=anchor)
